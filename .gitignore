@@ -1,0 +1,9 @@
+# Never commit game files or generated game code.
+*.elf
+*.ovl
+*.OVL
+*.iso
+SLUS_*
+xenosaga.*
+recomp/
+output/
