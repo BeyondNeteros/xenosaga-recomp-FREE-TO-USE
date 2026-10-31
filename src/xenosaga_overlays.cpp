@@ -211,6 +211,8 @@ namespace
             runtime.registerFunction(0x002412B0u, soundStub_returnZero); // RssdRequestCall
             runtime.registerFunction(0x0023FEB8u, soundStub_returnZero); // RssdSpuRead
             runtime.registerFunction(0x00240288u, soundStub_returnZero); // RssdGetCallCompletedCode
+            // Sound-data DMA status: 0 = transfer finished. Loaders spin until then.
+            runtime.registerFunction(0x002409B0u, soundStub_returnZero); // SsdSpuDmaCompleted
             std::cout << "[xenosaga] sound driver stubbed (XS_NO_SOUND=1)" << std::endl;
         }
         // The boot ELF already contains ov02 at 0xA00000.

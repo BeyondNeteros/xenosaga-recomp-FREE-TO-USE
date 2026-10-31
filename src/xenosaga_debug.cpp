@@ -6,6 +6,8 @@
 
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_memory.h"
+#include "runtime/gs/gs_frontend.h"
 
 #include <algorithm>
 #include <atomic>
@@ -138,6 +140,39 @@ namespace
     }
 }
 
+namespace
+{
+    // Save the frame the runtime would present, as a BMP next to the exe, so
+    // it can be inspected even when the game window can't be seen.
+    bool saveFrameBmp(PS2Runtime &runtime, const std::filesystem::path &path)
+    {
+        std::vector<uint8_t> rgba;
+        uint32_t w = 0, h = 0;
+        if (!runtime.gs().copyLatchedHostPresentationFrame(rgba, w, h, nullptr, nullptr, nullptr) || !w || !h)
+            return false;
+        const uint32_t rowBytes = w * 3u, pad = (4u - rowBytes % 4u) % 4u;
+        const uint32_t dataSize = (rowBytes + pad) * h;
+        std::ofstream out(path, std::ios::binary);
+        auto put16 = [&](uint16_t v) { out.write(reinterpret_cast<const char *>(&v), 2); };
+        auto put32 = [&](uint32_t v) { out.write(reinterpret_cast<const char *>(&v), 4); };
+        out.write("BM", 2); put32(54 + dataSize); put32(0); put32(54);
+        put32(40); put32(w); put32(h); put16(1); put16(24); put32(0); put32(dataSize);
+        put32(2835); put32(2835); put32(0); put32(0);
+        const char zeros[3] = {0, 0, 0};
+        for (uint32_t y = h; y-- > 0;)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const uint8_t *p = &rgba[(size_t(y) * w + x) * 4u];
+                const char bgr[3] = {char(p[2]), char(p[1]), char(p[0])};
+                out.write(bgr, 3);
+            }
+            out.write(zeros, pad);
+        }
+        return true;
+    }
+}
+
 void xs_startHeartbeat(PS2Runtime &runtime)
 {
     const char *env = std::getenv("XS_HEARTBEAT_SECONDS");
@@ -164,6 +199,17 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                       << (snap.eeCycle == lastCycle ? " (stalled)" : "")
                       << " running=" << snap.runningThreadId << std::endl;
             lastCycle = snap.eeCycle;
+            {
+                const GSRegisters &gs = runtime.memory().gs();
+                char regs[200];
+                std::snprintf(regs, sizeof(regs),
+                              "  gs pmode=0x%llx dispfb1=0x%llx display1=0x%llx dispfb2=0x%llx display2=0x%llx",
+                              (unsigned long long)gs.pmode, (unsigned long long)gs.dispfb1,
+                              (unsigned long long)gs.display1, (unsigned long long)gs.dispfb2,
+                              (unsigned long long)gs.display2);
+                const std::filesystem::path shot = PS2Runtime::getIoPaths().elfDirectory / "xs_frame.bmp";
+                std::cout << regs << (saveFrameBmp(runtime, shot) ? "  frame saved" : "  no frame") << std::endl;
+            }
             for (const auto &t : snap.threads)
             {
                 if (t.status == EeThreadStatus::Dormant)
