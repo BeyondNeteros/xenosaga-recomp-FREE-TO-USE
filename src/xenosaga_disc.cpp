@@ -76,6 +76,7 @@ void xs_configureDiscImage()
     paths.cdImage = image;
     PS2Runtime::setIoPaths(paths);
     g_layer1Start = xs_iso::findLayer1Start(image);
+    xs_iso::logLayout(image, std::cout);
 
     // The runtime loads IOP modules (and reads SYSTEM.CNF) as loose files from
     // the CD root. Extract them from the user's own disc once, next to the ELF.

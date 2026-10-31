@@ -98,6 +98,28 @@ namespace xs_iso
         return 0;
     }
 
+    // Diagnostics: print the volume size, image size, and every volume descriptor
+    // near the end of layer 0, to pin down how a dual-layer image is laid out.
+    template <typename Stream>
+    void logLayout(const std::filesystem::path &image, Stream &log)
+    {
+        std::ifstream in(image, std::ios::binary);
+        std::vector<uint8_t> pvd;
+        if (!in || !readSectors(in, 16, kSectorSize, pvd) || !isPvd(pvd))
+            return;
+        std::error_code ec;
+        const uint64_t total = std::filesystem::file_size(image, ec) / kSectorSize;
+        const uint32_t vol = le32(&pvd[80]);
+        log << "[xenosaga] iso layout: volume sectors=" << vol << " image sectors=" << total << std::endl;
+        for (int64_t lsn = int64_t(vol) - 32; lsn <= int64_t(vol) + 64; ++lsn)
+        {
+            std::vector<uint8_t> s;
+            if (lsn > 16 && readSectors(in, uint32_t(lsn), kSectorSize, s) && std::memcmp(&s[1], "CD001", 5) == 0)
+                log << "[xenosaga] iso layout: descriptor type " << int(s[0]) << " at sector " << lsn
+                    << (s[0] == 1 ? " volume sectors=" + std::to_string(le32(&s[80])) : std::string()) << std::endl;
+        }
+    }
+
     // Find a file or directory by path ("\\XENOSAGA.00;1", "cdrom0:\\IOP\\SSD.IRX;1").
     // layerStart selects the volume: 0 for layer 0, findLayer1Start() for layer 1.
     // Returned LSNs are absolute positions in the image.

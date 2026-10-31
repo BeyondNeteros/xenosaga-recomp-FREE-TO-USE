@@ -11,6 +11,7 @@
 #include "ps2_stubs.h"
 
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -173,6 +174,10 @@ namespace
 
     void applyXenosaga(PS2Runtime &runtime)
     {
+        // Write logs straight through, so a hang or crash still leaves a full log.
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+        std::ios::sync_with_stdio(true);
         xs_configureDiscImage();
         runtime.registerFunction(kLoadOverlayAddr, xglCdLoadOverlay_hook);
         // File lookups return real disc positions when a disc image is present.
@@ -193,6 +198,11 @@ namespace
             runtime.registerFunction(0x0023FBB8u, soundStub_returnZero); // RssdInitIop
             runtime.registerFunction(0x0023FE68u, soundStub_returnZero); // RssdBusy
             runtime.registerFunction(0x002405E8u, soundStub_returnZero); // SsdSendFuncPacket
+            // Every SSD request to the IOP goes through these; answer them locally.
+            runtime.registerFunction(0x0023FFF0u, soundStub_returnZero); // RssdCallFunc
+            runtime.registerFunction(0x002412B0u, soundStub_returnZero); // RssdRequestCall
+            runtime.registerFunction(0x0023FEB8u, soundStub_returnZero); // RssdSpuRead
+            runtime.registerFunction(0x00240288u, soundStub_returnZero); // RssdGetCallCompletedCode
             std::cout << "[xenosaga] sound driver stubbed (XS_NO_SOUND=1)" << std::endl;
         }
         // The boot ELF already contains ov02 at 0xA00000.
