@@ -24,6 +24,11 @@
 #include <thread>
 #include <vector>
 
+void xglRenderDispEnvInit_0x22d338(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void xglRenderDispOff_0x22d7b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void xglRenderDispOn_0x22d7d8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void xglRenderInit_0x22d7f8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 uint32_t xs_currentOverlay();
 
@@ -221,4 +226,62 @@ void xs_startHeartbeat(PS2Runtime &runtime)
             }
         }
     }).detach();
+}
+
+// Trace the display on/off path: log each call with the game's PMODE value
+// (dispEnv.pmode at 0x4A9000) before and after.
+namespace
+{
+    uint64_t dispEnvPmode(const uint8_t *rdram)
+    {
+        uint64_t v;
+        std::memcpy(&v, rdram + 0x004A9000u, sizeof(v));
+        return v;
+    }
+
+    template <void (*Original)(uint8_t *, R5900Context *, PS2Runtime *)>
+    void traced(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, const char *name)
+    {
+        const uint64_t before = dispEnvPmode(rdram);
+        const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        Original(rdram, ctx, runtime);
+        std::printf("[xenosaga] %s from %s: dispEnv.pmode 0x%llx -> 0x%llx\n", name, describePc(ra).c_str(),
+                    (unsigned long long)before, (unsigned long long)dispEnvPmode(rdram));
+    }
+
+    // On a PS2, ControlEntry spends many frames loading sound banks before it
+    // calls xglRenderDispOn, so the render thread's own xglRenderInit always
+    // runs first. With sound skipped that wait is instant and the order flips:
+    // the late re-init switches the display back off. Keep it on once requested.
+    std::atomic<bool> g_displayOnRequested{false};
+
+    void tracedRenderInit(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        traced<xglRenderInit_0x22d7f8>(r, c, rt, "xglRenderInit");
+        if (g_displayOnRequested.load())
+        {
+            uint64_t pmode = dispEnvPmode(r) | 0x2u; // EN2, as xglRenderDispOn sets
+            std::memcpy(r + 0x004A9000u, &pmode, sizeof(pmode));
+            std::printf("[xenosaga] display was already switched on; kept on (pmode 0x%llx)\n", (unsigned long long)pmode);
+        }
+    }
+    void tracedDispEnvInit(uint8_t *r, R5900Context *c, PS2Runtime *rt) { traced<xglRenderDispEnvInit_0x22d338>(r, c, rt, "xglRenderDispEnvInit"); }
+    void tracedDispOff(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        g_displayOnRequested = false;
+        traced<xglRenderDispOff_0x22d7b8>(r, c, rt, "xglRenderDispOff");
+    }
+    void tracedDispOn(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        g_displayOnRequested = true;
+        traced<xglRenderDispOn_0x22d7d8>(r, c, rt, "xglRenderDispOn");
+    }
+}
+
+void xs_traceDisplay(PS2Runtime &runtime)
+{
+    runtime.registerFunction(0x0022D7F8u, tracedRenderInit);
+    runtime.registerFunction(0x0022D338u, tracedDispEnvInit);
+    runtime.registerFunction(0x0022D7B8u, tracedDispOff);
+    runtime.registerFunction(0x0022D7D8u, tracedDispOn);
 }

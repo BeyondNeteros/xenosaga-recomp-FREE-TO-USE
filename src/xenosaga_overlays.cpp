@@ -31,6 +31,7 @@ void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_startHeartbeat(PS2Runtime &runtime);
+void xs_traceDisplay(PS2Runtime &runtime);
 
 namespace
 {
@@ -219,6 +220,7 @@ namespace
         activateOverlayFunctions(2);
         std::cout << "[xenosaga] overlay hook installed" << std::endl;
         xs_startHeartbeat(runtime);
+        xs_traceDisplay(runtime);
     }
 }
 
