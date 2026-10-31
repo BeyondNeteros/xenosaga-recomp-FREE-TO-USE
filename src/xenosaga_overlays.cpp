@@ -30,6 +30,13 @@ bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void xs_startHeartbeat(PS2Runtime &runtime);
+
+namespace
+{
+    uint32_t g_currentOverlay = 2; // the boot ELF carries ov02
+}
+uint32_t xs_currentOverlay() { return g_currentOverlay; }
 
 namespace
 {
@@ -144,6 +151,7 @@ namespace
         if (!readOverlayFile(id, data, source) || !loadOverlayImage(rdram, data))
             std::cerr << "[xenosaga] failed to load overlay " << id << " (" << source << ")" << std::endl;
         activateOverlayFunctions(id);
+        g_currentOverlay = id;
         std::cout << "[xenosaga] overlay " << id << " active (" << source << ")" << std::endl;
     }
 
@@ -208,6 +216,7 @@ namespace
         // The boot ELF already contains ov02 at 0xA00000.
         activateOverlayFunctions(2);
         std::cout << "[xenosaga] overlay hook installed" << std::endl;
+        xs_startHeartbeat(runtime);
     }
 }
 

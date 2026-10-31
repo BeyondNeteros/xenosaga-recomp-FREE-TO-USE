@@ -1,0 +1,178 @@
+// Xenosaga Episode I (SLUS_204.69): debugging aids.
+//
+// A heartbeat that logs, every few seconds, where each game thread is and
+// whether it is running or waiting, by function name. The names come from the
+// symbol tables in the user's own SLUS_204.69 and OVnn.OVL files.
+
+#include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
+uint32_t xs_currentOverlay();
+
+namespace
+{
+    struct Symbol
+    {
+        uint32_t addr;
+        uint32_t size;
+        std::string name;
+    };
+
+    // FUNC symbols from an ELF32 image, sorted by address.
+    std::vector<Symbol> readFunctionSymbols(const std::vector<uint8_t> &d)
+    {
+        std::vector<Symbol> out;
+        auto u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, &d[o], 2); return v; };
+        auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, &d[o], 4); return v; };
+        if (d.size() < 0x34 || std::memcmp(d.data(), "\x7f" "ELF", 4) != 0)
+            return out;
+        const uint32_t shoff = u32(0x20);
+        const uint16_t shentsize = u16(0x2E), shnum = u16(0x30);
+        for (uint16_t i = 0; i < shnum; ++i)
+        {
+            const size_t sh = shoff + size_t(i) * shentsize;
+            if (sh + 40 > d.size() || u32(sh + 4) != 2 /* SHT_SYMTAB */)
+                continue;
+            const uint32_t off = u32(sh + 16), size = u32(sh + 20), link = u32(sh + 24);
+            const size_t strSh = shoff + size_t(link) * shentsize;
+            if (strSh + 40 > d.size())
+                continue;
+            const uint32_t strOff = u32(strSh + 16), strSize = u32(strSh + 20);
+            for (uint32_t s = off; s + 16 <= off + size && s + 16 <= d.size(); s += 16)
+            {
+                const uint8_t info = d[s + 12];
+                if ((info & 0xF) != 2 /* STT_FUNC */)
+                    continue;
+                const uint32_t nameOff = u32(s);
+                if (nameOff >= strSize || strOff + nameOff >= d.size())
+                    continue;
+                out.push_back({u32(s + 4), u32(s + 8), reinterpret_cast<const char *>(&d[strOff + nameOff])});
+            }
+        }
+        std::sort(out.begin(), out.end(), [](const Symbol &a, const Symbol &b) { return a.addr < b.addr; });
+        return out;
+    }
+
+    std::vector<Symbol> g_mainSymbols;
+    std::map<uint32_t, std::vector<Symbol>> g_overlaySymbols;
+    std::mutex g_symbolMutex;
+
+    std::string lookupIn(const std::vector<Symbol> &syms, uint32_t pc)
+    {
+        auto it = std::upper_bound(syms.begin(), syms.end(), pc, [](uint32_t v, const Symbol &s) { return v < s.addr; });
+        if (it == syms.begin())
+            return {};
+        --it;
+        if (pc >= it->addr + std::max<uint32_t>(it->size, 4u) && it->size != 0)
+            return {};
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "+0x%x", pc - it->addr);
+        return it->name + buf;
+    }
+
+    std::string describePc(uint32_t pc)
+    {
+        std::lock_guard<std::mutex> lock(g_symbolMutex);
+        if (pc >= 0x009FF000u && pc < 0x00A60000u)
+        {
+            const uint32_t ov = xs_currentOverlay();
+            auto &syms = g_overlaySymbols[ov];
+            if (syms.empty())
+            {
+                char name[24];
+                std::snprintf(name, sizeof(name), "\\OV%02u.OVL;1", ov);
+                std::vector<uint8_t> data;
+                if (xs_readDiscFile(name, data))
+                    syms = readFunctionSymbols(data);
+            }
+            char prefix[16];
+            std::snprintf(prefix, sizeof(prefix), "ov%02u:", ov);
+            return prefix + lookupIn(syms, pc);
+        }
+        return lookupIn(g_mainSymbols, pc);
+    }
+
+    const char *statusName(EeThreadStatus s)
+    {
+        switch (s)
+        {
+        case EeThreadStatus::Running: return "running";
+        case EeThreadStatus::Ready: return "ready";
+        case EeThreadStatus::Waiting: return "waiting";
+        case EeThreadStatus::WaitingSuspended: return "waiting+suspended";
+        case EeThreadStatus::Suspended: return "suspended";
+        case EeThreadStatus::Dormant: return "dormant";
+        }
+        return "?";
+    }
+
+    const char *waitName(EeWaitReason w)
+    {
+        switch (w)
+        {
+        case EeWaitReason::None: return "";
+        case EeWaitReason::Sleep: return " (sleep)";
+        case EeWaitReason::Semaphore: return " (semaphore)";
+        case EeWaitReason::EventFlag: return " (event flag)";
+        case EeWaitReason::VSync: return " (vsync)";
+        case EeWaitReason::External: return " (external)";
+        case EeWaitReason::Mpeg: return " (mpeg)";
+        }
+        return "";
+    }
+}
+
+void xs_startHeartbeat(PS2Runtime &runtime)
+{
+    const char *env = std::getenv("XS_HEARTBEAT_SECONDS");
+    const int seconds = env ? std::atoi(env) : 5;
+    if (seconds <= 0)
+        return;
+
+    {
+        std::ifstream in(PS2Runtime::getIoPaths().elfPath, std::ios::binary);
+        std::vector<uint8_t> elf((std::istreambuf_iterator<char>(in)), {});
+        g_mainSymbols = readFunctionSymbols(elf);
+    }
+    std::cout << "[xenosaga] heartbeat every " << seconds << "s (" << g_mainSymbols.size() << " symbols)" << std::endl;
+
+    std::thread([&runtime, seconds]() {
+        uint64_t lastCycle = 0;
+        for (int beat = 1;; ++beat)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(seconds));
+            if (runtime.isStopRequested())
+                return;
+            const EeKernelSnapshot snap = runtime.eeScheduler().snapshot();
+            std::cout << "[heartbeat " << beat * seconds << "s] cycles=" << snap.eeCycle
+                      << (snap.eeCycle == lastCycle ? " (stalled)" : "")
+                      << " running=" << snap.runningThreadId << std::endl;
+            lastCycle = snap.eeCycle;
+            for (const auto &t : snap.threads)
+            {
+                if (t.status == EeThreadStatus::Dormant)
+                    continue;
+                char head[96];
+                std::snprintf(head, sizeof(head), "  thread %d prio %d %s%s pc=0x%06x ", t.id, t.currentPriority,
+                              statusName(t.status), waitName(t.waitReason), t.pc);
+                std::cout << head << describePc(t.pc) << "  ra=" << describePc(t.ra) << std::endl;
+            }
+        }
+    }).detach();
+}

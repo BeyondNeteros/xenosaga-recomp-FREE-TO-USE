@@ -89,11 +89,14 @@ namespace xs_iso
             return 0;
         const uint32_t layer0Sectors = le32(&pvd[80]);
         const uint32_t rounded = (layer0Sectors + 15u) & ~15u;
-        for (uint32_t base : {layer0Sectors, rounded, layer0Sectors - 1u, rounded + 16u})
+        // Layer 1's volume descriptor sits 16 sectors into layer 1. Real Redump
+        // images put it exactly at layer 0's volume size (so layer 1 starts 16
+        // sectors earlier); other dumps put the volume start there instead.
+        for (uint32_t pvdAt : {layer0Sectors, layer0Sectors + 16u, rounded, rounded + 16u})
         {
             std::vector<uint8_t> s;
-            if (base > 16 && readSectors(in, base + 16, kSectorSize, s) && isPvd(s))
-                return base;
+            if (pvdAt > 32 && readSectors(in, pvdAt, kSectorSize, s) && isPvd(s))
+                return pvdAt - 16u;
         }
         return 0;
     }
