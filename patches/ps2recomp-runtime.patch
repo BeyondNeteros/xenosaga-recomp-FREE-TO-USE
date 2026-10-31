@@ -157,6 +157,79 @@ index 0000000..6755bac
 +        }
 +    };
 +}
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..7d5144e 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include <cstddef>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -72,6 +73,35 @@ namespace
+     }
+ }
+ 
++
++namespace
++{
++    constexpr size_t kVu0StateBegin = offsetof(R5900Context, vu0_vf);
++    constexpr size_t kVu0StateSize = offsetof(R5900Context, cop0_index) - kVu0StateBegin;
++    alignas(16) uint8_t g_vu0Shared[kVu0StateSize];
++    bool g_vu0SharedValid = false;
++
++    void vu0LoadShared(R5900Context &context)
++    {
++        if (g_vu0SharedValid)
++            std::memcpy(reinterpret_cast<uint8_t *>(&context) + kVu0StateBegin, g_vu0Shared, kVu0StateSize);
++    }
++
++    template <typename ThreadMap>
++    void vu0SaveShared(ThreadMap &threads, int threadId, size_t invocationDepth)
++    {
++        auto it = threads.find(threadId);
++        if (it == threads.end())
++            return;
++        auto &thread = it->second;
++        if (thread.invocations.size() < invocationDepth)
++            return; // the context that ran is gone
++        const R5900Context &ran = invocationDepth == 0 ? thread.context : thread.invocations[invocationDepth - 1].context;
++        std::memcpy(g_vu0Shared, reinterpret_cast<const uint8_t *>(&ran) + kVu0StateBegin, kVu0StateSize);
++        g_vu0SharedValid = true;
++    }
++}
++
+ EeScheduler::EeScheduler(PS2Runtime &runtime)
+     : m_runtime(runtime)
+ {
+@@ -292,6 +322,13 @@ void EeScheduler::run()
+             continue;
+         }
+ 
++        // VU0 (COP2) registers belong to the hardware, not to a thread: the
++        // EE kernel does not save them on a thread switch, and games keep
++        // state there across threads (Xenosaga keeps its current matrix in
++        // vf27-vf30). Every context therefore runs with the shared copy.
++        const int vu0ThreadId = running->id;
++        const size_t vu0InvocationDepth = running->invocations.size();
++        vu0LoadShared(context);
+         try
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+@@ -299,11 +336,13 @@ void EeScheduler::run()
+             function(m_rdram, &context, &m_runtime);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
++            vu0SaveShared(m_threads, vu0ThreadId, vu0InvocationDepth);
+         }
+         catch (const EeDispatcherTransfer &)
+         {
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
++            vu0SaveShared(m_threads, vu0ThreadId, vu0InvocationDepth);
+         }
+         catch (...)
+         {
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp
 index b1083af..1ed9294 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp
@@ -614,7 +687,7 @@ index f872edd..d31be32 100644
              }
  
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index f19e281..85e1ac7 100644
+index f19e281..dc56f72 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -1,3 +1,4 @@
@@ -622,7 +695,51 @@ index f19e281..85e1ac7 100644
  #include "runtime/ps2_vu1.h"
  #include "runtime/gs/ps2_gif_arbiter.h"
  #include "runtime/gs/gs_frontend.h"
-@@ -64,6 +65,25 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+@@ -58,12 +59,69 @@ uint8_t VU1Interpreter::vfReadLanes(const InstructionUsage &usage, uint8_t reg)
+     return 0u;
+ }
+ 
++namespace
++{
++    // Earliest readyCycle among queued pipeline entries, per interpreter, so
++    // commitReadyPipelines() can skip its full scan on most cycles. A stale
++    // (too early) value only costs one extra scan; it is never too late,
++    // because every queue site lowers it.
++    struct NextCommitSlot
++    {
++        const void *owner = nullptr;
++        uint64_t cycle = 0;
++    };
++    NextCommitSlot g_nextCommit[4];
++
++    inline uint64_t &nextCommitFor(const void *owner)
++    {
++        for (auto &slot : g_nextCommit)
++            if (slot.owner == owner)
++                return slot.cycle;
++        for (auto &slot : g_nextCommit)
++            if (!slot.owner)
++            {
++                slot.owner = owner;
++                slot.cycle = 0;
++                return slot.cycle;
++            }
++        static uint64_t fallback = 0;
++        fallback = 0; // unknown owner: always scan
++        return fallback;
++    }
++
++    inline void noteQueued(const void *owner, uint64_t readyCycle)
++    {
++        uint64_t &next = nextCommitFor(owner);
++        if (readyCycle < next)
++            next = readyCycle;
++    }
++}
++
+ VU1Interpreter::VU1Interpreter(Unit unit)
+     : m_unit(unit)
+ {
      reset();
  }
  
@@ -648,7 +765,7 @@ index f19e281..85e1ac7 100644
  void VU1Interpreter::resetScheduler()
  {
      m_flagPipeline = {};
-@@ -73,7 +93,7 @@ void VU1Interpreter::resetScheduler()
+@@ -73,7 +131,7 @@ void VU1Interpreter::resetScheduler()
      m_vfWritePipeline = {};
      m_viWritePipeline = {};
      m_accWritePipeline = {};
@@ -657,16 +774,139 @@ index f19e281..85e1ac7 100644
      m_vfReady = {};
      m_viReady = {};
      m_accReady = {};
-@@ -932,7 +952,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+@@ -533,6 +591,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    noteQueued(this, entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +631,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            noteQueued(this, entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +651,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            noteQueued(this, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +676,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            noteQueued(this, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +691,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    noteQueued(this, m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +706,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            noteQueued(this, entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +724,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            noteQueued(this, store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +746,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            noteQueued(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +773,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            noteQueued(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +795,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            noteQueued(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -838,6 +906,29 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++
++    uint64_t next = ~0ull;
++    for (const FlagPipelineEntry &e : m_flagPipeline)
++        if (e.valid && e.readyCycle < next)
++            next = e.readyCycle;
++    if (m_fdiv.valid && m_fdiv.readyCycle < next)
++        next = m_fdiv.readyCycle;
++    for (const ScalarPipelineEntry &e : m_efu)
++        if (e.valid && e.readyCycle < next)
++            next = e.readyCycle;
++    for (const PendingStore &e : m_storePipeline)
++        if (e.valid && e.readyCycle < next)
++            next = e.readyCycle;
++    for (const PendingVfWrite &e : m_vfWritePipeline)
++        if (e.valid && e.readyCycle < next)
++            next = e.readyCycle;
++    for (const PendingViWrite &e : m_viWritePipeline)
++        if (e.valid && e.readyCycle < next)
++            next = e.readyCycle;
++    for (const PendingAccWrite &e : m_accWritePipeline)
++        if (e.valid && e.readyCycle < next)
++            next = e.readyCycle;
++    nextCommitFor(this) = next;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -932,7 +1023,10 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
          return;
  
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
 -    m_xgkick = {};
++    static const bool kickLog = std::getenv("PS2X_VU_KICKLOG") != nullptr;
++    if (kickLog)
++        std::printf("[vu1 kick] pc=0x%04x qword=%u cycle=%llu\n", m_state.pc, qwordAddress, (unsigned long long)m_cycle);
 +    resetXgkickState(m_xgkick);
      m_xgkick.active = true;
      m_xgkick.sourceAddress = sourceAddress;
      m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
-@@ -1531,12 +1551,57 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
+@@ -945,7 +1039,8 @@ void VU1Interpreter::advanceOneCycle()
+     m_state.cycles = m_cycle;
+     // LSU commits become visible at the cycle boundary before PATH1 consumes
+     // its next qword from VU memory.
+-    commitReadyPipelines();
++    if (m_cycle >= nextCommitFor(this))
++        commitReadyPipelines();
+     progressXgkick();
+ }
+ 
+@@ -1531,12 +1626,57 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
      return decoded;
  }
  
@@ -727,7 +967,7 @@ index f19e281..85e1ac7 100644
  
      m_cachedVuCode = vuCode;
      m_cachedMemory = memory;
-@@ -1567,8 +1632,14 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
+@@ -1567,8 +1707,14 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
          rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
      }
      const uint32_t pairIndex = pc / 8u;
@@ -743,12 +983,25 @@ index f19e281..85e1ac7 100644
      return m_decodedCodeCache[pairIndex];
  }
  
+@@ -1633,9 +1779,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
++    nextCommitFor(this) = 0; // state may have been replaced; rescan once
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+-        commitReadyPipelines();
++        if (m_cycle >= nextCommitFor(this))
++            commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
 diff --git a/ps2xRuntime/tools/vu1_replay.cpp b/ps2xRuntime/tools/vu1_replay.cpp
 new file mode 100644
-index 0000000..9c86f12
+index 0000000..37d388d
 --- /dev/null
 +++ b/ps2xRuntime/tools/vu1_replay.cpp
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,177 @@
 +// Replays VU1 calls recorded with PS2X_VU_CAPTURE=1 (vu1_capture.bin) through
 +// the runtime's VU1 interpreter, for profiling and for checking that
 +// optimizations don't change results.
@@ -829,7 +1082,15 @@ index 0000000..9c86f12
 +    gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &memory.gs());
 +    GifArbiter arbiter;
 +    uint64_t gifBytes = 0, gifPackets = 0;
++    std::ofstream gifDump;
++    if (const char *path = std::getenv("VU_REPLAY_GIFDUMP"))
++        gifDump.open(path, std::ios::binary);
 +    arbiter.setProcessPacketFn([&](const uint8_t *d, uint32_t size) {
++        if (gifDump.is_open())
++        {
++            gifDump.write(reinterpret_cast<const char *>(&size), 4);
++            gifDump.write(reinterpret_cast<const char *>(d), size);
++        }
 +        gifBytes += size;
 +        ++gifPackets;
 +        gs.processGIFPacket(d, size);
@@ -857,10 +1118,11 @@ index 0000000..9c86f12
 +                memory.markVU1CodeModified();
 +            }
 +            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
++            const uint64_t before = vu.state().cycles; // interpreter's running cycle count
 +            vu.state() = r.state;
++            vu.state().cycles = before;
 +            if (forceInvalidate)
 +                memory.markVU1CodeModified(); // the game re-uploads microcode (MPG) before its calls
-+            const uint64_t before = vu.state().cycles;
 +            const auto c0 = std::chrono::steady_clock::now();
 +            if (r.kind == 0)
 +                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
