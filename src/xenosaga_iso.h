@@ -73,19 +73,47 @@ namespace xs_iso
         return parts;
     }
 
+    inline bool isPvd(const std::vector<uint8_t> &s)
+    {
+        return s.size() >= kSectorSize && s[0] == 1 && std::memcmp(&s[1], "CD001", 5) == 0;
+    }
+
+    // Dual-layer (DVD9) PS2 images hold layer 1 as a second volume after layer 0.
+    // Returns the sector where layer 1 starts, or 0 for a single-layer image.
+    // Layer 0's volume size points at it; PCSX2 rounds that up to 16 sectors.
+    inline uint32_t findLayer1Start(const std::filesystem::path &image)
+    {
+        std::ifstream in(image, std::ios::binary);
+        std::vector<uint8_t> pvd;
+        if (!in || !readSectors(in, 16, kSectorSize, pvd) || !isPvd(pvd))
+            return 0;
+        const uint32_t layer0Sectors = le32(&pvd[80]);
+        const uint32_t rounded = (layer0Sectors + 15u) & ~15u;
+        for (uint32_t base : {layer0Sectors, rounded, layer0Sectors - 1u, rounded + 16u})
+        {
+            std::vector<uint8_t> s;
+            if (base > 16 && readSectors(in, base + 16, kSectorSize, s) && isPvd(s))
+                return base;
+        }
+        return 0;
+    }
+
     // Find a file or directory by path ("\\XENOSAGA.00;1", "cdrom0:\\IOP\\SSD.IRX;1").
-    inline bool lookup(const std::filesystem::path &image, const std::string &path, Entry &result)
+    // layerStart selects the volume: 0 for layer 0, findLayer1Start() for layer 1.
+    // Returned LSNs are absolute positions in the image.
+    inline bool lookup(const std::filesystem::path &image, const std::string &path, Entry &result,
+                       uint32_t layerStart = 0)
     {
         std::ifstream in(image, std::ios::binary);
         if (!in)
             return false;
 
         std::vector<uint8_t> pvd;
-        if (!readSectors(in, 16, kSectorSize, pvd) || pvd[0] != 1 || std::memcmp(&pvd[1], "CD001", 5) != 0)
+        if (!readSectors(in, layerStart + 16, kSectorSize, pvd) || !isPvd(pvd))
             return false;
 
         const uint8_t *root = &pvd[156];
-        Entry current{le32(root + 2), le32(root + 10), true};
+        Entry current{layerStart + le32(root + 2), le32(root + 10), true};
 
         for (const std::string &want : splitPath(path))
         {
@@ -110,7 +138,7 @@ namespace xs_iso
                 const std::string name(reinterpret_cast<const char *>(&dir[off + 33]), nameLen);
                 if (nameLen > 0 && !(nameLen == 1 && (name[0] == 0 || name[0] == 1)) && normalizeName(name) == want)
                 {
-                    current = Entry{le32(&dir[off + 2]), le32(&dir[off + 10]), (dir[off + 25] & 0x02) != 0};
+                    current = Entry{layerStart + le32(&dir[off + 2]), le32(&dir[off + 10]), (dir[off + 25] & 0x02) != 0};
                     found = true;
                     break;
                 }

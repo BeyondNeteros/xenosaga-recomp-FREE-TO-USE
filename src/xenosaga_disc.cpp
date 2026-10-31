@@ -19,6 +19,8 @@
 namespace
 {
     constexpr uint32_t kRdramMask = 0x01FFFFFFu;
+    uint32_t g_layer1Start = 0; // 0 = single-layer image
+    bool g_layerCall = false;   // set by the sceCdLayerSearchFile entry point
 
     std::string readGuestString(const uint8_t *rdram, uint32_t addr, size_t maxLen)
     {
@@ -72,7 +74,11 @@ void xs_configureDiscImage()
     PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
     paths.cdImage = image;
     PS2Runtime::setIoPaths(paths);
-    std::cout << "[xenosaga] disc image: " << image << std::endl;
+    g_layer1Start = xs_iso::findLayer1Start(image);
+    std::cout << "[xenosaga] disc image: " << image;
+    if (g_layer1Start)
+        std::cout << " (dual layer, layer 1 at sector " << g_layer1Start << ")";
+    std::cout << std::endl;
 }
 
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out)
@@ -96,9 +102,14 @@ void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint32_t fileAddr = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
     const uint32_t nameAddr = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
     const std::string name = readGuestString(rdram, nameAddr, 260);
+    // sceCdLayerSearchFile passes the layer in $a2; plain sceCdSearchFile leaves
+    // $a2 unrelated, so the layer is only read for the layer entry point.
+    const uint32_t layer = g_layerCall ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[6])) : 0u;
+    g_layerCall = false;
+    const uint32_t layerStart = (layer == 1 && g_layer1Start) ? g_layer1Start : 0u;
 
     xs_iso::Entry e;
-    if (!xs_iso::lookup(image, name, e) || e.directory)
+    if (!xs_iso::lookup(image, name, e, layerStart) || e.directory)
     {
         std::cout << "[xenosaga] disc file not found: " << name << std::endl;
         setReturnS32(ctx, 0);
@@ -111,6 +122,25 @@ void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     std::memcpy(fp + 4, &e.size, 4);
     std::string leaf = name.substr(name.find_last_of("\\/:") + 1);
     std::strncpy(reinterpret_cast<char *>(fp + 8), leaf.c_str(), 15);
-    std::cout << "[xenosaga] disc lookup " << name << " lsn=" << e.lsn << " size=" << e.size << std::endl;
+    std::cout << "[xenosaga] disc lookup " << name << " layer=" << layer << " lsn=" << e.lsn << " size=" << e.size << std::endl;
+    setReturnS32(ctx, 1);
+}
+
+void xs_sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g_layerCall = true;
+    xs_sceCdSearchFile(rdram, ctx, runtime);
+}
+
+// int sceCdReadDvdDualInfo(int *on_dual, u_int *layer1_start)
+void xs_sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+{
+    const uint32_t onDualAddr = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+    const uint32_t layer1Addr = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+    const uint32_t onDual = g_layer1Start ? 1u : 0u;
+    if (onDualAddr)
+        std::memcpy(rdram + (onDualAddr & kRdramMask), &onDual, 4);
+    if (layer1Addr)
+        std::memcpy(rdram + (layer1Addr & kRdramMask), &g_layer1Start, 4);
     setReturnS32(ctx, 1);
 }

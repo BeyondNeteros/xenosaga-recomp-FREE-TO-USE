@@ -27,6 +27,8 @@ void xs_register_ov12(PS2Runtime::RecompiledFunction *t);
 void xs_configureDiscImage();
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void xs_sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void xs_sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
 namespace
 {
@@ -168,18 +170,6 @@ namespace
         setReturnS32(ctx, -19); // -ENODEV
     }
 
-    // int sceCdReadDvdDualInfo(int *on_dual, u_int *layer1_start): single-layer disc.
-    void cdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
-    {
-        const uint32_t onDual = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
-        const uint32_t layer1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
-        const uint32_t zero = 0;
-        if (onDual)
-            std::memcpy(rdram + (onDual & kRdramMask), &zero, 4);
-        if (layer1)
-            std::memcpy(rdram + (layer1 & kRdramMask), &zero, 4);
-        setReturnS32(ctx, 1);
-    }
 
     void applyXenosaga(PS2Runtime &runtime)
     {
@@ -187,10 +177,10 @@ namespace
         runtime.registerFunction(kLoadOverlayAddr, xglCdLoadOverlay_hook);
         // File lookups return real disc positions when a disc image is present.
         runtime.registerFunction(0x0020D220u, xs_sceCdSearchFile);      // sceCdSearchFile
-        runtime.registerFunction(0x0020CF08u, xs_sceCdSearchFile);      // sceCdLayerSearchFile
+        runtime.registerFunction(0x0020CF08u, xs_sceCdLayerSearchFile); // sceCdLayerSearchFile
         runtime.registerFunction(0x0020E1C8u, cdReturnSuccess);   // _sceCdSetTimeout
         runtime.registerFunction(0x0020E358u, cdReturnSuccess);   // sceCdPowerOff
-        runtime.registerFunction(0x0020E2A0u, cdReadDvdDualInfo); // sceCdReadDvdDualInfo
+        runtime.registerFunction(0x0020E2A0u, xs_sceCdReadDvdDualInfo); // sceCdReadDvdDualInfo
         // _sceFsWaitS waits on the libc file-I/O semaphore. File I/O runs host-side,
         // so that semaphore is never created; succeed immediately.
         runtime.registerFunction(0x00204338u, cdReturnZero);
