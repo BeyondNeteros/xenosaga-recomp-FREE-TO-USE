@@ -1,0 +1,836 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..a02e0f1 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -253,7 +253,7 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
+ if(NOT PS2X_ENABLE_FFMPEG)
+     message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
+     add_library(ffmpeg INTERFACE)
+-elseif(WIN32)
++elseif(WIN32 AND NOT PS2X_FFMPEG_USE_PKGCONFIG)
+     include(ExternalProject)
+ 
+     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+@@ -441,6 +441,11 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+ )
+ 
++# Hand-written port code changes often; keep it out of unity batches so an edit
++# does not recompile the generated files batched with it.
++file(GLOB PS2X_PORT_SRC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_*.cpp")
++set_source_files_properties(${PS2X_PORT_SRC_FILES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++
+ set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
+ set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+ 
+@@ -577,6 +582,27 @@ if(MSVC)
+     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+ endif()
+ 
++# MinGW has no /FORCE:MULTIPLE. raylib's CloseWindow/ShowCursor clash with the
++# user32 functions of the same name, so rename raylib's definitions and the
++# callers that mean raylib's. GLFW reaches user32 through __imp_ pointers and
++# is unaffected.
++if(MINGW)
++    find_program(PS2X_OBJCOPY NAMES ${CMAKE_OBJCOPY} x86_64-w64-mingw32-objcopy objcopy REQUIRED)
++    add_custom_command(TARGET ps2EntryRunner PRE_LINK
++        COMMAND ${PS2X_OBJCOPY}
++            --redefine-sym CloseWindow=rlCloseWindow
++            --redefine-sym ShowCursor=rlShowCursor
++            $<TARGET_FILE:raylib>
++        COMMAND ${PS2X_OBJCOPY}
++            --redefine-sym ShowCursor=rlShowCursor
++            $<TARGET_FILE:rlImGui>
++        COMMAND ${PS2X_OBJCOPY}
++            --redefine-sym CloseWindow=rlCloseWindow
++            $<TARGET_FILE:ps2_runtime>
++        COMMENT "Renaming raylib CloseWindow/ShowCursor to avoid user32 clashes"
++        VERBATIM)
++endif()
++
+ # Vita: Work around for GCC 10's LTO plugin
+ if(PS2X_IS_VITA)
+     target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+@@ -597,7 +623,7 @@ install(TARGETS ps2_runtime ps2EntryRunner
+     ARCHIVE DESTINATION lib
+ )
+ 
+-if(WIN32 AND PS2X_ENABLE_FFMPEG)
++if(WIN32 AND PS2X_ENABLE_FFMPEG AND NOT PS2X_FFMPEG_USE_PKGCONFIG)
+     install(DIRECTORY "${FFMPEG_BIN_DIR}/"
+         DESTINATION bin
+         FILES_MATCHING
+@@ -608,3 +634,10 @@ endif()
+ install(DIRECTORY include/
+     DESTINATION include
+ )
++
++# Offline VU1 replay/profiling tool (PS2X_VU_CAPTURE=1 recordings).
++option(PS2X_BUILD_VU_REPLAY "Build the vu1_replay profiling tool" OFF)
++if(PS2X_BUILD_VU_REPLAY)
++    add_executable(vu1_replay tools/vu1_replay.cpp)
++    target_link_libraries(vu1_replay PRIVATE ps2_runtime)
++endif()
+diff --git a/ps2xRuntime/cmake/ReleaseMode.cmake b/ps2xRuntime/cmake/ReleaseMode.cmake
+index 92ef0d5..d24ec97 100644
+--- a/ps2xRuntime/cmake/ReleaseMode.cmake
++++ b/ps2xRuntime/cmake/ReleaseMode.cmake
+@@ -34,7 +34,7 @@ function(EnableFastReleaseMode TargetName)
+         endif()
+     endif()
+ 
+-    if(IPO_SUPPORTED)
++    if(IPO_SUPPORTED AND NOT PS2X_DISABLE_IPO)
+         set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+     else()
+         message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0485d50..40c7680 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -856,21 +856,21 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_UN_S(a, b) (std::isnan((float)(a)) || std::isnan((float)(b)))
+ #define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || std::isnan((float)(a)) || std::isnan((float)(b)))
+ #define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || std::isnan((float)(a)) || std::isnan((float)(b)))
+ #define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || std::isnan((float)(a)) || std::isnan((float)(b)))
+ #define FPU_C_SF_S(a, b) (0)
+-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_NGLE_S(a, b) (std::isnan((float)(a)) || std::isnan((float)(b)))
+ #define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || std::isnan((float)(a)) || std::isnan((float)(b)))
+ #define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || std::isnan((float)(a)) || std::isnan((float)(b)))
+ #define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || std::isnan((float)(a)) || std::isnan((float)(b)))
+ 
+ // QFSRV: Quadword Funnel Shift Right Variable
+ // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
+diff --git a/ps2xRuntime/include/runtime/ps2_profile.h b/ps2xRuntime/include/runtime/ps2_profile.h
+new file mode 100644
+index 0000000..6755bac
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_profile.h
+@@ -0,0 +1,33 @@
++#pragma once
++// Lightweight host-time counters for finding emulation bottlenecks.
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++namespace ps2_profile
++{
++    enum Counter : uint32_t
++    {
++        Vu1Exec,   // VU1 microprogram execution (includes XGKICK -> GS)
++        GsPacket,  // GS::processGIFPacket (GIF parsing + rasterization)
++        Vif1Parse, // VIF1 stream parsing (includes UNPACK, DIRECT -> GS)
++        Count
++    };
++
++    inline std::atomic<uint64_t> g_ns[Count]{};
++    inline std::atomic<uint64_t> g_calls[Count]{};
++
++    struct Scope
++    {
++        Counter counter;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        explicit Scope(Counter c) : counter(c) {}
++        ~Scope()
++        {
++            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                std::chrono::steady_clock::now() - start).count();
++            g_ns[counter].fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
++            g_calls[counter].fetch_add(1, std::memory_order_relaxed);
++        }
++    };
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp
+index b1083af..1ed9294 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp
+@@ -15,17 +15,23 @@ namespace ps2_stubs
+ 
+     void sceFsSemExit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        TODO_NAMED("sceFsSemExit", rdram, ctx, runtime);
++        // File I/O is serviced host-side, so the EE-side fs semaphore is unnecessary.
++        (void)rdram; (void)runtime;
++        setReturnS32(ctx, 0);
+     }
+ 
+     void sceFsSemInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        TODO_NAMED("sceFsSemInit", rdram, ctx, runtime);
++        // File I/O is serviced host-side, so the EE-side fs semaphore is unnecessary.
++        (void)rdram; (void)runtime;
++        setReturnS32(ctx, 0);
+     }
+ 
+     void sceFsSigSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        TODO_NAMED("sceFsSigSema", rdram, ctx, runtime);
++        // File I/O is serviced host-side, so the EE-side fs semaphore is unnecessary.
++        (void)rdram; (void)runtime;
++        setReturnS32(ctx, 0);
+     }
+ 
+     void close(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index aed4cb5..82ba73c 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -1,3 +1,4 @@
++#include <cstddef>
+ #include "Common.h"
+ #include "GS.h"
+ #include "ps2_log.h"
+@@ -1016,6 +1017,17 @@ namespace ps2_stubs
+         uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+ 
+         writeGsDispEnv(rdram, envAddr, display, dispfb);
++
++        // Like libgraph, also default PMODE and BGCOLOR: read circuit 2 only
++        // (EN2=1, CRTMD=1, MMOD=1 fixed alpha). Games build on this value;
++        // leaving it zero switches both display circuits off.
++        if (uint8_t *env = getMemPtr(rdram, envAddr))
++        {
++            const uint64_t pmode = (1ull << 1) | (1ull << 2) | (1ull << 5);
++            const uint64_t bgcolor = 0;
++            std::memcpy(env + offsetof(GsDispEnvMem, pmode), &pmode, sizeof(pmode));
++            std::memcpy(env + offsetof(GsDispEnvMem, bgcolor), &bgcolor, sizeof(bgcolor));
++        }
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..fb5f2c8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_profile.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+@@ -640,6 +641,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ 
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2_profile::Scope profileScope(ps2_profile::GsPacket);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..7463fdb 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -1439,6 +1440,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
+                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
+                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
++                        // Bit 63 (SPR) selects scratchpad for ADDR. Map it to the
++                        // scratchpad's EE address so isScratchpad()/translateAddress() see it.
++                        const bool addrInSpr = ((tag >> 63) & 0x1ull) != 0ull;
++                        if (addrInSpr)
++                        {
++                            addr = PS2_SCRATCHPAD_BASE + (addr & (PS2_SCRATCHPAD_SIZE - 1u));
++                            static uint64_t sprRefs = 0;
++                            if (++sprRefs <= 20 || (sprRefs % 10000) == 0)
++                                std::printf("[dma] chain tag id=%u references scratchpad +0x%x (#%llu)\n",
++                                            id, addr - PS2_SCRATCHPAD_BASE, (unsigned long long)sprRefs);
++                        }
+                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+                         ++tagsProcessed;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..1869a3a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,6 @@
++#include <cstdio>
++#include <cstdlib>
++#include "runtime/ps2_profile.h"
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -27,6 +30,44 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++namespace
++{
++    // PS2X_VU_CAPTURE=1: record VU1 calls (state + code + data memory) to
++    // vu1_capture.bin for offline replay/profiling. Skips the first
++    // PS2X_VU_CAPTURE_SKIP calls (default 20000), then records 300.
++    void captureVu1Call(uint32_t kind, uint32_t startPC, uint32_t top, uint32_t itop,
++                        const VU1State &state, const uint8_t *code, const uint8_t *data)
++    {
++        static const bool enabled = [] { const char *v = std::getenv("PS2X_VU_CAPTURE"); return v && v[0] == '1'; }();
++        if (!enabled)
++            return;
++        static const uint64_t skip = [] { const char *v = std::getenv("PS2X_VU_CAPTURE_SKIP"); return v ? std::strtoull(v, nullptr, 10) : 20000ull; }();
++        static uint64_t calls = 0;
++        static uint32_t recorded = 0;
++        static std::ofstream out;
++        if (++calls <= skip || recorded >= 300u)
++            return;
++        if (!out.is_open())
++        {
++            out.open("vu1_capture.bin", std::ios::binary);
++            const uint32_t header[4] = {0x31555658u /* XVU1 */, 1u, static_cast<uint32_t>(sizeof(VU1State)), 0u};
++            out.write(reinterpret_cast<const char *>(header), sizeof(header));
++        }
++        const uint32_t rec[4] = {kind, startPC, top, itop};
++        out.write(reinterpret_cast<const char *>(rec), sizeof(rec));
++        out.write(reinterpret_cast<const char *>(&state), sizeof(VU1State));
++        out.write(reinterpret_cast<const char *>(code), PS2_VU1_CODE_SIZE);
++        out.write(reinterpret_cast<const char *>(data), PS2_VU1_DATA_SIZE);
++        if (++recorded == 300u)
++        {
++            out.close();
++            std::printf("[vu-capture] wrote 300 VU1 calls to vu1_capture.bin\n");
++        }
++    }
++}
++
++
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -679,6 +720,8 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     captureVu1Call(0u, startPC, top, itop, m_vu1.state(), m_memory.getVU1Code(), m_memory.getVU1Data());
++                                     ps2_profile::Scope vuScope(ps2_profile::Vu1Exec);
+                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+@@ -697,6 +740,8 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     captureVu1Call(1u, 0u, top, itop, m_vu1.state(), m_memory.getVU1Code(), m_memory.getVU1Data());
++                                     ps2_profile::Scope vuScope(ps2_profile::Vu1Exec);
+                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, 65536);
+@@ -1134,6 +1179,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+     }
+ }
+ 
++
+ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f872edd..d31be32 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,3 +1,6 @@
++#include "runtime/ps2_profile.h"
++#include <cstdio>
++#include <cstdlib>
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
+@@ -283,6 +286,25 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+     }
+ }
+ 
++namespace
++{
++    // PS2X_VU_TRACE=1: log VU1 microprogram uploads (MPG) and starts (MSCAL/MSCNT).
++    bool vuTraceEnabled()
++    {
++        static const bool enabled = [] {
++            const char *v = std::getenv("PS2X_VU_TRACE");
++            return v && v[0] == '1';
++        }();
++        return enabled;
++    }
++
++    bool vuTraceSample(uint64_t &counter)
++    {
++        const uint64_t n = ++counter;
++        return n <= 200 || (n % 5000) == 0;
++    }
++}
++
+ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+@@ -297,6 +319,7 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2_profile::Scope profileScope(ps2_profile::Vif1Parse);
+     if (sizeBytes == 0u)
+         return;
+ 
+@@ -304,33 +327,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+-        if (m_vif1PendingPath2ImageQwc != 0u)
+-        {
+-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+-            if (availableQw == 0u)
+-            {
+-                break;
+-            }
+-
+-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+-            const uint64_t imageTag =
+-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+-                (static_cast<uint64_t>(kGifFmtImage) << 58);
+-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+-
+-            pos += chunkQw * 16u;
+-            m_vif1PendingPath2ImageQwc -= chunkQw;
+-            if (m_vif1PendingPath2ImageQwc == 0u)
+-            {
+-                m_vif1PendingPath2DirectHl = false;
+-            }
+-            continue;
+-        }
+-
++        // Note: a GIF IMAGE transfer left incomplete by a DIRECT command is
++        // continued by the payload of the next DIRECT/DIRECTHL command (each
++        // with its own VIFcode), never by raw bytes following the command.
+         uint32_t cmd;
+         memcpy(&cmd, data + pos, 4);
+         pos += 4;
+@@ -416,6 +415,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
++            if (vuTraceEnabled())
++            {
++                static uint64_t mscalCount = 0;
++                if (vuTraceSample(mscalCount))
++                {
++                    uint32_t lower = 0, upper = 0;
++                    if (m_vu1Code && startPC + 8 <= PS2_VU1_CODE_SIZE)
++                    {
++                        std::memcpy(&lower, m_vu1Code + startPC, 4);
++                        std::memcpy(&upper, m_vu1Code + startPC + 4, 4);
++                    }
++                    std::printf("[vu-trace] MSCAL #%llu start=0x%x top=0x%x code@start=%08x %08x\n",
++                                (unsigned long long)mscalCount, startPC, runTop, lower, upper);
++                }
++            }
+             if (m_vu1MscalCallback)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+@@ -469,6 +483,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             uint32_t destAddr = (uint32_t)imm * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
++            bool uploaded = false;
+             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
+             {
+                 uint32_t copyBytes = mpgBytes;
+@@ -476,8 +491,27 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+                 if (pos + copyBytes <= sizeBytes)
+                 {
+-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+-                    markVU1CodeModified();
++                    // Games re-upload the same microcode every frame; only a real
++                    // change should invalidate the VU1 decode cache.
++                    if (std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
++                    {
++                        std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
++                        markVU1CodeModified();
++                    }
++                    uploaded = true;
++                }
++            }
++            if (vuTraceEnabled())
++            {
++                static uint64_t mpgCount = 0;
++                if (vuTraceSample(mpgCount) || !uploaded)
++                {
++                    uint32_t first = 0;
++                    if (pos + 4 <= sizeBytes)
++                        std::memcpy(&first, data + pos, 4);
++                    std::printf("[vu-trace] MPG #%llu dest=0x%x instrs=%u avail=%u first=0x%08x %s\n",
++                                (unsigned long long)mpgCount, destAddr, instructionCount, sizeBytes - pos, first,
++                                uploaded ? "ok" : "DROPPED");
+                 }
+             }
+             pos += mpgBytes;
+@@ -498,13 +532,41 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             if (qwCount > 0)
+             {
+                 const bool directHl = (opcode == VIF_DIRECTHL);
+-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
++                const uint8_t *payload = data + pos;
++                uint32_t payloadQw = qwCount;
+ 
+-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+-                if (pendingImageQw != 0u)
++                // Continue an IMAGE transfer started by an earlier DIRECT
++                // (e.g. sceVif1PkRefLoadImage puts the GIFtag and the pixels in
++                // separate DIRECT commands).
++                if (m_vif1PendingPath2ImageQwc != 0u)
+                 {
+-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
+-                    m_vif1PendingPath2DirectHl = directHl;
++                    const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, payloadQw);
++                    std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
++                    const uint64_t imageTag =
++                        static_cast<uint64_t>(chunkQw & 0x7FFFu) |
++                        ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
++                        (static_cast<uint64_t>(kGifFmtImage) << 58);
++                    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                    std::memcpy(imagePacket.data() + 16u, payload, static_cast<size_t>(chunkQw) * 16u);
++                    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true,
++                                    m_vif1PendingPath2DirectHl);
++                    m_vif1PendingPath2ImageQwc -= chunkQw;
++                    if (m_vif1PendingPath2ImageQwc == 0u)
++                        m_vif1PendingPath2DirectHl = false;
++                    payload += chunkQw * 16u;
++                    payloadQw -= chunkQw;
++                }
++
++                if (payloadQw > 0)
++                {
++                    submitGifPacket(GifPathId::Path2, payload, payloadQw * 16, true, directHl);
++
++                    const uint32_t pendingImageQw = pendingGifImageQwc(payload, payloadQw * 16u);
++                    if (pendingImageQw != 0u)
++                    {
++                        m_vif1PendingPath2ImageQwc = pendingImageQw;
++                        m_vif1PendingPath2DirectHl = directHl;
++                    }
+                 }
+             }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index f19e281..85e1ac7 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,3 +1,4 @@
++#include <mutex>
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -64,6 +65,25 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+     reset();
+ }
+ 
++namespace
++{
++    // Reset an XGKICK pipeline without zeroing its 64 KB packet buffer: the
++    // buffer is always written before it is read, and clearing it on every
++    // VU1 call and every XGKICK cost more than running the microcode.
++    template <typename Pipeline>
++    void resetXgkickState(Pipeline &x)
++    {
++        x.sourceAddress = 0;
++        x.totalBytes = 0;
++        x.copiedBytes = 0;
++        x.currentTagEnd = 0;
++        x.cycleCredit = 0;
++        x.issueCycle = 0;
++        x.active = false;
++        x.currentTagEop = false;
++    }
++}
++
+ void VU1Interpreter::resetScheduler()
+ {
+     m_flagPipeline = {};
+@@ -73,7 +93,7 @@ void VU1Interpreter::resetScheduler()
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
+-    m_xgkick = {};
++    resetXgkickState(m_xgkick);
+     m_vfReady = {};
+     m_viReady = {};
+     m_accReady = {};
+@@ -932,7 +952,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+         return;
+ 
+     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+-    m_xgkick = {};
++    resetXgkickState(m_xgkick);
+     m_xgkick.active = true;
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+@@ -1531,12 +1551,57 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
+     return decoded;
+ }
+ 
++namespace
++{
++    // Lazy decode-cache validity, kept out of the header so this stays a
++    // one-file change. A code change bumps the owner's epoch in O(1); each
++    // instruction pair is re-decoded the first time it runs after that,
++    // instead of re-decoding all 2048 pairs (about 20 us) on every change.
++    struct LazyDecodeState
++    {
++        const void *owner = nullptr;
++        uint32_t epoch = 1;
++        std::array<uint32_t, 0x4000u / 8u> pairEpoch{};
++    };
++    LazyDecodeState g_lazyDecode[4];
++    std::mutex g_lazyDecodeMutex;
++
++    LazyDecodeState &lazyDecodeFor(const void *owner)
++    {
++        thread_local const void *lastOwner = nullptr;
++        thread_local LazyDecodeState *lastState = nullptr;
++        if (lastOwner == owner && lastState)
++            return *lastState;
++        std::lock_guard<std::mutex> lock(g_lazyDecodeMutex);
++        LazyDecodeState *found = nullptr;
++        for (auto &st : g_lazyDecode)
++            if (st.owner == owner)
++                found = &st;
++        if (!found)
++            for (auto &st : g_lazyDecode)
++                if (!st.owner)
++                {
++                    st.owner = owner;
++                    found = &st;
++                    break;
++                }
++        if (!found)
++            found = &g_lazyDecode[0];
++        lastOwner = owner;
++        lastState = found;
++        return *found;
++    }
++}
++
+ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                                              const PS2Memory *memory, uint64_t generation)
+ {
+-    const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+-    for (uint32_t i = 0; i < pairCount; ++i)
+-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
++    LazyDecodeState &lazy = lazyDecodeFor(this);
++    if (++lazy.epoch == 0u)
++    {
++        lazy.pairEpoch.fill(0u);
++        lazy.epoch = 1u;
++    }
+ 
+     m_cachedVuCode = vuCode;
+     m_cachedMemory = memory;
+@@ -1567,8 +1632,14 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
+         rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
+     }
+     const uint32_t pairIndex = pc / 8u;
+-    if (pairIndex >= kMaxDecodedPairs)
++    if (pairIndex >= kMaxDecodedPairs || pc + 8u > codeSize)
+         return decodeInstructionPair(vuCode, pc);
++    LazyDecodeState &lazy = lazyDecodeFor(this);
++    if (lazy.pairEpoch[pairIndex] != lazy.epoch)
++    {
++        m_decodedCodeCache[pairIndex] = decodeInstructionPair(vuCode, pc);
++        lazy.pairEpoch[pairIndex] = lazy.epoch;
++    }
+     return m_decodedCodeCache[pairIndex];
+ }
+ 
+diff --git a/ps2xRuntime/tools/vu1_replay.cpp b/ps2xRuntime/tools/vu1_replay.cpp
+new file mode 100644
+index 0000000..9c86f12
+--- /dev/null
++++ b/ps2xRuntime/tools/vu1_replay.cpp
+@@ -0,0 +1,168 @@
++// Replays VU1 calls recorded with PS2X_VU_CAPTURE=1 (vu1_capture.bin) through
++// the runtime's VU1 interpreter, for profiling and for checking that
++// optimizations don't change results.
++//
++//   vu1_replay vu1_capture.bin [repeat] [--dump-out out.bin]
++
++#include "ps2_runtime.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/ps2_vu1.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/ps2_gif_arbiter.h"
++
++#include <chrono>
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++
++namespace
++{
++    struct Record
++    {
++        uint32_t kind, startPC, top, itop;
++        VU1State state;
++        std::vector<uint8_t> code, data;
++    };
++
++    uint64_t fnv1a(const uint8_t *p, size_t n, uint64_t h = 1469598103934665603ull)
++    {
++        for (size_t i = 0; i < n; ++i)
++            h = (h ^ p[i]) * 1099511628211ull;
++        return h;
++    }
++}
++
++int main(int argc, char **argv)
++{
++    if (argc < 2)
++    {
++        std::fprintf(stderr, "usage: %s vu1_capture.bin [repeat]\n", argv[0]);
++        return 1;
++    }
++    const int repeat = argc > 2 ? std::atoi(argv[2]) : 20;
++
++    std::ifstream in(argv[1], std::ios::binary);
++    uint32_t header[4];
++    in.read(reinterpret_cast<char *>(header), sizeof(header));
++    if (!in || header[0] != 0x31555658u || header[2] != sizeof(VU1State))
++    {
++        std::fprintf(stderr, "bad capture (state size %u, expected %zu)\n", header[2], sizeof(VU1State));
++        return 1;
++    }
++    std::vector<Record> records;
++    for (;;)
++    {
++        Record r;
++        uint32_t rec[4];
++        if (!in.read(reinterpret_cast<char *>(rec), sizeof(rec)))
++            break;
++        r.kind = rec[0]; r.startPC = rec[1]; r.top = rec[2]; r.itop = rec[3];
++        in.read(reinterpret_cast<char *>(&r.state), sizeof(VU1State));
++        r.code.resize(PS2_VU1_CODE_SIZE);
++        r.data.resize(PS2_VU1_DATA_SIZE);
++        in.read(reinterpret_cast<char *>(r.code.data()), PS2_VU1_CODE_SIZE);
++        in.read(reinterpret_cast<char *>(r.data.data()), PS2_VU1_DATA_SIZE);
++        if (!in)
++            break;
++        records.push_back(std::move(r));
++    }
++    std::printf("loaded %zu VU1 calls\n", records.size());
++
++    PS2Memory memory;
++    if (!memory.initialize())
++        return 1;
++    GS gs;
++    gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &memory.gs());
++    GifArbiter arbiter;
++    uint64_t gifBytes = 0, gifPackets = 0;
++    arbiter.setProcessPacketFn([&](const uint8_t *d, uint32_t size) {
++        gifBytes += size;
++        ++gifPackets;
++        gs.processGIFPacket(d, size);
++    });
++    memory.setGifArbiter(&arbiter);
++
++    VU1Interpreter vu(VU1Interpreter::Unit::VU1);
++    vu.reset();
++
++    uint64_t checksum = 0;
++    double totalNs = 0;
++    uint64_t totalCycles = 0;
++    const bool forceInvalidate = std::getenv("VU_REPLAY_INVALIDATE") != nullptr;
++    for (int pass = 0; pass < repeat; ++pass)
++    {
++        gifBytes = gifPackets = 0;
++        uint64_t cycles = 0;
++        double callNs = 0;
++        const auto t0 = std::chrono::steady_clock::now();
++        for (const Record &r : records)
++        {
++            if (std::memcmp(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE) != 0)
++            {
++                std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
++                memory.markVU1CodeModified();
++            }
++            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
++            vu.state() = r.state;
++            if (forceInvalidate)
++                memory.markVU1CodeModified(); // the game re-uploads microcode (MPG) before its calls
++            const uint64_t before = vu.state().cycles;
++            const auto c0 = std::chrono::steady_clock::now();
++            if (r.kind == 0)
++                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                           gs, &memory, r.startPC, r.top, r.itop, 65536);
++            else
++                vu.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                          gs, &memory, r.top, r.itop, 65536);
++            arbiter.drain();
++            callNs += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - c0).count();
++            cycles += vu.state().cycles - before;
++            if (pass == 0)
++            {
++                checksum = fnv1a(memory.getVU1Data(), PS2_VU1_DATA_SIZE, checksum);
++                checksum = fnv1a(reinterpret_cast<const uint8_t *>(vu.state().vf), sizeof(vu.state().vf), checksum);
++                checksum = fnv1a(reinterpret_cast<const uint8_t *>(vu.state().vi), sizeof(vu.state().vi), checksum);
++            }
++        }
++        const double ns = callNs; (void)t0;
++        if (pass > 0) // first pass warms caches
++        {
++            totalNs += ns;
++            totalCycles += cycles;
++        }
++    }
++    if (std::getenv("VU_REPLAY_DETAIL"))
++    {
++        for (size_t i = 0; i < records.size(); ++i)
++        {
++            const Record &r = records[i];
++            std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
++            memory.markVU1CodeModified();
++            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
++            vu.state() = r.state;
++            gifBytes = 0;
++            if (r.kind == 0)
++                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                           gs, &memory, r.startPC, r.top, r.itop, 65536);
++            else
++                vu.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                          gs, &memory, r.top, r.itop, 65536);
++            arbiter.drain();
++            const VU1State &st = vu.state();
++            std::printf("call %3zu kind=%u start=0x%04x end_pc=0x%04x cycles=%6llu ebit=%d D=%d T=%d gif=%llu\n", i, r.kind,
++                        r.startPC, st.pc, (unsigned long long)st.cycles, st.ebit, st.stoppedByD, st.stoppedByT,
++                        (unsigned long long)gifBytes);
++        }
++    }
++    const int timed = repeat > 1 ? repeat - 1 : 1;
++    std::printf("per call: %.1f us   per VU cycle: %.1f ns   VU cycles/call: %.0f\n",
++                totalNs / timed / records.size() / 1000.0, totalNs / (totalCycles ? totalCycles : 1),
++                double(totalCycles) / timed / records.size());
++    std::printf("gif packets/pass: %llu  gif bytes/pass: %llu\n", (unsigned long long)gifPackets,
++                (unsigned long long)gifBytes);
++    std::printf("checksum: %016llx\n", (unsigned long long)checksum);
++    return 0;
++}

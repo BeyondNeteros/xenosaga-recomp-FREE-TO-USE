@@ -30,8 +30,6 @@ del "XenosagaRecomp.exe.part0" "XenosagaRecomp.exe.part1" "XenosagaRecomp.exe.pa
 
 rem Sound is skipped until the sound driver connection is fixed.
 set "XS_NO_SOUND=1"
-rem Debug: trace VU1 microprogram uploads and starts.
-set "PS2X_VU_TRACE=1"
 set "XS_DISC_IMAGE=%DISC%"
 
 echo Starting Xenosaga Episode I: Recompiled...
