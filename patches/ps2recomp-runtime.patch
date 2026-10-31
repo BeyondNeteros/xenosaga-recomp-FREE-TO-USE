@@ -260,36 +260,43 @@ index 37b6a4d..7463fdb 100644
                          ++tagsProcessed;
  
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..1869a3a 100644
+index 45cb9d2..d4e4031 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1,3 +1,6 @@
+@@ -1,3 +1,7 @@
++#include <mutex>
 +#include <cstdio>
 +#include <cstdlib>
 +#include "runtime/ps2_profile.h"
  #include "ps2_runtime.h"
  #include "ps2_log.h"
  #include "ps2_stubs.h"
-@@ -27,6 +30,44 @@
+@@ -27,6 +31,106 @@
  #include <unordered_map>
  #include <sstream>
  
 +namespace
 +{
 +    // PS2X_VU_CAPTURE=1: record VU1 calls (state + code + data memory) to
-+    // vu1_capture.bin for offline replay/profiling. Skips the first
-+    // PS2X_VU_CAPTURE_SKIP calls (default 20000), then records 300.
++    // vu1_capture.bin for offline replay/profiling. Recording starts after
++    // PS2X_VU_CAPTURE_SKIP calls if that is set, or else the first time
++    // ps2x_armVu1Capture() is called (the heartbeat arms it when VU1 is the
++    // bottleneck); then 300 calls are recorded.
++    std::atomic<bool> g_vu1CaptureArmed{false};
++
 +    void captureVu1Call(uint32_t kind, uint32_t startPC, uint32_t top, uint32_t itop,
 +                        const VU1State &state, const uint8_t *code, const uint8_t *data)
 +    {
 +        static const bool enabled = [] { const char *v = std::getenv("PS2X_VU_CAPTURE"); return v && v[0] == '1'; }();
 +        if (!enabled)
 +            return;
-+        static const uint64_t skip = [] { const char *v = std::getenv("PS2X_VU_CAPTURE_SKIP"); return v ? std::strtoull(v, nullptr, 10) : 20000ull; }();
++        static const uint64_t skip = [] { const char *v = std::getenv("PS2X_VU_CAPTURE_SKIP"); return v ? std::strtoull(v, nullptr, 10) : ~0ull; }();
 +        static uint64_t calls = 0;
 +        static uint32_t recorded = 0;
 +        static std::ofstream out;
-+        if (++calls <= skip || recorded >= 300u)
++        if (recorded >= 300u)
++            return;
++        if (++calls <= skip && !g_vu1CaptureArmed.load(std::memory_order_relaxed))
 +            return;
 +        if (!out.is_open())
 +        {
@@ -308,32 +315,108 @@ index 45cb9d2..1869a3a 100644
 +            std::printf("[vu-capture] wrote 300 VU1 calls to vu1_capture.bin\n");
 +        }
 +    }
++
++    // Per-program VU1 statistics for the heartbeat: calls, VU cycles, host
++    // time, and how calls ended (E bit, cycle budget, or other stop).
++    struct Vu1ProgramStats
++    {
++        uint64_t calls = 0, cycles = 0, hostNs = 0, ended = 0, budget = 0, maxCycles = 0;
++    };
++    std::mutex g_vu1StatsMutex;
++    std::unordered_map<uint32_t, Vu1ProgramStats> g_vu1Stats;
++
++    void recordVu1Call(uint32_t startPC, uint64_t cycles, uint64_t hostNs, const VU1State &st, uint32_t budget)
++    {
++        std::lock_guard<std::mutex> lock(g_vu1StatsMutex);
++        Vu1ProgramStats &p = g_vu1Stats[startPC];
++        ++p.calls;
++        p.cycles += cycles;
++        p.hostNs += hostNs;
++        if (st.ebit)
++            ++p.ended;
++        else if (cycles >= budget)
++            ++p.budget;
++        if (cycles > p.maxCycles)
++            p.maxCycles = cycles;
++    }
 +}
 +
++void ps2x_armVu1Capture()
++{
++    g_vu1CaptureArmed.store(true, std::memory_order_relaxed);
++}
 +
++// Top VU1 programs by host time since the last report, then resets.
++std::string ps2x_vu1StatsReport()
++{
++    std::vector<std::pair<uint32_t, Vu1ProgramStats>> rows;
++    {
++        std::lock_guard<std::mutex> lock(g_vu1StatsMutex);
++        rows.assign(g_vu1Stats.begin(), g_vu1Stats.end());
++        g_vu1Stats.clear();
++    }
++    std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.hostNs > b.second.hostNs; });
++    std::string out;
++    char line[256];
++    for (size_t i = 0; i < rows.size() && i < 6; ++i)
++    {
++        const Vu1ProgramStats &p = rows[i].second;
++        std::snprintf(line, sizeof(line),
++                      "  vu1 prog 0x%04x: %llu calls, %.0f cyc/call (max %llu), %.1f us/call, %.1f ns/cyc, ebit %llu budget %llu\n",
++                      rows[i].first, (unsigned long long)p.calls, double(p.cycles) / p.calls, (unsigned long long)p.maxCycles,
++                      p.hostNs / 1000.0 / p.calls, p.cycles ? double(p.hostNs) / p.cycles : 0.0,
++                      (unsigned long long)p.ended, (unsigned long long)p.budget);
++        out += line;
++    }
++    return out;
++}
++
++namespace
++{
++}
 +
  namespace ps2_stubs
  {
      void resetSifState();
-@@ -679,6 +720,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -679,9 +783,18 @@ bool PS2Runtime::syncCoreSubsystems()
                                           (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                       m_vu1.state().tBitEnabled =
                                           (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
 +                                     captureVu1Call(0u, startPC, top, itop, m_vu1.state(), m_memory.getVU1Code(), m_memory.getVU1Data());
 +                                     ps2_profile::Scope vuScope(ps2_profile::Vu1Exec);
++                                     const uint64_t cyclesBefore = m_vu1.state().cycles;
++                                     const uint32_t statPc = startPC;
++                                     const auto hostStart = std::chrono::steady_clock::now();
                                       m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                     m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                     m_gs, &m_memory, startPC, top, itop, 65536);
-@@ -697,6 +740,8 @@ bool PS2Runtime::syncCoreSubsystems()
++                                     recordVu1Call(statPc, m_vu1.state().cycles - cyclesBefore,
++                                                   static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                       std::chrono::steady_clock::now() - hostStart).count()),
++                                                   m_vu1.state(), 65536);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -697,9 +810,18 @@ bool PS2Runtime::syncCoreSubsystems()
                                           (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                       m_vu1.state().tBitEnabled =
                                           (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
 +                                     captureVu1Call(1u, 0u, top, itop, m_vu1.state(), m_memory.getVU1Code(), m_memory.getVU1Data());
 +                                     ps2_profile::Scope vuScope(ps2_profile::Vu1Exec);
++                                     const uint64_t cyclesBefore = m_vu1.state().cycles;
++                                     const uint32_t statPc = 0x8000u | (m_vu1.state().pc & 0x7fffu);
++                                     const auto hostStart = std::chrono::steady_clock::now();
                                       m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, top, itop, 65536);
-@@ -1134,6 +1179,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
++                                     recordVu1Call(statPc, m_vu1.state().cycles - cyclesBefore,
++                                                   static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                       std::chrono::steady_clock::now() - hostStart).count()),
++                                                   m_vu1.state(), 65536);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -1134,6 +1256,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  

@@ -31,6 +31,8 @@ del "XenosagaRecomp.exe.part0" "XenosagaRecomp.exe.part1" "XenosagaRecomp.exe.pa
 rem Sound is skipped until the sound driver connection is fixed.
 set "XS_NO_SOUND=1"
 set "XS_DISC_IMAGE=%DISC%"
+rem Debug: when VU1 is the bottleneck, record 300 VU1 calls to vu1_capture.bin.
+set "PS2X_VU_CAPTURE=1"
 
 echo Starting Xenosaga Episode I: Recompiled...
 echo Log: "%~dp0xenosaga.log"

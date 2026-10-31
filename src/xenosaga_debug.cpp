@@ -33,6 +33,10 @@ void xglRenderInit_0x22d7f8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runti
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 uint32_t xs_currentOverlay();
 
+// Defined in the runtime (ps2_runtime.cpp).
+void ps2x_armVu1Capture();
+std::string ps2x_vu1StatsReport();
+
 namespace
 {
     struct Symbol
@@ -214,8 +218,11 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                     const uint64_t calls = ps2_profile::g_calls[c].exchange(0);
                     std::printf(" %s=%.1f%% (%llu calls)", names[c], 100.0 * ns / (seconds * 1e9),
                                 (unsigned long long)calls);
+                    if (c == ps2_profile::Vu1Exec && ns > seconds * 400000000ull)
+                        ps2x_armVu1Capture(); // VU1 is the bottleneck: record some calls
                 }
                 std::printf("\n");
+                std::fputs(ps2x_vu1StatsReport().c_str(), stdout);
             }
             {
                 const GSRegisters &gs = runtime.memory().gs();
