@@ -151,6 +151,37 @@ namespace xs_iso
         return true;
     }
 
+    // List the files (not subdirectories) in a directory of layer 0, e.g. "\\IOP".
+    inline std::vector<std::string> listFiles(const std::filesystem::path &image, const std::string &dirPath)
+    {
+        std::vector<std::string> names;
+        Entry d;
+        if (!lookup(image, dirPath, d) || !d.directory)
+            return names;
+        std::ifstream in(image, std::ios::binary);
+        std::vector<uint8_t> dir;
+        if (!in || !readSectors(in, d.lsn, d.size, dir))
+            return names;
+        for (uint32_t off = 0; off < dir.size();)
+        {
+            const uint8_t len = dir[off];
+            if (len == 0)
+            {
+                off = (off / kSectorSize + 1) * kSectorSize;
+                continue;
+            }
+            if (off + 33 > dir.size() || off + len > dir.size())
+                break;
+            const uint8_t nameLen = dir[off + 32];
+            const bool isDir = (dir[off + 25] & 0x02) != 0;
+            std::string name(reinterpret_cast<const char *>(&dir[off + 33]), nameLen);
+            if (!isDir && nameLen > 1)
+                names.push_back(normalizeName(name));
+            off += len;
+        }
+        return names;
+    }
+
     // Read a whole file from the image.
     inline bool readFile(const std::filesystem::path &image, const std::string &path, std::vector<uint8_t> &out)
     {

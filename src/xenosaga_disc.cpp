@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -75,6 +76,25 @@ void xs_configureDiscImage()
     paths.cdImage = image;
     PS2Runtime::setIoPaths(paths);
     g_layer1Start = xs_iso::findLayer1Start(image);
+
+    // The runtime loads IOP modules (and reads SYSTEM.CNF) as loose files from
+    // the CD root. Extract them from the user's own disc once, next to the ELF.
+    const std::filesystem::path cdRoot = paths.cdRoot;
+    std::error_code ec;
+    std::filesystem::create_directories(cdRoot / "IOP", ec);
+    auto extract = [&](const std::string &discPath, const std::filesystem::path &dest) {
+        if (std::filesystem::exists(dest, ec))
+            return;
+        std::vector<uint8_t> data;
+        if (!xs_iso::readFile(image, discPath, data))
+            return;
+        std::ofstream out(dest, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+        std::cout << "[xenosaga] extracted " << discPath << std::endl;
+    };
+    extract("\\SYSTEM.CNF;1", cdRoot / "SYSTEM.CNF");
+    for (const std::string &name : xs_iso::listFiles(image, "\\IOP"))
+        extract("\\IOP\\" + name + ";1", cdRoot / "IOP" / name);
     std::cout << "[xenosaga] disc image: " << image;
     if (g_layer1Start)
         std::cout << " (dual layer, layer 1 at sector " << g_layer1Start << ")";
