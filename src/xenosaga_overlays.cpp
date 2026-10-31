@@ -8,8 +8,10 @@
 
 #include "ps2_runtime.h"
 #include "game_overrides.h"
+#include "ps2_stubs.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +24,9 @@ void xs_register_ov02(PS2Runtime::RecompiledFunction *t);
 void xs_register_ov10(PS2Runtime::RecompiledFunction *t);
 void xs_register_ov11(PS2Runtime::RecompiledFunction *t);
 void xs_register_ov12(PS2Runtime::RecompiledFunction *t);
+void xs_configureDiscImage();
+bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
+void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
 namespace
 {
@@ -70,13 +75,25 @@ namespace
         return v;
     }
 
-    // Copy the overlay's PT_LOAD segments into guest memory, like sceSifLoadElf.
-    bool loadOverlayImage(uint8_t *rdram, const std::filesystem::path &path)
+    // Overlay bytes come from a loose OVnn.OVL next to the ELF, or from the disc image.
+    bool readOverlayFile(uint32_t id, std::vector<uint8_t> &data, std::string &source)
     {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
-            return false;
-        std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), {});
+        if (const std::filesystem::path file = findOverlayFile(id); !file.empty())
+        {
+            std::ifstream in(file, std::ios::binary);
+            data.assign(std::istreambuf_iterator<char>(in), {});
+            source = file.filename().string();
+            return !data.empty();
+        }
+        char name[24];
+        std::snprintf(name, sizeof(name), "\\OV%02u.OVL;1", id);
+        source = std::string("disc ") + name;
+        return xs_readDiscFile(name, data);
+    }
+
+    // Copy the overlay's PT_LOAD segments into guest memory, like sceSifLoadElf.
+    bool loadOverlayImage(uint8_t *rdram, const std::vector<uint8_t> &data)
+    {
         if (data.size() < 0x34 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0)
             return false;
 
@@ -119,19 +136,75 @@ namespace
             return;
         current = static_cast<uint8_t>(id);
 
-        const std::filesystem::path file = findOverlayFile(id);
-        if (file.empty() || !loadOverlayImage(rdram, file))
-        {
-            std::cerr << "[xenosaga] failed to load overlay " << id << " from "
-                      << PS2Runtime::getIoPaths().cdRoot << std::endl;
-        }
+        std::vector<uint8_t> data;
+        std::string source;
+        if (!readOverlayFile(id, data, source) || !loadOverlayImage(rdram, data))
+            std::cerr << "[xenosaga] failed to load overlay " << id << " (" << source << ")" << std::endl;
         activateOverlayFunctions(id);
-        std::cout << "[xenosaga] overlay " << id << " active (" << file.filename().string() << ")" << std::endl;
+        std::cout << "[xenosaga] overlay " << id << " active (" << source << ")" << std::endl;
+    }
+
+    // Temporary: skip Monolith's sound driver (SSD/RSSD on the IOP) until the
+    // real IRX modules are available. Enabled with XS_NO_SOUND=1.
+    void soundStub_returnZero(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        setReturnS32(ctx, 0);
+    }
+
+    // CD S-commands the runtime doesn't simulate yet. The originals busy-wait on
+    // a real drive, so answer them directly. All return 1 (success).
+    void cdReturnSuccess(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        setReturnS32(ctx, 1);
+    }
+
+    void cdReturnZero(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        setReturnS32(ctx, 0);
+    }
+
+    void devctlNoDevice(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        setReturnS32(ctx, -19); // -ENODEV
+    }
+
+    // int sceCdReadDvdDualInfo(int *on_dual, u_int *layer1_start): single-layer disc.
+    void cdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t onDual = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+        const uint32_t layer1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+        const uint32_t zero = 0;
+        if (onDual)
+            std::memcpy(rdram + (onDual & kRdramMask), &zero, 4);
+        if (layer1)
+            std::memcpy(rdram + (layer1 & kRdramMask), &zero, 4);
+        setReturnS32(ctx, 1);
     }
 
     void applyXenosaga(PS2Runtime &runtime)
     {
+        xs_configureDiscImage();
         runtime.registerFunction(kLoadOverlayAddr, xglCdLoadOverlay_hook);
+        // File lookups return real disc positions when a disc image is present.
+        runtime.registerFunction(0x0020D220u, xs_sceCdSearchFile);      // sceCdSearchFile
+        runtime.registerFunction(0x0020CF08u, xs_sceCdSearchFile);      // sceCdLayerSearchFile
+        runtime.registerFunction(0x0020E1C8u, cdReturnSuccess);   // _sceCdSetTimeout
+        runtime.registerFunction(0x0020E358u, cdReturnSuccess);   // sceCdPowerOff
+        runtime.registerFunction(0x0020E2A0u, cdReadDvdDualInfo); // sceCdReadDvdDualInfo
+        // _sceFsWaitS waits on the libc file-I/O semaphore. File I/O runs host-side,
+        // so that semaphore is never created; succeed immediately.
+        runtime.registerFunction(0x00204338u, cdReturnZero);
+        // sceDevctl("hdd0:", ...): report that no PS2 hard drive is attached, so
+        // the game uses the disc instead of a HDD install.
+        runtime.registerFunction(0x00206E88u, devctlNoDevice);
+        if (const char *v = std::getenv("XS_NO_SOUND"); v && v[0] == '1')
+        {
+            runtime.registerFunction(0x0023F960u, soundStub_returnZero); // SsdInit
+            runtime.registerFunction(0x0023FBB8u, soundStub_returnZero); // RssdInitIop
+            runtime.registerFunction(0x0023FE68u, soundStub_returnZero); // RssdBusy
+            runtime.registerFunction(0x002405E8u, soundStub_returnZero); // SsdSendFuncPacket
+            std::cout << "[xenosaga] sound driver stubbed (XS_NO_SOUND=1)" << std::endl;
+        }
         // The boot ELF already contains ov02 at 0xA00000.
         activateOverlayFunctions(2);
         std::cout << "[xenosaga] overlay hook installed" << std::endl;

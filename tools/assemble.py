@@ -132,6 +132,9 @@ def main():
     for p in PORT_SRC.glob("*.cpp"):
         shutil.copy2(p, RUNNER / p.name)
         print(f"port: {p.name}")
+    for p in PORT_SRC.glob("*.h"):
+        shutil.copy2(p, INCLUDE / p.name)
+        print(f"port: {p.name}")
 
 
 if __name__ == "__main__":
