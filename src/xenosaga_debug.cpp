@@ -6,6 +6,7 @@
 
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_profile.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_frontend.h"
 
@@ -204,6 +205,18 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                       << (snap.eeCycle == lastCycle ? " (stalled)" : "")
                       << " running=" << snap.runningThreadId << std::endl;
             lastCycle = snap.eeCycle;
+            {
+                static const char *names[] = {"vu1", "gs", "vif1"};
+                std::printf("  host time over last %ds:", seconds);
+                for (uint32_t c = 0; c < ps2_profile::Count; ++c)
+                {
+                    const uint64_t ns = ps2_profile::g_ns[c].exchange(0);
+                    const uint64_t calls = ps2_profile::g_calls[c].exchange(0);
+                    std::printf(" %s=%.1f%% (%llu calls)", names[c], 100.0 * ns / (seconds * 1e9),
+                                (unsigned long long)calls);
+                }
+                std::printf("\n");
+            }
             {
                 const GSRegisters &gs = runtime.memory().gs();
                 char regs[200];
