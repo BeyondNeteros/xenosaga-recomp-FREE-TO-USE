@@ -15,6 +15,18 @@ if not exist "%DISC%" (
 )
 if not exist "SLUS_204.69" copy /y "%ELF_SOURCE%" "SLUS_204.69" >nul
 
+rem Builds arrive split in parts (file transfer limit); rejoin a new build once.
+if exist "XenosagaRecomp.exe.part0" (
+    echo Assembling XenosagaRecomp.exe...
+    copy /b /y "XenosagaRecomp.exe.part0"+"XenosagaRecomp.exe.part1"+"XenosagaRecomp.exe.part2" "XenosagaRecomp.exe" >nul
+    if errorlevel 1 (
+        echo Failed to assemble XenosagaRecomp.exe
+        pause
+        exit /b 1
+    )
+    del "XenosagaRecomp.exe.part0" "XenosagaRecomp.exe.part1" "XenosagaRecomp.exe.part2"
+)
+
 rem Sound is skipped until the sound driver connection is fixed.
 set "XS_NO_SOUND=1"
 set "XS_DISC_IMAGE=%DISC%"
