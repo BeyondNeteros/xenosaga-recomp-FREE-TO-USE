@@ -235,6 +235,14 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                               (unsigned long long)gs.display2);
                 const std::filesystem::path shot = PS2Runtime::getIoPaths().elfDirectory / "xs_frame.bmp";
                 std::cout << regs << (saveFrameBmp(runtime, shot) ? "  frame saved" : "  no frame") << std::endl;
+                // Raw 4 MB GS memory next to the frame, for decoding textures
+                // offline (port/tools/gsvram.py). Taken without locking, so a
+                // texture being uploaded at that moment may be torn.
+                if (const uint8_t *vram = runtime.memory().getGSVRAM())
+                {
+                    std::ofstream out(PS2Runtime::getIoPaths().elfDirectory / "xs_vram.bin", std::ios::binary);
+                    out.write(reinterpret_cast<const char *>(vram), PS2_GS_VRAM_SIZE);
+                }
             }
             for (const auto &t : snap.threads)
             {

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install a freshly built ps2EntryRunner.exe as XenosagaRecomp.exe, plus the
-# MSYS2 MinGW DLLs it needs. The previous exe is kept as
-# XenosagaRecomp.exe.bak-<timestamp> (never deleted).
+# MSYS2 MinGW DLLs it needs. The first install keeps the exe that was there
+# as XenosagaRecomp.exe.bak-<timestamp> (never touched again); after that the
+# previous build is kept as XenosagaRecomp.exe.previous.
 #
 #   bash port/tools/install.sh [install dir]
 set -euo pipefail
@@ -14,9 +15,13 @@ EXE="$BUILD/ps2EntryRunner.exe"
 [ -f "$EXE" ] || { echo "no build at $EXE"; exit 1; }
 
 if [ -f "$DEST/XenosagaRecomp.exe" ]; then
-    bak="$DEST/XenosagaRecomp.exe.bak-$(date +%Y%m%d-%H%M%S)"
-    mv "$DEST/XenosagaRecomp.exe" "$bak"
-    echo "backed up old exe to $(basename "$bak")"
+    if ls "$DEST"/XenosagaRecomp.exe.bak-* >/dev/null 2>&1; then
+        bak="$DEST/XenosagaRecomp.exe.previous"   # our own last build
+    else
+        bak="$DEST/XenosagaRecomp.exe.bak-$(date +%Y%m%d-%H%M%S)"
+    fi
+    mv -f "$DEST/XenosagaRecomp.exe" "$bak"
+    echo "kept old exe as $(basename "$bak")"
 fi
 cp "$EXE" "$DEST/XenosagaRecomp.exe"
 

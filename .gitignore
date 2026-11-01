@@ -7,3 +7,6 @@ SLUS_*
 xenosaga.*
 recomp/
 output/
+xs_vram.bin
+*.bmp
+vu1_capture.bin
