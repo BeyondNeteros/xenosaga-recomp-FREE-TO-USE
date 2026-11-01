@@ -496,7 +496,7 @@ index 0000000..6755bac
 +    };
 +}
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
-index 67c8184..18e808e 100644
+index 67c8184..fd167b0 100644
 --- a/ps2xRuntime/include/runtime/ps2_vu1.h
 +++ b/ps2xRuntime/include/runtime/ps2_vu1.h
 @@ -3,6 +3,8 @@
@@ -552,7 +552,7 @@ index 67c8184..18e808e 100644
      XgkickPipeline m_xgkick{};
      std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
      std::array<uint64_t, 16> m_viReady{};
-@@ -250,10 +282,50 @@ private:
+@@ -250,10 +282,54 @@ private:
      static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
      static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
      DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
@@ -574,7 +574,7 @@ index 67c8184..18e808e 100644
 +    {
 +        uint8_t kind; // 0 = VF, 1 = VI, 2 = ACC
 +        uint8_t reg;
-+        uint8_t lane;
++        uint8_t lane; // live-ins: component mask (bit c); final writes: component
 +        uint16_t offset;
 +    };
 +    struct StaticBlock
@@ -588,6 +588,10 @@ index 67c8184..18e808e 100644
 +        uint16_t efuOpFirst = 0xFFFFu;    // first EFU-pipeline op (incl. WAITP)
 +        uint16_t efuEntryFirst = 0xFFFFu; // first EFU issue or WAITP
 +        std::vector<uint16_t> offsets;
++        // Per pair: 0 = generic (execPairDirect + finishPair); otherwise bit 1 =
++        // run the upper half, bit 2 = run the lower half, then just reset
++        // vf0/vi0 and step pc (no branch/E/D/T/I-bit/shadow/branch-VI work).
++        std::vector<uint8_t> plain;
 +        std::vector<StaticLane> liveIns;     // must be ready by entry + offset
 +        std::vector<StaticLane> finalWrites; // readiness = entry + offset
 +    };
@@ -604,7 +608,7 @@ index 67c8184..18e808e 100644
      void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
  
      void applyDest(float *dst, const float *result, uint8_t dest);
-@@ -278,6 +350,7 @@ private:
+@@ -278,6 +354,7 @@ private:
  
      void resetScheduler();
      void commitReadyPipelines();
@@ -612,7 +616,7 @@ index 67c8184..18e808e 100644
      void advanceOneCycle();
      void advanceTo(uint64_t targetCycle);
      void flushPipelines();
-@@ -287,13 +360,25 @@ private:
+@@ -287,13 +364,25 @@ private:
      void markPairWrites(const DecodedInstructionPair &decoded);
      bool pipelinesPending() const;
  
@@ -2915,7 +2919,7 @@ index f872edd..d31be32 100644
              }
  
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index f19e281..dcff018 100644
+index f19e281..8e9eea5 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -1,3 +1,4 @@
@@ -3303,9 +3307,9 @@ index f19e281..dcff018 100644
 +    // (this runs almost every VU cycle, so a second scan was a large cost).
 +    uint64_t next = ~0ull;
 +    const uint64_t now = m_cycle;
-+
  
 -    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++
 +    if (m_fdiv.valid)
      {
 -        m_state.q = m_fdiv.value;
@@ -3353,15 +3357,14 @@ index f19e281..dcff018 100644
 +            if (!store.valid)
 +                continue;
 +            if (store.readyCycle > now)
++            {
++                pendingMin = std::min(pendingMin, store.readyCycle);
++                continue;
++            }
++            if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
              {
 -                if ((store.laneMask & laneForComponent(component)) != 0u)
 -                    oldWords[component] = store.words[component];
-+                pendingMin = std::min(pendingMin, store.readyCycle);
-+                continue;
-             }
--            std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
-+            if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
-+            {
 +                uint32_t oldWords[4]{};
 +                std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
 +                for (uint32_t component = 0; component < 4u; ++component)
@@ -3370,7 +3373,8 @@ index f19e281..dcff018 100644
 +                        oldWords[component] = store.words[component];
 +                }
 +                std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
-+            }
+             }
+-            std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
 +            store = {};
          }
 -        store = {};
@@ -3532,6 +3536,11 @@ index f19e281..dcff018 100644
 -                if ((access.lanes & laneForComponent(component)) != 0u)
 -                    ready = std::max(ready, m_vfReady[access.reg][component]);
 -            }
+-        }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
 +            const std::array<uint64_t, 4> &lanes = m_vfReady[access.reg];
 +            // Branch-free: a lane outside the mask contributes 0.
 +            ready = std::max(ready, lanes[0] & (0ull - ((access.lanes >> 3) & 1u)));
@@ -3539,16 +3548,11 @@ index f19e281..dcff018 100644
 +            ready = std::max(ready, lanes[2] & (0ull - ((access.lanes >> 1) & 1u)));
 +            ready = std::max(ready, lanes[3] & (0ull - (access.lanes & 1u)));
          }
--        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        for (uint32_t component = 0; component < 4u; ++component)
 +        for (uint32_t mask = usage->viRead & 0xFFFEu; mask != 0u; mask &= mask - 1u)
 +            ready = std::max(ready, m_viReady[__builtin_ctz(mask)]);
 +        if (usage->accRead != 0u)
          {
--            if ((usage->viRead & (1u << reg)) != 0u)
--                ready = std::max(ready, m_viReady[reg]);
--        }
--        for (uint32_t component = 0; component < 4u; ++component)
--        {
 -            if ((usage->accRead & laneForComponent(component)) != 0u)
 -                ready = std::max(ready, m_accReady[component]);
 +            if (usage->accRead & 0x8u)
@@ -3708,7 +3712,7 @@ index f19e281..dcff018 100644
      return m_decodedCodeCache[pairIndex];
  }
  
-@@ -1620,6 +1761,375 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+@@ -1620,6 +1761,420 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
      run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
  }
  
@@ -3941,7 +3945,18 @@ index f19e281..dcff018 100644
 +        const uint16_t off = static_cast<uint16_t>(ready);
 +        block.offsets.push_back(off);
 +        for (int k = 0; k < liveCount; ++k)
-+            block.liveIns.push_back({live[k].kind, live[k].reg, live[k].lane, off});
++        {
++            bool merged = false;
++            for (StaticLane &existing : block.liveIns)
++                if (existing.kind == live[k].kind && existing.reg == live[k].reg && existing.offset == off)
++                {
++                    existing.lane |= static_cast<uint8_t>(1u << live[k].lane);
++                    merged = true;
++                    break;
++                }
++            if (!merged)
++                block.liveIns.push_back({live[k].kind, live[k].reg, static_cast<uint8_t>(1u << live[k].lane), off});
++        }
 +        if (firstFdiv)
 +            block.fdivFirst = off;
 +        if (firstEfuOp)
@@ -3982,6 +3997,17 @@ index f19e281..dcff018 100644
 +            efuEntriesMax = std::max(efuEntriesMax, ready + static_cast<int>(lower.latency));
 +        }
 +
++        {
++            const bool lowerNop = d.lower == 0x00000000u || d.lower == 0x8000033Cu;
++            const uint32_t upperOp = d.upper & 0x3Fu;
++            const uint32_t upperSpecial = (d.upper & 3u) | ((d.upper >> 4) & 0x7Cu);
++            const bool upperNop = upperOp >= 0x3Cu && (upperSpecial == 0x2Fu || upperSpecial == 0x30u) &&
++                                  !d.iBit && (d.upper & 0x78000000u) == 0u;
++            const bool viBackup = (lower.viWrite & 0xFFFEu) != 0u && lower.delaysNextBranchRead;
++            const bool generic = d.iBit || d.upperVfShadowReg != 0u || viBackup || d.eBit || d.dBit || d.tBit ||
++                                 lower.pipeline == PipelineBranch || stopAfter >= 0 || (index + 2u) * 8u > codeSize;
++            block.plain.push_back(generic ? 0u : static_cast<uint8_t>(1u | (upperNop ? 0u : 2u) | (lowerNop ? 0u : 4u)));
++        }
 +        cur = ready + 1;
 +        ++block.pairCount;
 +        block.lastOffset = off;
@@ -4019,9 +4045,17 @@ index f19e281..dcff018 100644
 +    const uint64_t entry = m_cycle;
 +    for (const StaticLane &l : block.liveIns)
 +    {
-+        const uint64_t readyCycle = l.kind == 0 ? m_vfReady[l.reg][l.lane] : l.kind == 1 ? m_viReady[l.reg] : m_accReady[l.lane];
-+        if (readyCycle > entry + l.offset)
-+            return false;
++        const uint64_t limit = entry + l.offset;
++        if (l.kind == 1)
++        {
++            if (m_viReady[l.reg] > limit)
++                return false;
++            continue;
++        }
++        const std::array<uint64_t, 4> &lanes = l.kind == 0 ? m_vfReady[l.reg] : m_accReady;
++        for (uint32_t c = 0; c < 4u; ++c)
++            if (((l.lane >> c) & 1u) && lanes[c] > limit)
++                return false;
 +    }
 +    if (block.fdivFirst != 0xFFFFu && m_fdiv.valid && m_fdiv.readyCycle > entry + block.fdivFirst)
 +        return false;
@@ -4062,6 +4096,21 @@ index f19e281..dcff018 100644
 +                commitReadyPipelines();
 +        }
 +        const DecodedInstructionPair &decoded = m_decodedCodeCache[startIndex + i];
++        if (const uint8_t plain = block.plain[i])
++        {
++            if (plain & 2u)
++                execUpper(decoded.upper);
++            if (plain & 4u)
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            m_viBranchBackupValid = false;
++            m_state.vf[0][0] = 0.0f;
++            m_state.vf[0][1] = 0.0f;
++            m_state.vf[0][2] = 0.0f;
++            m_state.vf[0][3] = 1.0f;
++            m_state.vi[0] = 0;
++            m_state.pc += 8u;
++            continue;
++        }
 +        execPairDirect(decoded, vuData, dataSize, gs, memory, false);
 +        ended = finishPair(decoded, codeSize);
 +        if (ended && i + 1u != block.pairCount)
@@ -4084,7 +4133,7 @@ index f19e281..dcff018 100644
  void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                           uint8_t *vuData, uint32_t dataSize,
                           GS &gs, PS2Memory *memory, uint32_t maxCycles)
-@@ -1633,13 +2143,62 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,13 +2188,62 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -4149,7 +4198,7 @@ index f19e281..dcff018 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1660,6 +2219,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1660,6 +2264,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          if (m_cycle >= budgetEnd)
              break;
  
@@ -4162,7 +4211,7 @@ index f19e281..dcff018 100644
          uint8_t writtenVi = 0u;
          int32_t oldVi = 0;
          for (uint32_t reg = 1; reg < 16u; ++reg)
-@@ -1766,58 +2331,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1766,58 +2376,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          markPairWrites(decoded);
          if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
              recordViWriteForBranch(writtenVi, oldVi);

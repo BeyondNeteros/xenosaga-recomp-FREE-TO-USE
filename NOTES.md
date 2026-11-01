@@ -104,6 +104,26 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## VU1 next steps (2026-11-01, runs/plain1)
+
+- Static blocks now classify each pair once: "plain" pairs (no branch, E/D/T,
+  I-bit, upper/lower shadowing or branch-VI backup, not at the end of
+  microcode memory) skip NOP halves and finishPair. Live-in checks are merged
+  per register. 18.5 -> 17.3 ns per VU cycle, 74/74 captures identical; game
+  ~9.9 fps, picture correct.
+- Profile: execUpperFmacFast ~45% (per-instruction decode/branching), block
+  runner ~12%, execLower ~9%, entry checks ~7%.
+- Budget for 30 fps: ~4.2M VU1 cycles per frame -> <= ~8 ns per VU cycle with
+  VU1 overlapping everything else. Two pieces left:
+  1. Native code for VU1 blocks: the runtime logs blocks it runs; a generator
+     emits C++ with each pair's instruction words as template constants (decode
+     and branches fold away), compiled into the runner and looked up by block
+     hash at run time, falling back to the interpreter. Verifiable with
+     vu1_check.sh. Expected ~1.5-2x on VU1.
+  2. VU1 (VIF1 processing + VU1 + XGKICK) on its own thread, with the EE only
+     queuing copied DMA data and syncing when it reads VIF1/DMA/VU1 state:
+     frame time becomes max(EE, VU1) instead of the sum.
+
 ## Parallel rasterizer (2026-11-01, runs/gspar1)
 
 - GSCpuBackend queues primitives and draws them on `PS2X_GS_THREADS` threads
