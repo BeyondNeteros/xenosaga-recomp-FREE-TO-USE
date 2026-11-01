@@ -114,6 +114,11 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
   offline with `vu1_replay vu1_capture.bin [repeat]`; env `VU_REPLAY_DETAIL=1`
   (per call), `VU_REPLAY_GIFDUMP=out.bin` (GIF output), `VU_REPLAY_INVALIDATE=1`,
   and `PS2X_VU_KICKLOG=1` (XGKICK addresses).
+- `bash port/tools/vu1_check.sh` replays every `runs/*/vu1_capture.bin` through the
+  current vu1_replay and a frozen reference (`PS2Recomp-ref/`: a git worktree of
+  PS2Recomp at e563698 + the runtime patch from port commit a9b3cd4, built into
+  `PS2Recomp-ref/build`) and compares checksums and GIF output. Run it after any
+  VU1 change. `runs/prof/prof.sh <capture>` profiles vu1_replay.
 - `port/tools/vudis.py capture.bin <record> <start> <end>` disassembles VU1
   microcode from a capture; `port/tools/gifparse.py gif.bin` summarizes GIF
   packets (tags, AD registers, primitive types, vertex ranges).

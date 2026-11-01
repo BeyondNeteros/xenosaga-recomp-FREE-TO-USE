@@ -104,28 +104,36 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
-## Speed status (2026-11-01, runs/speed1)
+## Speed status (2026-11-01, runs/fast3)
 
-The heartbeat now prints `fps: game X, vsync Y` (game = DISPFB1 flips per
-second, sampled every 1 ms). Tutorial scene: **game 2.6 fps** (the game targets
-30, i.e. 2 vsyncs per frame), VU1 still ~85% of host time.
+The heartbeat prints `fps: game X, vsync Y` (game = DISPFB1 flips per
+second, sampled every 1 ms). Tutorial scene: **game 5.2 fps** (was 2.6; the
+game targets 30, i.e. 2 vsyncs per frame). Host time: VU1 ~72%, GS ~37%.
 
-Interpreter work so far (vu1_replay on runs/sqrt1 capture, checksum must stay
-a416285182b00444): 112 -> 73 ns per VU cycle. Changes: decoded pair returned by
-reference, single-pass pipeline commit, per-pipeline "next ready" deadlines so
-idle pipelines are not scanned, normalizeOperand inlined. Remaining profile:
-commit 19%, hazard check (calculatePairReadyCycle) 14%, run loop 13%, exact
-FMAC / flag maths ~20%.
+VU1 interpreter, vu1_replay on runs/sqrt1: 112 -> 25.7 ns per VU cycle, results
+identical to the original interpreter on all 66 captures (`tools/vu1_check.sh`
+against the frozen reference build in `PS2Recomp-ref/`, checksum now includes
+MAC/status/clip). What changed:
+- results go straight into registers (readers stall until the value would
+  have landed anyway); `PS2X_VU1_FAST=0` restores the delayed-write queues
+- FMAC flags skip the long-double exact result when the float result is safely
+  normal (`PS2X_VU1_EXACT_FLAGS=1` forces it)
+- flag pipeline is an issue-order ring committed lazily (flag reads, full ring,
+  FDIV status update, program end)
+- decode cache validated once per call; per-instance decode epoch and commit
+  deadline (the old global 4-slot tables could be shared by VU0 instances)
+- cheaper hazard check / write bookkeeping, inline broadcast
 
-Arithmetic: ~4.5M VU1 cycles per game frame. 30 fps with headroom needs about
-3 ns per VU cycle (25x), and even a free VU1 leaves the rest at ~6.7x of
-current speed, so EE/GS (~15%) must roughly halve too. Plan: a VU1 fast path
-that runs instructions in order (hardware interlocks make that give the same
-register results) and models only what software can observe: 4-cycle
-MAC/status/clip flag delay, Q/P latency, branch delay slots, E-bit/T/D;
-XGKICK copied at kick time. First as a lean interpreter validated against the
-accurate one on captures (checksum + GIF dump), then compiled per microprogram
-(hash of uploaded code -> generated C++).
+Workload: no duplicate drawing (`PS2X_GS_DUPCHECK=1`): ~13,400 GIF packets /
+6 MB and ~4.2M VU1 cycles per frame. 30 fps therefore needs VU1 at ~5 ns per
+cycle (or VU1 on its own thread plus ~10 ns) AND a much faster GS (37% at 5 fps
+would be >200% at 30): a GPU renderer or a threaded/optimised software one.
+
+Next for VU1: a translator that removes decode/dispatch and computes stalls
+statically inside straight-line blocks (only reads of registers written before
+the block need a dynamic check; flags/Q/P are already lazy), validated with
+vu1_check.sh. Profile now: execUpper 20%, hazard check 15%, run loop 13%,
+commit 12%, FMAC result/flags ~22%.
 
 ## Next: VU1 speed (older notes)
 
