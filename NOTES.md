@@ -104,6 +104,25 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## VU1 vector fast path (2026-11-01, runs/simd1)
+
+- `execUpperFmacFast` (ps2_vu1_upper.cpp): ADD/SUB/MUL/MADD/MSUB in bc/q/i/full
+  and ACC forms with SSE, flags written straight into the flag ring; plus
+  MAX/MINI, ITOF/FTOI, ABS and upper NOP without the generic operand setup.
+  It only takes a lane it can prove exact: result safely normal, or an exact
+  +-0 (ADD/SUB zero sums; MUL/MADD where an operand is 0). Otherwise it falls
+  back before touching state. `PS2X_VU1_NO_FAST_FMAC=1` disables it.
+- vu1_replay 25.7 -> 22.9 ns per VU cycle, 71/71 captures identical to the
+  frozen reference; game 6.5 -> 7.1 fps.
+- Tried and reverted: a "registers with pending writes" bitmask to skip the
+  hazard check. No gain: the microcode is tightly scheduled, nearly every pair
+  reads something written a cycle or two before.
+- So the remaining cost is the cycle-accurate timing itself (hazard check,
+  per-cycle bookkeeping ~50%). The next real step is static scheduling of
+  straight-line blocks (stalls and flag/Q timing precomputed from block entry,
+  with a cheap entry check that falls back to the dynamic path), or a full
+  microcode recompiler.
+
 ## Graphics (GS) speed (2026-11-01, runs/async1)
 
 - In-game profile (`XS_PROFILE=180,45`): one thread did all the work, ~65% VU1

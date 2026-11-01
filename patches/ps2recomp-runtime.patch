@@ -404,7 +404,7 @@ index 0000000..6755bac
 +    };
 +}
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
-index 67c8184..c1d53f0 100644
+index 67c8184..7503e2d 100644
 --- a/ps2xRuntime/include/runtime/ps2_vu1.h
 +++ b/ps2xRuntime/include/runtime/ps2_vu1.h
 @@ -3,6 +3,7 @@
@@ -448,7 +448,7 @@ index 67c8184..c1d53f0 100644
      XgkickPipeline m_xgkick{};
      std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
      std::array<uint64_t, 16> m_viReady{};
-@@ -250,7 +270,11 @@ private:
+@@ -250,10 +270,16 @@ private:
      static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
      static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
      DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
@@ -461,7 +461,12 @@ index 67c8184..c1d53f0 100644
      void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
  
      void execUpper(uint32_t instr);
-@@ -278,6 +302,7 @@ private:
++    bool execUpperFmacFast(uint32_t instr);
++    bool execUpperSimpleFast(uint32_t instr, uint32_t op, bool special4, uint32_t special);
+     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+ 
+     void applyDest(float *dst, const float *result, uint8_t dest);
+@@ -278,6 +304,7 @@ private:
  
      void resetScheduler();
      void commitReadyPipelines();
@@ -469,7 +474,7 @@ index 67c8184..c1d53f0 100644
      void advanceOneCycle();
      void advanceTo(uint64_t targetCycle);
      void flushPipelines();
-@@ -287,13 +312,25 @@ private:
+@@ -287,13 +314,25 @@ private:
      void markPairWrites(const DecodedInstructionPair &decoded);
      bool pipelinesPending() const;
  
@@ -3224,6 +3229,353 @@ index 94be789..165e032 100644
  
      // The lower instruction encoding uses bits 31:25 for the primary opcode
      switch (opHi)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 6974254..15a442d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -1,7 +1,10 @@
+ #include "runtime/ps2_vu1.h"
+ #include "ps2_vu1_detail.h"
+ 
++#include <algorithm>
+ #include <cmath>
++#include <cstdlib>
++#include <immintrin.h>
+ #include <cstring>
+ #include <limits>
+ 
+@@ -16,6 +19,321 @@ namespace
+             return std::numeric_limits<int32_t>::min();
+         return static_cast<int32_t>(scaled);
+     }
++
++    // ---- SIMD fast path for the common FMAC arithmetic (see execUpperFmacFast)
++    enum FastKind : uint8_t
++    {
++        FastNone,
++        FastAdd,
++        FastSub,
++        FastMul,
++        FastMadd,
++        FastMsub,
++    };
++    enum FastSrc : uint8_t
++    {
++        SrcBc,
++        SrcQ,
++        SrcI,
++        SrcVt,
++    };
++    struct FastOp
++    {
++        FastKind kind = FastNone;
++        FastSrc src = SrcVt;
++    };
++    struct FastOpTables
++    {
++        FastOp normal[64];
++        FastOp special[128];
++        static void fill(FastOp *t)
++        {
++            for (uint32_t i = 0; i < 4; ++i)
++            {
++                t[0x00 + i] = {FastAdd, SrcBc};
++                t[0x04 + i] = {FastSub, SrcBc};
++                t[0x08 + i] = {FastMadd, SrcBc};
++                t[0x0C + i] = {FastMsub, SrcBc};
++                t[0x18 + i] = {FastMul, SrcBc};
++            }
++            t[0x1C] = {FastMul, SrcQ};
++            t[0x1E] = {FastMul, SrcI};
++            t[0x20] = {FastAdd, SrcQ};
++            t[0x21] = {FastMadd, SrcQ};
++            t[0x22] = {FastAdd, SrcI};
++            t[0x23] = {FastMadd, SrcI};
++            t[0x24] = {FastSub, SrcQ};
++            t[0x25] = {FastMsub, SrcQ};
++            t[0x26] = {FastSub, SrcI};
++            t[0x27] = {FastMsub, SrcI};
++            t[0x28] = {FastAdd, SrcVt};
++            t[0x29] = {FastMadd, SrcVt};
++            t[0x2A] = {FastMul, SrcVt};
++            t[0x2C] = {FastSub, SrcVt};
++            t[0x2D] = {FastMsub, SrcVt};
++        }
++        FastOpTables()
++        {
++            fill(normal);  // vd = ...
++            fill(special); // ACC = ... (same numbering in the 0x3C..0x3F group)
++        }
++    };
++    const FastOpTables g_fastOps;
++
++    // Same as normalizeOperand on four lanes: denormals -> +-0, Inf/NaN -> +-max.
++    inline __m128 normalize4(__m128 v)
++    {
++        const __m128i bits = _mm_castps_si128(v);
++        const __m128i expMask = _mm_set1_epi32(0x7F800000);
++        const __m128i exp = _mm_and_si128(bits, expMask);
++        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++        __m128i out = _mm_blendv_epi8(bits, sign, _mm_cmpeq_epi32(exp, _mm_setzero_si128()));
++        out = _mm_blendv_epi8(out, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), _mm_cmpeq_epi32(exp, expMask));
++        return _mm_castsi128_ps(out);
++    }
++
++    // Lanes (component bit c set) whose exponent field is outside [lo, 253].
++    inline int unsafeLanes(__m128 v, int lo)
++    {
++        const __m128i exp = _mm_srli_epi32(_mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7F800000)), 23);
++        const __m128i bad = _mm_or_si128(_mm_cmplt_epi32(exp, _mm_set1_epi32(lo)),
++                                         _mm_cmpgt_epi32(exp, _mm_set1_epi32(253)));
++        return _mm_movemask_ps(_mm_castsi128_ps(bad));
++    }
++
++    // DEST bits (x=8 .. w=1) <-> component bits (x=1 .. w=8).
++    constexpr uint8_t kReverse4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
++
++    inline uint32_t maxExponent4(const float *v)
++    {
++        uint32_t e = 0;
++        for (int c = 0; c < 4; ++c)
++        {
++            uint32_t bits;
++            std::memcpy(&bits, &v[c], 4);
++            e = std::max(e, (bits >> 23) & 0xFFu);
++        }
++        return e;
++    }
++}
++
++
++
++// MAX/MINI (bc, i, full), ITOF*/FTOI*, ABS and CLIP: no FMAC flags, so just
++// the per-lane operation (same normalisation and comparisons as the generic
++// path; _mm_max_ps/_mm_min_ps return the second operand on ties, like
++// "vs > x ? vs : x"). Returns false for anything else.
++bool VU1Interpreter::execUpperSimpleFast(uint32_t instr, uint32_t op, bool special4, uint32_t special)
++{
++    const uint8_t dest = DEST(instr);
++    const uint8_t fs = FS(instr);
++    const uint8_t ft = FT(instr);
++    const int laneMask = kReverse4[dest];
++    const __m128 select = _mm_castsi128_ps(_mm_set_epi32((laneMask & 8) ? -1 : 0, (laneMask & 4) ? -1 : 0,
++                                                         (laneMask & 2) ? -1 : 0, (laneMask & 1) ? -1 : 0));
++    const auto store = [&](float *dst, __m128 value)
++    {
++        _mm_storeu_ps(dst, _mm_blendv_ps(_mm_loadu_ps(dst), value, select));
++    };
++
++    if (!special4)
++    {
++        const bool isMax = (op >= 0x10u && op <= 0x13u) || op == 0x1Du || op == 0x2Bu;
++        const bool isMin = (op >= 0x14u && op <= 0x17u) || op == 0x1Fu || op == 0x2Fu;
++        if (!isMax && !isMin)
++            return false;
++        m_currentUpperInstruction = instr;
++        const __m128 vs = normalize4(_mm_loadu_ps(m_state.vf[fs]));
++        __m128 x;
++        if (op <= 0x17u)
++            x = _mm_set1_ps(normalizeOperand(m_state.vf[ft][op & 3u]));
++        else if (op == 0x1Du || op == 0x1Fu)
++            x = _mm_set1_ps(normalizeOperand(m_state.i));
++        else
++            x = normalize4(_mm_loadu_ps(m_state.vf[ft]));
++        store(m_state.vf[FD(instr)], isMax ? _mm_max_ps(vs, x) : _mm_min_ps(vs, x));
++        return true;
++    }
++
++    if (special >= 0x10u && special <= 0x13u) // ITOF0/4/12/15
++    {
++        m_currentUpperInstruction = instr;
++        static const float kScale[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++        __m128 value = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[fs])));
++        if (special != 0x10u)
++            value = _mm_div_ps(value, _mm_set1_ps(kScale[special & 3u]));
++        store(m_state.vf[ft], value);
++        return true;
++    }
++    if (special >= 0x14u && special <= 0x17u) // FTOI0/4/12/15
++    {
++        m_currentUpperInstruction = instr;
++        static const float kScale[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++        float result[4];
++        for (int c = 0; c < 4; ++c)
++        {
++            const int32_t iv = vuFloatToInt(normalizeOperand(m_state.vf[fs][c]), kScale[special & 3u]);
++            std::memcpy(&result[c], &iv, 4);
++        }
++        store(m_state.vf[ft], _mm_loadu_ps(result));
++        return true;
++    }
++    if (special == 0x1Du) // ABS
++    {
++        m_currentUpperInstruction = instr;
++        const __m128 vs = normalize4(_mm_loadu_ps(m_state.vf[fs]));
++        store(m_state.vf[ft], _mm_andnot_ps(_mm_set1_ps(-0.0f), vs));
++        return true;
++    }
++    return false;
++}
++
++// Vectorised ADD/SUB/MUL/MADD/MSUB (bc, q, i, full; vd or ACC destination).
++// Bit-identical to the scalar path below: same operand normalisation, same
++// float operations in the same order (no FMA contraction), and it only
++// handles the case where every written lane is safely normal, where the
++// flags are just the signs. Anything else returns false before touching any
++// state and the generic path runs. PS2X_VU1_NO_FAST_FMAC=1 disables it.
++bool VU1Interpreter::execUpperFmacFast(uint32_t instr)
++{
++    const uint32_t op = instr & 0x3Fu;
++    const bool toAcc = op >= 0x3Cu;
++    const uint32_t special = (instr & 3u) | ((instr >> 4) & 0x7Cu);
++    if (toAcc && (special == 0x2Fu || special == 0x30u))
++    {
++        m_currentUpperInstruction = instr; // NOP: the generic path changes nothing else
++        return true;
++    }
++    if (execUpperSimpleFast(instr, op, toAcc, special))
++        return true;
++    const FastOp fop = toAcc ? g_fastOps.special[special] : g_fastOps.normal[op];
++    if (fop.kind == FastNone)
++        return false;
++
++    const uint8_t dest = DEST(instr);
++    const uint8_t fs = FS(instr);
++    const uint8_t ft = FT(instr);
++    m_currentUpperInstruction = instr;
++    if (dest == 0u)
++        return true; // nothing written, no flag update (as applyFmacDest)
++
++    const bool productSum = fop.kind == FastMadd || fop.kind == FastMsub;
++    int minExp = 1;
++    if (productSum)
++    {
++        // Same operand bound as normalizeFmacResult's product-sum fast path.
++        uint32_t qBits, iBits;
++        std::memcpy(&qBits, &m_state.q, 4);
++        std::memcpy(&iBits, &m_state.i, 4);
++        const uint32_t operandExp = std::max(std::max(maxExponent4(m_state.vf[fs]), maxExponent4(m_state.vf[ft])),
++                                             std::max((qBits >> 23) & 0xFFu, (iBits >> 23) & 0xFFu));
++        if (operandExp >= 190u)
++            return false;
++        minExp = 26;
++    }
++
++    const __m128 vs = normalize4(_mm_loadu_ps(m_state.vf[fs]));
++    __m128 x;
++    switch (fop.src)
++    {
++    case SrcBc:
++        x = _mm_set1_ps(normalizeOperand(m_state.vf[ft][op & 3u]));
++        break;
++    case SrcQ:
++        x = _mm_set1_ps(normalizeOperand(m_state.q));
++        break;
++    case SrcI:
++        x = _mm_set1_ps(normalizeOperand(m_state.i));
++        break;
++    default:
++        x = normalize4(_mm_loadu_ps(m_state.vf[ft]));
++        break;
++    }
++
++    const int laneMask = kReverse4[dest]; // component bits written
++    const auto zeroLanes = [](__m128 v)
++    {
++        const __m128i magnitude = _mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7FFFFFFF));
++        return _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128())));
++    };
++    // Lanes where an operand is +-0: the product is exactly +-0 (same sign
++    // rule in float and in the exact path), never an underflow.
++    const int zeroOperand = (fop.kind == FastMul || productSum) ? ((zeroLanes(vs) | zeroLanes(x)) & laneMask) : 0;
++
++    __m128 result;
++    int productSigns = 0;
++    int productZeros = 0;
++    switch (fop.kind)
++    {
++    case FastAdd:
++        result = _mm_add_ps(vs, x);
++        break;
++    case FastSub:
++        result = _mm_sub_ps(vs, x);
++        break;
++    case FastMul:
++        result = _mm_mul_ps(vs, x);
++        break;
++    default:
++    {
++        const __m128 product = _mm_mul_ps(vs, x);
++        if (unsafeLanes(product, 1) & laneMask & ~zeroOperand)
++            return false;
++        productSigns = _mm_movemask_ps(product) & laneMask;
++        productZeros = zeroOperand;
++        const __m128 acc = normalize4(_mm_loadu_ps(m_state.acc));
++        result = fop.kind == FastMadd ? _mm_add_ps(acc, product) : _mm_sub_ps(acc, product);
++        break;
++    }
++    }
++    const int zeros = zeroLanes(result) & laneMask;
++    int unsafe = unsafeLanes(result, minExp) & laneMask;
++    if (fop.kind == FastAdd || fop.kind == FastSub)
++    {
++        // ADD/SUB of two normalised floats is +-0 only when the exact sum is
++        // 0, with the same sign rule: a zero lane just sets Z (and S if -0).
++        unsafe &= ~zeros;
++    }
++    else if (fop.kind == FastMul)
++    {
++        unsafe &= ~(zeros & zeroOperand);
++    }
++    else
++    {
++        // Exact product +-0: the result is acc +- 0 = acc exactly (or an
++        // exact +-0), so only an overflow-sized value would need the exact
++        // path; acc is normalised, so exponent 254 still means <= max.
++        const __m128i exp = _mm_srli_epi32(_mm_and_si128(_mm_castps_si128(result), _mm_set1_epi32(0x7F800000)), 23);
++        const int denormal = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(exp, _mm_setzero_si128()))) & ~zeros;
++        unsafe &= ~(zeroOperand & ~denormal);
++    }
++    if (unsafe)
++        return false;
++
++    // Flag pipeline entry, as updateFmacFlags builds it: per lane Z (bit 0)
++    // and S (bit 1) into MAC (lane, lane << 4) and the status low bits.
++    const int signs = _mm_movemask_ps(result) & laneMask;
++    FlagPipelineEntry *entry = allocFlagEntry();
++    if (!entry)
++    {
++        reportReservedInstruction(true, 0xFFFFFFFFu);
++    }
++    else
++    {
++        entry->issueCycle = m_cycle;
++        entry->readyCycle = m_cycle + kFmacLatency;
++        entry->mac = static_cast<uint32_t>(kReverse4[zeros]) | (static_cast<uint32_t>(kReverse4[signs]) << 4);
++        entry->status = (zeros ? 0x1u : 0u) | (signs ? 0x2u : 0u);
++        entry->extraSticky = (productSigns ? 0x2u : 0u) | (productZeros ? 0x1u : 0u);
++        entry->writesMac = true;
++        entry->writesStatus = true;
++    }
++
++    float *dst = toAcc ? m_state.acc : m_state.vf[FD(instr)];
++    const __m128i select = _mm_set_epi32((laneMask & 8) ? -1 : 0, (laneMask & 4) ? -1 : 0,
++                                         (laneMask & 2) ? -1 : 0, (laneMask & 1) ? -1 : 0);
++    _mm_storeu_ps(dst, _mm_blendv_ps(_mm_loadu_ps(dst), result, _mm_castsi128_ps(select)));
++    return true;
+ }
+ 
+ // ============================================================================
+@@ -23,6 +341,9 @@ namespace
+ // ============================================================================
+ void VU1Interpreter::execUpper(uint32_t instr)
+ {
++    static const bool noFastFmac = std::getenv("PS2X_VU1_NO_FAST_FMAC") != nullptr;
++    if (!noFastFmac && execUpperFmacFast(instr))
++        return;
+     m_currentUpperInstruction = instr;
+     uint8_t dest = DEST(instr);
+     uint8_t ft = FT(instr);
 diff --git a/ps2xRuntime/tools/gs_replay.cpp b/ps2xRuntime/tools/gs_replay.cpp
 new file mode 100644
 index 0000000..440d8a9
