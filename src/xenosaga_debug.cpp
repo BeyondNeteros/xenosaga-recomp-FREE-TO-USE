@@ -11,6 +11,7 @@
 #include "runtime/gs/gs_frontend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -269,6 +270,77 @@ namespace
                     (unsigned long long)before, (unsigned long long)dispEnvPmode(rdram));
     }
 
+
+    // --- Current-matrix tracing -------------------------------------------
+    // Xenosaga keeps a "current matrix" in VU0 vf27-vf30 (ps2__CurMatrixSet/
+    // Mul/Get). The world-to-clip matrix it sends to VU1 comes out of this
+    // chain, and it arrives garbled. Keep the last few operations and print
+    // them whenever a Get returns a non-finite or absurdly large matrix.
+    struct MatrixOp
+    {
+        char kind;
+        uint32_t a0, ra;
+        float input[16];
+        float before[16];
+        float after[16];
+    };
+    MatrixOp g_matrixRing[24];
+    uint32_t g_matrixRingPos = 0;
+    int g_matrixReports = 0;
+    int g_matrixGoodReports = 0;
+
+    void readCur(const R5900Context *ctx, float out[16])
+    {
+        for (int r = 0; r < 4; ++r)
+            _mm_storeu_ps(out + r * 4, ctx->vu0_vf[27 + r]);
+    }
+
+    bool absurd(const float m[16])
+    {
+        for (int i = 0; i < 16; ++i)
+            if (!std::isfinite(m[i]) || std::fabs(m[i]) > 1e15f)
+                return true;
+        return false;
+    }
+
+    void printMatrix(const char *label, const float m[16])
+    {
+        std::printf("      %s", label);
+        for (int r = 0; r < 4; ++r)
+            std::printf(" (%.4g %.4g %.4g %.4g)", m[r * 4], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
+        std::printf("\n");
+    }
+
+    template <void (*Original)(uint8_t *, R5900Context *, PS2Runtime *), char Kind>
+    void tracedMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        MatrixOp &op = g_matrixRing[g_matrixRingPos++ % 24];
+        op.kind = Kind;
+        op.a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+        op.ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        std::memcpy(op.input, rdram + (op.a0 & 0x01FFFFF0u), sizeof(op.input));
+        readCur(ctx, op.before);
+        Original(rdram, ctx, runtime);
+        readCur(ctx, op.after);
+        if (Kind != 'G')
+            return;
+        const bool bad = absurd(op.after);
+        if (bad ? g_matrixReports++ >= 6 : g_matrixGoodReports++ >= 2)
+            return;
+        std::printf("[xenosaga] CurMatrixGet %s (ctx %p): last operations, oldest first\n", bad ? "returned a bad matrix" : "ok", (void *)ctx);
+        for (uint32_t i = 0; i < 24; ++i)
+        {
+            const MatrixOp &o = g_matrixRing[(g_matrixRingPos + i) % 24];
+            if (!o.kind)
+                continue;
+            std::printf("    %c a0=0x%08x from %s\n", o.kind, o.a0, describePc(o.ra).c_str());
+            if (o.kind != 'G')
+                printMatrix("in    ", o.input);
+            printMatrix("before", o.before);
+            printMatrix("after ", o.after);
+        }
+    }
+
     // On a PS2, ControlEntry spends many frames loading sound banks before it
     // calls xglRenderDispOn, so the render thread's own xglRenderInit always
     // runs first. With sound skipped that wait is instant and the order flips:
@@ -304,4 +376,7 @@ void xs_traceDisplay(PS2Runtime &runtime)
     runtime.registerFunction(0x0022D338u, tracedDispEnvInit);
     runtime.registerFunction(0x0022D7B8u, tracedDispOff);
     runtime.registerFunction(0x0022D7D8u, tracedDispOn);
+    runtime.registerFunction(0x00236448u, tracedMatrix<ps2__CurMatrixSet_0x236448, 'S'>);
+    runtime.registerFunction(0x00236478u, tracedMatrix<ps2__CurMatrixMul_0x236478, 'M'>);
+    runtime.registerFunction(0x00236460u, tracedMatrix<ps2__CurMatrixGet_0x236460, 'G'>);
 }
