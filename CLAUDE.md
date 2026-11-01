@@ -15,6 +15,9 @@ Read `NOTES.md` for the current investigation before changing anything.
 - Don't permanently delete Beyond's files. Use the Recycle Bin or move to a
   `_to_delete` folder.
 - End commit messages with the attribution lines Claude Code normally adds.
+- After each commit, push to the private GitHub repo: `git push github`
+  (https://github.com/BeyondNeteros/xenosaga-recomp; `origin` is the old
+  bundle). Only this repo goes up, never game data.
 
 ## Layout (project root = the folder containing `port/`)
 
