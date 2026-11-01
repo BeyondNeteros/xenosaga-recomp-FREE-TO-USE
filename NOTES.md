@@ -104,6 +104,26 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Graphics (GS) speed (2026-11-01, runs/async1)
+
+- In-game profile (`XS_PROFILE=180,45`): one thread did all the work, ~65% VU1
+  and ~30% software rasterizer (SampleTexture, WritePixel, DrawTriangle,
+  texture/Z reads); the EE game code itself is small.
+- `PS2X_GS_CAPTURE=185,3` + `tools/gs_replay` (target gs_replay): exact offline
+  replay of 3 tutorial frames, final VRAM byte-identical to the game's (the
+  capture records whether each call ran with VU1's round-toward-zero mode, which
+  changes the rasterizer's float maths). ~70 ms of GS work per frame.
+- The GS now runs on its own worker thread (`PS2X_GS_ASYNC=0` to disable): game
+  5.2 -> 6.5 fps, GS thread ~46% busy, main thread now ~75% VU1. Readbacks
+  sync with the queue (CSR/SIGLBLID reads, CSR writes, local->host, VRAM reads,
+  presentation latch).
+- Tried and dropped: per-row span limiting in DrawTriangle (no gain, triangles
+  are tiny; per-pixel work dominates).
+- Next for GS when it becomes the limit again (~14 fps): hoist per-primitive
+  setup out of SampleTexture/WritePixel, then split rasterization over several
+  threads by screen bands (same per-pixel order, so output stays exact; flush
+  on uploads and when a draw samples a buffer drawn earlier in the batch).
+
 ## Speed status (2026-11-01, runs/fast3)
 
 The heartbeat prints `fps: game X, vsync Y` (game = DISPFB1 flips per
