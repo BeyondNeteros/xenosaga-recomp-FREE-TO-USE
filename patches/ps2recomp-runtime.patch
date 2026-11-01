@@ -1,3 +1,35 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..fd92760 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -164,17 +164,16 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VCALLMSR(const Instruction &inst)
+     {
+-        // VCALLMSR calls a VU0 microprogram at address stored in integer register
+-        uint8_t vis_reg_idx = inst.rd; // Source integer register (vis)
+-
+-        return fmt::format(
+-            "{{ "
+-            "    uint16_t instr_index = ctx->vi[{}] & 0x1FF; "             // Get instruction index from VI[IS], mask to 9 bits
+-            "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
+-            "    ctx->vu0_pc = target_byte_addr; "
+-            "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+-            "}}",
+-            vis_reg_idx);
++        // VCALLMSR calls the VU0 microprogram whose address is in CMSAR0 (control
++        // register 27, set with CTC2). The encoding's rd field is always 27; it is
++        // not an index into vi[], which only has 16 entries.
++        (void)inst;
++        return "{ "
++               "    uint16_t instr_index = ctx->vu0_cmsar0 & 0x1FF; "           // CMSAR0 holds an instruction index
++               "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
++               "    ctx->vu0_pc = target_byte_addr; "
++               "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
++               "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
 index 589d768..a02e0f1 100644
 --- a/ps2xRuntime/CMakeLists.txt

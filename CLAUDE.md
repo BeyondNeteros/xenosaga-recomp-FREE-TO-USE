@@ -57,6 +57,41 @@ The playable install lives at `<install folder>`
 6. Copy `ps2EntryRunner.exe` to the install folder as `XenosagaRecomp.exe`
    (plus any MinGW/FFmpeg DLLs it needs if not linked statically).
 
+### Windows build on Beyond's PC (works as of 2026-10-31)
+
+MSYS2 is at `C:\msys64` (installed with `winget install MSYS2.MSYS2`). From Git
+Bash, put `/c/msys64/mingw64/bin:/c/msys64/usr/bin` first on `PATH` (Git for
+Windows ships its own `/mingw64`; don't use that one). Folders used:
+
+- `<root>/gamefiles/` Beyond's `SLUS_204.69`, `OV*.OVL`, `SYSTEM.CNF` (extracted
+  from the ISO with `C:\Program Files\7-Zip\7z.exe e`). Never commit.
+- `PS2Recomp/build-tools/` tools only: `-G Ninja -DCMAKE_BUILD_TYPE=Release
+  -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF`, then
+  `cmake --build build-tools --target ps2_recomp ps2_analyzer`.
+- `PS2Recomp/build-runtime/` runtime: `-DPS2X_BUILD_RECOMP=OFF
+  -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF` plus
+  the step-5 flags and `-DPS2X_BUILD_VU_REPLAY=ON`; build `ps2EntryRunner
+  vu1_replay`. Full build is ~368 ninja steps, about 15 minutes on 24 threads.
+- `runs/build-logs/` configure/build logs.
+- Install with `bash port/tools/install.sh`: it renames the old exe to
+  `XenosagaRecomp.exe.bak-<timestamp>`, copies the new one and the MSYS2 DLLs it
+  imports (82 of them, mostly FFmpeg codecs; a static or trimmed FFmpeg
+  would cut this down).
+
+Windows fixes so far: `setup_recomp.py` needed absolute tool paths (it runs
+the tools with cwd set to the output folder). The patch's MinGW tweaks
+(objcopy rename, pkg-config FFmpeg) worked unchanged with GCC 16.2.
+
+Recompiler fix in the patch: `VCALLMSR` reads CMSAR0 (`ctx->vu0_cmsar0`), not
+`vi[27]`. Without it no VU0 microprogram started from EE code ever ran (see
+NOTES.md). Changing `ps2xRecomp` means rebuilding the tools and regenerating
+the code (`setup_recomp.py` + `assemble.py`) before the runtime build.
+
+`tools/eedis.py <elf> <symbol|0xaddr> [count]` disassembles EE code from the
+ELF by symbol (`--sym text` lists symbols); needs `pip install capstone
+pyelftools`. Capstone decodes PS2 `lq`/`sq` (opcodes 0x1e/0x1f) as MSA junk and
+COP2 macro ops as `.word`; read those from the raw word.
+
 A full build compiles ~7,500 generated files and is slow. Changing a header
 included by `ps2_runtime.h` (for example `runtime/ps2_vu1.h`) or adding a new
 source file rebuilds everything; editing one runtime `.cpp` is quick.
@@ -64,7 +99,8 @@ source file rebuilds everything; editing one runtime `.cpp` is quick.
 Port code lives in `port/src` and is copied by `assemble.py`. After editing a
 port file, copy it to `PS2Recomp/ps2xRuntime/src/runner` (or rerun assemble.py).
 Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
-`git -C PS2Recomp diff -- . ":(exclude)ps2xRuntime/src/runner" > port/patches/ps2recomp-runtime.patch`.
+`git -C PS2Recomp diff -- . ":(exclude)ps2xRuntime/src/runner" > port/patches/ps2recomp-runtime.patch`
+(new files need `git -C PS2Recomp add -N <file>` first or they are left out).
 
 ## Running and debugging
 
