@@ -52,7 +52,7 @@ def main():
     ap.add_argument("--bin", default=str(Path(os.environ.get("PS2RECOMP", ROOT / "PS2Recomp")) / "out" / "build"))
     args = ap.parse_args()
     src = Path(args.game_files)
-    bin_dir = Path(args.bin)
+    bin_dir = Path(args.bin).resolve()  # absolute: tools run with cwd set to the output folder
     analyzer = find_tool(bin_dir, "ps2_analyzer")
     recomp = find_tool(bin_dir, "ps2_recomp")
 
