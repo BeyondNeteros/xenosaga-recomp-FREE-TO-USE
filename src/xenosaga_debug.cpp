@@ -27,6 +27,42 @@
 #include <thread>
 #include <vector>
 
+// Debug switches are read once on the main thread (xsCacheEnv, called before
+// the game starts): getenv from game threads later in the run was unreliable
+// here and made switches randomly appear off.
+namespace
+{
+    std::map<std::string, std::string> &envCache()
+    {
+        static std::map<std::string, std::string> cache; // safe whatever the init order
+        return cache;
+    }
+}
+
+void xsCacheEnv()
+{
+    for (const char *key : {"PS2X_GS_SEQLOG", "XS_CUR_COUNT", "XS_INTERP_LOG", "XS_JNT_DUMP", "XS_MUL_WATCH",
+                            "XS_PARTS_DUMP", "XS_RAM_DUMP", "XS_ROT_CHECK"})
+        if (const char *v = std::getenv(key))
+            envCache()[key] = v;
+    std::printf("[xenosaga] environment:");
+    for (char **e = _environ; e && *e; ++e)
+        if (std::strncmp(*e, "XS_", 3) == 0 || std::strncmp(*e, "PS2X_", 5) == 0)
+            std::printf(" %s", *e);
+    std::printf("\n[xenosaga] debug switches:");
+    for (const auto &kv : envCache())
+        std::printf(" %s=%s", kv.first.c_str(), kv.second.c_str());
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
+const char *xsEnv(const char *key)
+{
+    const auto it = envCache().find(key);
+    return it == envCache().end() ? nullptr : it->second.c_str();
+}
+
+
 void xglRenderDispEnvInit_0x22d338(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xglRenderDispOff_0x22d7b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xglRenderDispOn_0x22d7d8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -246,11 +282,13 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                 }
                 // XS_RAM_DUMP=1: also the 32 MB of EE RAM (xs_ram.bin), to diff
                 // against a PCSX2 save state's eeMemory.bin. Game data: never commit.
-                static const bool ramDump = std::getenv("XS_RAM_DUMP") != nullptr;
+                static const bool ramDump = xsEnv("XS_RAM_DUMP") != nullptr;
                 if (ramDump)
                 {
                     std::ofstream out(PS2Runtime::getIoPaths().elfDirectory / "xs_ram.bin", std::ios::binary);
                     out.write(reinterpret_cast<const char *>(runtime.memory().getRDRAM()), PS2_RAM_SIZE);
+                    std::ofstream spr(PS2Runtime::getIoPaths().elfDirectory / "xs_spr.bin", std::ios::binary);
+                    spr.write(reinterpret_cast<const char *>(runtime.memory().getScratchpad()), PS2_SCRATCHPAD_SIZE);
                 }
             }
             for (const auto &t : snap.threads)
@@ -396,6 +434,7 @@ namespace
     uint32_t rdWord(const uint8_t *rdram, uint32_t addr) { uint32_t v; std::memcpy(&v, rdram + (addr & 0x01FFFFFCu), 4); return v; }
     std::atomic<int> g_texCalls[3];
 
+    void printCurCounts();
     std::atomic<int> g_flushCalls{0};
     void tracedModelFlush(uint8_t *r, R5900Context *c, PS2Runtime *rt)
     {
@@ -406,6 +445,8 @@ namespace
                         g_flushCalls.load(), g_texCalls[0].load(), g_texCalls[1].load(), g_texCalls[2].load());
             std::fflush(stdout);
         }
+        if (g_flushCalls % 500 == 0 && xsEnv("XS_CUR_COUNT"))
+            printCurCounts();
         nmlModelFlush_0x235ff8(r, c, rt);
     }
 
@@ -438,7 +479,7 @@ namespace
     {
         const uint32_t obj = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
         const int n = g_texCalls[2]++;
-        static const char *seq = std::getenv("PS2X_GS_SEQLOG");
+        static const char *seq = xsEnv("PS2X_GS_SEQLOG");
         // Every call once the GS sequence log runs (it starts at about the same
         // time), otherwise the first 12: the XTX entries become CT32 uploads at
         // dbp = (bank*2048 + entry[8]) / 64.
@@ -504,7 +545,7 @@ namespace
 {
     void tracedAddParts(uint8_t *r, R5900Context *c, PS2Runtime *rt)
     {
-        static const char *env = std::getenv("XS_PARTS_DUMP");
+        static const char *env = xsEnv("XS_PARTS_DUMP");
         if (env)
         {
             static const auto start = std::chrono::steady_clock::now();
@@ -527,8 +568,333 @@ namespace
     }
 }
 
+// XS_JNT_DUMP=<seconds>: log the joint-matrix array JNT_setMDLMatrix reads
+// (*(jnt+0x7a0), entry jnt+0x2c) for a few calls, to find bad joint matrices.
+namespace
+{
+    void tracedSetMDLMatrix(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        static const char *env = xsEnv("XS_JNT_DUMP");
+        if (env)
+        {
+            static const auto start = std::chrono::steady_clock::now();
+            static int printed = 0;
+            const uint32_t jnt = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(std::atoi(env)) && printed < 40)
+            {
+                ++printed;
+                // The JNT object lives in the scratchpad (0x70000000).
+                const uint8_t *spr = rt->memory().getScratchpad();
+                auto guest = [&](uint32_t a) -> const uint8_t * {
+                    return (a & 0xF0000000u) == 0x70000000u ? spr + (a & 0x3FF0u) : r + (a & 0x01FFFFF0u);
+                };
+                uint32_t arr, idx;
+                std::memcpy(&arr, guest(jnt + 0x7a0) + ((jnt + 0x7a0) & 0xC), 4);
+                std::memcpy(&idx, guest(jnt + 0x2c) + ((jnt + 0x2c) & 0xC), 4);
+                float m[16];
+                std::memcpy(m, guest(arr + idx * 64u), sizeof(m));
+                std::printf("[jnt] jnt=0x%x array=0x%x idx=%u elem=0x%x\n", jnt, arr, idx, arr + idx * 64u);
+                printMatrix("joint", m);
+                std::fflush(stdout);
+            }
+        }
+        JNT_setMDLMatrix_0x313950(r, c, rt);
+    }
+}
+
+// XS_MUL_WATCH=<hex lo>,<hex hi>: when xglMatrixMul writes its result into
+// [lo,hi), log both inputs (a1, a2; either may be in the scratchpad).
+namespace
+{
+    void tracedMatrixMul(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        static std::atomic<int> calls{0};
+        static std::atomic<int> jntCalls{0};
+        if (static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[31])) == 0x313a5cu && jntCalls++ < 30)
+        {
+            std::printf("[mul] from JNT_setMDLMatrix: out=0x%x a=0x%x b=0x%x\n",
+                        static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4])), static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[5])),
+                        static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[6])));
+            std::fflush(stdout);
+        }
+        if (calls++ == 0)
+        {
+            std::printf("[mul] hook entered\n");
+            std::fflush(stdout);
+        }
+        static uint32_t lo = 0, hi = 0;
+        static const bool on = [] {
+            const char *env = xsEnv("XS_MUL_WATCH");
+            if (!env)
+                return false;
+            char *end = nullptr;
+            lo = static_cast<uint32_t>(std::strtoul(env, &end, 16));
+            hi = (end && *end == ',') ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16)) : lo + 64;
+            return true;
+        }();
+        const uint32_t out = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4])) & 0x1FFFFFFFu; // physical
+        static int printed = 0;
+        if (on && out >= lo && out < hi && printed < 4000)
+        {
+            ++printed;
+            const uint8_t *spr = rt->memory().getScratchpad();
+            auto guest = [&](uint32_t a) -> const uint8_t * {
+                return (a & 0xF0000000u) == 0x70000000u ? spr + (a & 0x3FF0u) : r + (a & 0x01FFFFF0u);
+            };
+            const uint32_t a = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[5]));
+            const uint32_t b = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[6]));
+            float ma[16], mb[16];
+            std::memcpy(ma, guest(a), sizeof(ma));
+            std::memcpy(mb, guest(b), sizeof(mb));
+            std::printf("[mul] out=0x%x a=0x%x b=0x%x ra=0x%x\n", out, a, b,
+                        static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[31])));
+            printMatrix("a", ma);
+            printMatrix("b", mb);
+            std::fflush(stdout);
+        }
+        xglMatrixMul_0x229bc8(r, c, rt);
+    }
+}
+
+// XS_INTERP_LOG=1: log the blend weight (f12) liner_interpolate gets, and
+// the return address, for the first calls.
+namespace
+{
+    void tracedLinerInterpolate(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        static const bool on = xsEnv("XS_INTERP_LOG") != nullptr;
+        static std::atomic<int> n{0};
+        if (on && n++ < 300)
+        {
+            std::printf("[interp] t=%g ra=0x%x\n", c->f[12], static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[31])));
+            std::fflush(stdout);
+        }
+        liner_interpolate_0x313300(r, c, rt);
+    }
+}
+
+// XS_ROT_CHECK=1: re-compute CUR_MATRIX_Rzyx4s (rotate the VU0 current
+// matrix vf27-29 by x, y, z angles read from a0) in plain C++ from the game's
+// own instruction sequence, and log the first mismatches with the
+// recompiled result.
+namespace
+{
+    void tracedRzyx4s(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        static const bool on = xsEnv("XS_ROT_CHECK") != nullptr;
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true))
+        {
+            std::printf("[rot] hook active, check %s\n", on ? "on" : "off");
+            std::fflush(stdout);
+        }
+        if (!on)
+        {
+            CUR_MATRIX_Rzyx4s_0x26f430(r, c, rt);
+            return;
+        }
+        const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
+        float ang[3];
+        const uint8_t *angSrc = (a0 & 0xF0000000u) == 0x70000000u ? rt->memory().getScratchpad() + (a0 & 0x3FFCu)
+                                                                    : r + (a0 & 0x01FFFFFCu);
+        std::memcpy(ang, angSrc, sizeof(ang));
+        float m[4][4];
+        for (int i = 0; i < 4; ++i)
+            _mm_storeu_ps(m[i], c->vu0_vf[27 + i]);
+        const float cx = std::cos(ang[0]), sx = std::sin(ang[0]);
+        const float cy = std::cos(ang[1]), sy = std::sin(ang[1]);
+        const float cz = std::cos(ang[2]), sz = std::sin(ang[2]);
+        float e27[3], e28[3], e29[3], v9[3], v8[3], n28[3], n29[3];
+        for (int k = 0; k < 3; ++k)
+        {
+            v9[k] = m[0][k] * cx + m[1][k] * sx;  // vmulax/vmaddx vf9
+            n28[k] = m[1][k] * cx - m[0][k] * sx; // vmulax/vmsubx vf28
+            v8[k] = v9[k] * cy - m[2][k] * sy;    // vmsuby vf8
+            n29[k] = m[2][k] * cy + v9[k] * sy;   // vmaddy vf29
+            e27[k] = v8[k];
+            e28[k] = n28[k] * cz + n29[k] * sz;   // vf9 -> vf28
+            e29[k] = n29[k] * cz - n28[k] * sz;
+        }
+        CUR_MATRIX_Rzyx4s_0x26f430(r, c, rt);
+        float got[3][4];
+        for (int i = 0; i < 3; ++i)
+            _mm_storeu_ps(got[i], c->vu0_vf[27 + i]);
+        float worst = 0;
+        const float *exp[3] = {e27, e28, e29};
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 3; ++k)
+                worst = std::max(worst, std::fabs(got[i][k] - exp[i][k]));
+        static std::atomic<int> bad{0}, total{0};
+        ++total;
+        if (worst > 1e-3f && bad++ < 10)
+        {
+            std::printf("[rot] mismatch %g (call %d) angles %g %g %g\n", worst, total.load(), ang[0], ang[1], ang[2]);
+            for (int i = 0; i < 3; ++i)
+                std::printf("      vf%d got (%g %g %g) expected (%g %g %g)\n", 27 + i, got[i][0], got[i][1], got[i][2],
+                            exp[i][0], exp[i][1], exp[i][2]);
+            std::fflush(stdout);
+        }
+        if (total == 1 || total == 100 || total == 2000)
+        {
+            std::printf("[rot] %d calls checked, %d mismatches\n", total.load(), bad.load());
+            std::fflush(stdout);
+        }
+    }
+}
+
+// XS_CUR_COUNT=1: count calls to each CUR_MATRIX_* helper; printed every 500 flushes.
+namespace
+{
+    std::atomic<uint32_t> g_curCounts[14];
+    const char *const kCurNames[14] = {"Unit", "Unit4s", "Set", "Get", "GetT", "SetT", "SetR", "4s3",
+                                       "Txyz4s", "Rx4s", "Ry4s", "Rz4s", "Rzyx4s", "Sxyz4s"};
+    bool vfFinite(const R5900Context *c, int first, int count)
+    {
+        for (int i = first; i < first + count; ++i)
+        {
+            float v[4];
+            _mm_storeu_ps(v, c->vu0_vf[i]);
+            for (float x : v)
+                if (!std::isfinite(x) || std::fabs(x) > 1e30f)
+                    return false;
+        }
+        return true;
+    }
+
+    template <int I, void (*Original)(uint8_t *, R5900Context *, PS2Runtime *)>
+    void countedCur(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        ++g_curCounts[I];
+        // NaN hunt: the PS2 has no NaN/Inf, so the first helper that turns a
+        // finite current matrix (vf27-30) into NaN/Inf/huge points at the bug.
+        const bool before = vfFinite(c, 27, 4);
+        float in[4][4];
+        for (int i = 0; i < 4; ++i)
+            _mm_storeu_ps(in[i], c->vu0_vf[27 + i]);
+        const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
+        Original(r, c, rt);
+        static std::atomic<int> reports{0};
+        if (before && !vfFinite(c, 27, 4) && reports++ < 12)
+        {
+            const uint8_t *spr = rt->memory().getScratchpad();
+            const uint8_t *src = (a0 & 0xF0000000u) == 0x70000000u ? spr + (a0 & 0x3FF0u) : r + (a0 & 0x01FFFFF0u);
+            float arg[16];
+            std::memcpy(arg, src, sizeof(arg));
+            float out[16];
+            for (int i = 0; i < 4; ++i)
+                _mm_storeu_ps(out + i * 4, c->vu0_vf[27 + i]);
+            std::printf("[nan] CUR_MATRIX_%s made the matrix non-finite; a0=0x%x ra=0x%x\n", kCurNames[I], a0,
+                        static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[31])));
+            printMatrix("in ", &in[0][0]);
+            printMatrix("a0 ", arg);
+            printMatrix("out", out);
+            std::fflush(stdout);
+        }
+    }
+    void printCurCounts()
+    {
+        std::printf("[cur]");
+        for (int i = 0; i < 14; ++i)
+            std::printf(" %s=%u", kCurNames[i], g_curCounts[i].load());
+        std::printf("\n");
+        std::fflush(stdout);
+    }
+}
+
+// XS_NO_EXMOTION=1: skip EXM_CalcExMotion (hair/skirt physics) as an experiment.
+// XS_EXM_HUNT=1: report EXM_CalcExMotion calls that turn finite joint matrices
+// (*(jnt+0x7a0), 96 entries) into NaN/Inf/huge values.
+namespace
+{
+    bool matFinite(const float *m)
+    {
+        for (int i = 0; i < 16; ++i)
+            if (!std::isfinite(m[i]) || std::fabs(m[i]) > 1e30f)
+                return false;
+        return true;
+    }
+
+    void huntExMotion(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        const uint32_t jnt = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
+        const uint32_t elem = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[5]));
+        const uint8_t *spr = rt->memory().getScratchpad();
+        auto guest = [&](uint32_t a) -> const uint8_t * {
+            return (a & 0xF0000000u) == 0x70000000u ? spr + (a & 0x3FFFu) : r + (a & 0x01FFFFFFu);
+        };
+        uint32_t arr;
+        std::memcpy(&arr, guest(jnt + 0x7a0), 4);
+        static float before[96][16];
+        bool finite[96];
+        for (int i = 0; i < 96; ++i)
+        {
+            std::memcpy(before[i], guest(arr + i * 64u), 64);
+            finite[i] = matFinite(before[i]);
+        }
+        uint8_t elemBytes[64];
+        std::memcpy(elemBytes, guest(elem), sizeof(elemBytes));
+        EXM_CalcExMotion_0x31d760(r, c, rt);
+        static std::atomic<int> reports{0};
+        for (int i = 0; i < 96; ++i)
+        {
+            float after[16];
+            std::memcpy(after, guest(arr + i * 64u), 64);
+            if (finite[i] && !matFinite(after) && reports++ < 8)
+            {
+                uint16_t type;
+                std::memcpy(&type, elemBytes, 2);
+                std::printf("[exm] joint %d (0x%x) went bad; elem 0x%x type %u bytes:", i, arr + i * 64u, elem, type);
+                for (int b = 0; b < 64; b += 4)
+                {
+                    uint32_t w;
+                    std::memcpy(&w, elemBytes + b, 4);
+                    std::printf(" %08x", w);
+                }
+                std::printf("\n");
+                printMatrix("before", before[i]);
+                printMatrix("after ", after);
+                std::fflush(stdout);
+            }
+        }
+    }
+
+    void skipExMotion(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        (void)r;
+        (void)rt;
+        c->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[31]));
+    }
+}
+
 void xs_traceDisplay(PS2Runtime &runtime)
 {
+    xsCacheEnv();
+    if (std::getenv("XS_NO_EXMOTION"))
+        runtime.registerFunction(0x0031D760u, skipExMotion);
+    else if (std::getenv("XS_EXM_HUNT"))
+        runtime.registerFunction(0x0031D760u, huntExMotion);
+    if (xsEnv("XS_CUR_COUNT"))
+    {
+        runtime.registerFunction(0x0026F250u, countedCur<0, CUR_MATRIX_Unit_0x26f250>);
+        runtime.registerFunction(0x0026F268u, countedCur<1, CUR_MATRIX_Unit4s_0x26f268>);
+        runtime.registerFunction(0x0026F288u, countedCur<2, CUR_MATRIX_Set_0x26f288>);
+        runtime.registerFunction(0x0026F2A0u, countedCur<3, CUR_MATRIX_Get_0x26f2a0>);
+        runtime.registerFunction(0x0026F2B8u, countedCur<4, CUR_MATRIX_GetT_0x26f2b8>);
+        runtime.registerFunction(0x0026F2C8u, countedCur<5, CUR_MATRIX_SetT_0x26f2c8>);
+        runtime.registerFunction(0x0026F2D8u, countedCur<6, CUR_MATRIX_SetR_0x26f2d8>);
+        runtime.registerFunction(0x0026F2F8u, countedCur<7, CUR_MATRIX_4s3_0x26f2f8>);
+        runtime.registerFunction(0x0026F360u, countedCur<8, CUR_MATRIX_Txyz4s_0x26f360>);
+        runtime.registerFunction(0x0026F388u, countedCur<9, CUR_MATRIX_Rx4s_0x26f388>);
+        runtime.registerFunction(0x0026F3C0u, countedCur<10, CUR_MATRIX_Ry4s_0x26f3c0>);
+        runtime.registerFunction(0x0026F3F8u, countedCur<11, CUR_MATRIX_Rz4s_0x26f3f8>);
+        runtime.registerFunction(0x0026F430u, countedCur<12, CUR_MATRIX_Rzyx4s_0x26f430>);
+        runtime.registerFunction(0x0026F4C0u, countedCur<13, CUR_MATRIX_Sxyz4s_0x26f4c0>);
+    }
+    else
+        runtime.registerFunction(0x0026F430u, tracedRzyx4s);
+    runtime.registerFunction(0x00313300u, tracedLinerInterpolate);
+    runtime.registerFunction(0x00229BC8u, tracedMatrixMul);
+    runtime.registerFunction(0x00313950u, tracedSetMDLMatrix);
     runtime.registerFunction(0x00237EE8u, tracedAddParts);
     runtime.registerFunction(0x0022A548u, tracedFrustum);
     runtime.registerFunction(0x00235FF8u, tracedModelFlush);

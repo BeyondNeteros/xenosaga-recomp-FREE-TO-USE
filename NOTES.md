@@ -42,25 +42,33 @@ It reads `sceGsGetGParam`, whose stub used byte fields; the SDK struct is four
 shorts (interlace=1, omode=2, ffmode=0 on the real console), fixed in the
 patch (Stubs/Helpers/Support.h). Display registers now match real hardware.
 
-## In progress: collapsed legs / stray polygons (2026-11-01, runs/ram2)
+## Collapsed legs / flung hair: fixed - SQRT.S operand (2026-11-01, runs/sqrt1)
 
-Legs collapse upward to the hips and hair is flung out (see shots/). Findings:
-- Object placement matrices (part +0x180/+0x80) match the PCSX2 state exactly,
-  as do heap addresses, so RAM can be diffed directly (XS_RAM_DUMP=1 writes
-  xs_ram.bin; compare with runs/pcsx2/eeMemory.bin).
-- The VU1 skinning packets differ: per bone the packet has UNPACK V4-32 of 4
-  qwords (quaternion-like values, some ~2x the real ones) then UNPACK of a 4x4
-  matrix, which in the port is zeros/NaN/huge (e.g. 0xc00e30-0xc00f40 in
-  xs_ram.bin vs eeMemory.bin). Source arrays near 0x112af20 differ too.
-- Ruled out: VU0 inverse microprogram (tools/vu0_test.cpp runs it through the
-  interpreter: correct), mirrored rotations, VOPMULA/VOPMSUB and broadcast
-  multiply-add translations, VRSQRT (translator ignores the numerator, but this
-  game always uses vf0w = 1).
-- Next suspects: xglQuaternion2Matrix / xglQuaternionInterpolateLinear (pure
-  VU0 macro code; decode with tools/cop2dis.py), the code that fills the
-  per-bone quaternion block, and the remaining sceGsSetDefDrawEnv stub.
+Characters' skinning matrices (e.g. 0x1001170, built by JNT_setMDLMatrix =
+xglMatrixMul(joint, inverse bind)) were NaN/1e38. Traced with the new write
+watchpoint and NaN hunts:
+- joint matrices come from JNT_constructMatrix and EXM_CalcExMotion (hair /
+  skirt physics); the first joint to go bad is a type-3 EXM element:
+  translate, then MATRIX_rotZ4s/rotY4s/rotX4s -> MATRIX_rotate4(axis, angle).
+- MATRIX_rotate4 normalises the axis with `sqrt.s`. The EE encodes SQRT.S
+  fd, ft (operand in ft, fs = 0; all 108 sqrt.s in the game are like that),
+  but PS2Recomp's FPU translator read fs, i.e. sqrt(f0). For the Y and X axes
+  that divided by 0 -> +-max -> NaN. Fixed in fpu_translator.cpp; every
+  square root in the game was affected.
+- Also fixed on the way (no visible effect alone): VU0 macro VDIV/VSQRT/VRSQRT
+  now use the PS2 rules (x/0 = +-max, sqrt(|x|), fs/sqrt(|ft|)) via ps2_fdiv/
+  ps2_fsqrt/ps2_frsqrt instead of returning 0.
+- Checked and fine: CUR_MATRIX_Rzyx4s (self-check vs C++), VU0 sin/cos and
+  matrix inverse microprograms (tools/vu0_test.cpp), VOPMULA/VOPMSUB, broadcast
+  multiply-adds, VMULq, ldl/ldr/sdl/sdr, quaternion helpers, bind matrices.
 
-
+Debugging infrastructure added for this (see CLAUDE.md): PS2X_WATCH write
+watchpoint (runtime), XS_RAM_DUMP (EE RAM + scratchpad), XS_CUR_COUNT (CUR_MATRIX
+call counts + NaN hunt), XS_EXM_HUNT, XS_ROT_CHECK, XS_MUL_WATCH, XS_JNT_DUMP,
+tools/vu0_test (run VU0 microprograms offline), tools/cop2dis.py. Pass debug
+switches with `run_game.sh ... --env NAME=VALUE`: variables set in front of the
+command did not reliably reach the game. Note the skeleton object lives in the
+scratchpad (0x70000000); hooks must read it via memory().getScratchpad().
 
 ## 3D black screen: root cause found (2026-10-31, run4)
 
@@ -88,6 +96,13 @@ row: (0 1 0 0) (0 0 1 0) (0.98 1.01 -2.4 1) (garbage).
 Side note: the generator also emits `vi[21]`/`vi[24]` writes in two
 functions that are data misread as code (sub_00A11338, ov01 sub_00A46248
 near 0xa46e34). Harmless unless executed.
+
+## State after the SQRT fix (runs/sqrt1)
+
+The "Virtual Tutorial" scene matches the PCSX2 save state: characters,
+textures, camera and text. Remaining big item: speed (below). Things not yet
+looked at: sound (skipped), FMV playback quality, later scenes/battles
+(overlays ov10/ov11/ov12), widescreen.
 
 ## Next: VU1 speed
 

@@ -39,6 +39,22 @@ index 97dc2dd..e685a7a 100644
              auto appendEntryPointHints = [&](const toml::value &table, const char *key)
              {
                  if (!table.contains(key) || !table.at(key).is_array())
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 435db3a..93e2779 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -58,7 +58,10 @@ namespace ps2recomp
+                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
+                                    ft, fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // The EE encodes SQRT.S fd, ft: the operand is in the ft field and fs
++                // is 0 (every sqrt.s in Xenosaga's code has fs = 0). Reading fs took
++                // the square root of f0, which broke every normalisation.
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
 diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
 index 8c1c7c5..dbd1978 100644
 --- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
@@ -66,10 +82,42 @@ index 8c1c7c5..dbd1978 100644
          {
              return true;
 diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
-index 509fd07..fd92760 100644
+index 509fd07..33ff0f5 100644
 --- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
 +++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
-@@ -164,17 +164,16 @@ namespace ps2recomp
+@@ -75,21 +75,28 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        // VU semantics (same as the EE FPU's, see ps2_fdiv): x/0 gives +-max with
++        // the sign of fs xor ft, never 0 or Inf. Code like Xenosaga's alignXAxis
++        // relies on that for vectors along an axis.
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_fdiv(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        // sqrt(|ft|): the sign of ft is ignored, as on the hardware.
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_fsqrt(ft); }}", ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++        // Q = fs / sqrt(|ft|); ft = 0 gives +-max (sign of fs), see ps2_frsqrt.
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_frsqrt(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+@@ -164,17 +171,16 @@ namespace ps2recomp
  
      std::string CodeGenerator::translateVU_VCALLMSR(const Instruction &inst)
      {
@@ -185,6 +233,41 @@ index 92ef0d5..d24ec97 100644
          set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
      else()
          message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..a468930 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -237,6 +237,13 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
+     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
+ }
+ 
++// Guest write watchpoint: PS2X_WATCH=<start>,<end> (hex, end exclusive) logs
++// stores into that physical range with the writer's pc/ra (ps2_runtime.cpp).
++extern uint32_t g_ps2WatchLo;
++extern uint32_t g_ps2WatchHi;
++void ps2WatchHit(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const char *op,
++                 const R5900Context *ctx);
++
+ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                uint32_t guestAddr,
+                                uint32_t size,
+@@ -246,13 +253,9 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                const R5900Context *ctx)
+ {
+     (void)rdram;
+-    (void)guestAddr;
+-    (void)size;
+-    (void)valueLo;
+-    (void)valueHi;
+-    (void)op;
+-    (void)ctx;
+-    // TODO we dont need this anymore so on next release it will be deleted
++    const uint32_t phys = guestAddr & 0x1FFFFFFFu;
++    if (phys < g_ps2WatchHi && phys + size > g_ps2WatchLo)
++        ps2WatchHit(guestAddr, size, valueLo, valueHi, op, ctx);
+ }
+ 
+ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
 diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
 index 0485d50..40c7680 100644
 --- a/ps2xRuntime/include/ps2_runtime_macros.h
@@ -1125,7 +1208,7 @@ index 8590f14..e55e157 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..d4e4031 100644
+index 45cb9d2..bced858 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -1289,6 +1372,50 @@ index 45cb9d2..d4e4031 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
+@@ -1411,6 +1534,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     return ctx->pc == fallthroughPc;
+ }
+ 
++namespace
++{
++    // PS2X_WATCH=<start>,<end>[,<max hits>] in hex physical addresses.
++    struct WatchRange
++    {
++        uint32_t lo = 0, hi = 0, maxHits = 200;
++        WatchRange()
++        {
++            if (const char *env = std::getenv("PS2X_WATCH"))
++            {
++                char *end = nullptr;
++                lo = static_cast<uint32_t>(std::strtoul(env, &end, 16));
++                if (end && *end == ',')
++                    hi = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
++                if (end && *end == ',')
++                    maxHits = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10));
++            }
++        }
++    };
++    const WatchRange g_watchRange;
++    std::atomic<uint32_t> g_watchHits{0};
++}
++
++uint32_t g_ps2WatchLo = g_watchRange.lo;
++uint32_t g_ps2WatchHi = g_watchRange.hi;
++
++void ps2WatchHit(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const char *op,
++                 const R5900Context *ctx)
++{
++    if (g_watchHits.fetch_add(1) >= g_watchRange.maxHits)
++        return;
++    std::printf("[watch] %s 0x%08x (%u) = %016llx%016llx pc=0x%08x ra=0x%08x\n", op, guestAddr, size,
++                static_cast<unsigned long long>(valueHi), static_cast<unsigned long long>(valueLo),
++                ctx ? ctx->pc : 0u, ctx ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) : 0u);
++    std::fflush(stdout);
++}
++
+ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
+ {
+     if (exception == EXCEPTION_INTEGER_OVERFLOW)
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 index f872edd..d31be32 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
@@ -1790,10 +1917,10 @@ index f19e281..dc56f72 100644
  
 diff --git a/ps2xRuntime/tools/vu0_test.cpp b/ps2xRuntime/tools/vu0_test.cpp
 new file mode 100644
-index 0000000..577500b
+index 0000000..94c29a5
 --- /dev/null
 +++ b/ps2xRuntime/tools/vu0_test.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,65 @@
 +// Runs a VU0 microprogram from a raw microcode file through the runtime's VU
 +// interpreter with vf28-31 set to a test matrix, and prints vf28-31 after.
 +// Used to check timing-sensitive programs (e.g. Xenosaga's matrix inverse)
@@ -1814,7 +1941,9 @@ index 0000000..577500b
 +
 +int main(int argc, char **argv)
 +{
-+    if (argc < 3 + 16)
++    // Register mode: vu0_test code.bin pc vf4=x,y,z,w [vfN=...]  -> prints vf1-vf4.
++    const bool regMode = argc > 3 && std::strncmp(argv[3], "vf", 2) == 0;
++    if (argc < 3 + (regMode ? 1 : 16))
 +    {
 +        std::fprintf(stderr, "usage: %s microcode.bin startpc m00..m33\n", argv[0]);
 +        return 1;
@@ -1832,14 +1961,28 @@ index 0000000..577500b
 +
 +    VU1Interpreter vu(VU1Interpreter::Unit::VU0);
 +    VU1State &s = vu.state();
-+    for (int r = 0; r < 4; ++r)
-+        for (int c = 0; c < 4; ++c)
-+            s.vf[28 + r][c] = static_cast<float>(std::atof(argv[3 + r * 4 + c]));
++    if (regMode)
++    {
++        for (int a = 3; a < argc; ++a)
++        {
++            int reg = 0;
++            float v[4] = {0, 0, 0, 0};
++            if (std::sscanf(argv[a], "vf%d=%f,%f,%f,%f", &reg, &v[0], &v[1], &v[2], &v[3]) >= 2 && reg > 0 && reg < 32)
++                std::memcpy(s.vf[reg], v, sizeof(v));
++        }
++    }
++    else
++    {
++        for (int r = 0; r < 4; ++r)
++            for (int c = 0; c < 4; ++c)
++                s.vf[28 + r][c] = static_cast<float>(std::atof(argv[3 + r * 4 + c]));
++    }
 +    s.vf[0][3] = 1.0f;
 +    vu.execute(code.data(), PS2_VU0_CODE_SIZE, data.data(), PS2_VU0_DATA_SIZE, gs, nullptr,
 +               static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 16)), 0, 0, 4096);
++    const int first = regMode ? 1 : 28;
 +    for (int r = 0; r < 4; ++r)
-+        std::printf("%g %g %g %g\n", s.vf[28 + r][0], s.vf[28 + r][1], s.vf[28 + r][2], s.vf[28 + r][3]);
++        std::printf("%g %g %g %g\n", s.vf[first + r][0], s.vf[first + r][1], s.vf[first + r][2], s.vf[first + r][3]);
 +    std::printf("cycles %llu\n", static_cast<unsigned long long>(s.cycles));
 +    return 0;
 +}
