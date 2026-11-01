@@ -104,6 +104,28 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## VU1 static block scheduling (2026-11-01, runs/static1)
+
+- Straight-line blocks (ending after a branch's delay slot, after the pair
+  following an E-bit, at a D/T pair, or at 64 pairs) get a precomputed
+  schedule: the issue cycle of each pair (same rules as
+  calculatePairReadyCycle/markPairWrites, on offsets from block entry), the
+  register lanes read before being written in the block ("live-ins") with the
+  offset they are read at, first FDIV/EFU uses, and the final readiness of
+  every register written. `staticEntryOk` checks live-ins, pending FDIV/EFU
+  and that no XGKICK is in progress when the block kicks; otherwise that run
+  of the block goes through the dynamic loop. Blocks with two XGKICKs or more
+  than two EFU issues are never static. Per-pair execution and the
+  pc/branch/E/D/T logic are shared (`execPairDirect`, `finishPair`); cycles are
+  stepped one by one while a kick is active so its memory reads interleave
+  with stores exactly as before. FDIV commits now order flag commits by the
+  FDIV's own ready cycle (same result in the dynamic loop).
+- `PS2X_VU1_STATIC=0` disables it. vu1_replay 22.9 -> 18.5 ns per VU cycle, 72/72
+  captures identical to the frozen reference; game 7.1 -> 8.5 fps.
+- Profile now: almost no scheduling cost left; FMAC fast path ~25%, block
+  runner ~20%, execLower ~10%. GS thread is at ~60%, so it becomes the
+  limit around 14 fps.
+
 ## VU1 vector fast path (2026-11-01, runs/simd1)
 
 - `execUpperFmacFast` (ps2_vu1_upper.cpp): ADD/SUB/MUL/MADD/MSUB in bc/q/i/full
