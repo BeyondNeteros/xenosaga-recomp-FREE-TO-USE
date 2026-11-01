@@ -104,6 +104,31 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Parallel rasterizer (2026-11-01, runs/gspar1)
+
+- GSCpuBackend queues primitives and draws them on `PS2X_GS_THREADS` threads
+  (default hardware threads / 3, max 8; 1 = old immediate path). Each thread
+  owns interleaved 8-row bands of every target and walks the queue in order,
+  so every pixel sees the same operations as single-threaded.
+- Drained before anything that reads/changes VRAM or transfer state (uploads,
+  transfers, clears, readbacks, VRAM snapshot/present, FINISH) and when the
+  GS worker's input queue runs dry. Queued primitives keep a CLUT snapshot,
+  so CLUT loads don't drain (unless the CLUT source is being drawn into).
+- Conflict checks use page ranges: frame/Z by the primitive's vertex rows,
+  textures by their format's page geometry. A primitive that reads memory an
+  earlier queued one writes (or writes what one reads, or aliases another
+  target layout) drains first. A primitive that samples its own target or
+  whose Z overlaps its frame is drawn ordered on one thread (~300 per frame in
+  the tutorial: 2D effects around the characters that sample the framebuffer
+  half a row below each pixel; a real row-order dependency).
+- The texture page snapshot cache was removed (texels read straight from VRAM;
+  same output, faster, and thread-safe).
+- Drawing always uses round-to-nearest. `GS_REPLAY_ROUND=nearest` makes
+  gs_replay do the same for every record: 1, 4 and 8 threads give identical
+  VRAM; with 1 thread and recorded modes it still matches the game capture.
+- gs_replay: 65.7 -> 46.8 ms per frame (8 threads); game 8.5 -> 9.6 fps, GS
+  thread ~39% busy. VU1 (~70% of the main thread) is the limit again.
+
 ## VU1 static block scheduling (2026-11-01, runs/static1)
 
 - Straight-line blocks (ending after a branch's delay slot, after the pair
