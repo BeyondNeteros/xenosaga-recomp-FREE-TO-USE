@@ -23,7 +23,7 @@ done
 
 taskkill //IM XenosagaRecomp.exe //F >/dev/null 2>&1 || true
 cd "$GAME"
-rm -f xs_trx_*.bin xs_vram_after_*.bin xs_texdump*
+rm -f xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin
 export XS_NO_SOUND=1 XS_DISC_IMAGE="$DISC" PS2X_VU_CAPTURE=1 PS2X_GS_TRXLOG=1
 # Extra debug env passes through, e.g. PS2X_GS_TRXDUMP=3a80,38b2 bash port/tools/run_game.sh ...
 [ -n "$input" ] && export PS2X_INPUT_SCRIPT="$input"
@@ -39,7 +39,7 @@ wait $pid 2>/dev/null || true
 
 out="$ROOT/runs/$name"
 mkdir -p "$out"
-for f in xenosaga.log xs_frame.bmp xs_vram.bin vu1_capture.bin xs_trx_*.bin xs_vram_after_*.bin xs_texdump*; do
+for f in xenosaga.log xs_frame.bmp xs_vram.bin vu1_capture.bin xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin; do
     [ -f "$f" ] && cp -p "$f" "$out/"
 done
 echo "run $name done; results in runs/$name"

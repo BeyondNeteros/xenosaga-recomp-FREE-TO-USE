@@ -22,6 +22,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -242,6 +243,14 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                 {
                     std::ofstream out(PS2Runtime::getIoPaths().elfDirectory / "xs_vram.bin", std::ios::binary);
                     out.write(reinterpret_cast<const char *>(vram), PS2_GS_VRAM_SIZE);
+                }
+                // XS_RAM_DUMP=1: also the 32 MB of EE RAM (xs_ram.bin), to diff
+                // against a PCSX2 save state's eeMemory.bin. Game data: never commit.
+                static const bool ramDump = std::getenv("XS_RAM_DUMP") != nullptr;
+                if (ramDump)
+                {
+                    std::ofstream out(PS2Runtime::getIoPaths().elfDirectory / "xs_ram.bin", std::ios::binary);
+                    out.write(reinterpret_cast<const char *>(runtime.memory().getRDRAM()), PS2_RAM_SIZE);
                 }
             }
             for (const auto &t : snap.threads)
@@ -488,8 +497,39 @@ namespace
     }
 }
 
+// XS_PARTS_DUMP=<seconds>: that long after the first call, print the part
+// structures nmlPacketAddParts receives (a1; matrices at +0x180 and +0x80, a2
+// camera) for the first 48 distinct parts, to compare with a PCSX2 save state.
+namespace
+{
+    void tracedAddParts(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        static const char *env = std::getenv("XS_PARTS_DUMP");
+        if (env)
+        {
+            static const auto start = std::chrono::steady_clock::now();
+            static std::set<uint32_t> seen;
+            const uint32_t part = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[5]));
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(std::atoi(env)) && seen.size() < 48 &&
+                seen.insert(part).second)
+            {
+                float m180[16], m80[16];
+                std::memcpy(m180, r + ((part + 0x180u) & 0x01FFFFF0u), sizeof(m180));
+                std::memcpy(m80, r + ((part + 0x80u) & 0x01FFFFF0u), sizeof(m80));
+                std::printf("[parts] part=0x%x flags=0x%x model=0x%x cam=0x%x\n", part, rdWord(r, part + 0x250),
+                            static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4])), static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[6])));
+                printMatrix("+0x180", m180);
+                printMatrix("+0x80 ", m80);
+                std::fflush(stdout);
+            }
+        }
+        nmlPacketAddParts_0x237ee8(r, c, rt);
+    }
+}
+
 void xs_traceDisplay(PS2Runtime &runtime)
 {
+    runtime.registerFunction(0x00237EE8u, tracedAddParts);
     runtime.registerFunction(0x0022A548u, tracedFrustum);
     runtime.registerFunction(0x00235FF8u, tracedModelFlush);
     runtime.registerFunction(0x00237DA0u, tracedAddTexture);

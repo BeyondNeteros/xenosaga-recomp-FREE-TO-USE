@@ -10,3 +10,4 @@ output/
 xs_vram.bin
 *.bmp
 vu1_capture.bin
+xs_ram.bin

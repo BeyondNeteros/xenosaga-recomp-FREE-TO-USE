@@ -98,7 +98,7 @@ index 509fd07..fd92760 100644
  
      std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..a02e0f1 100644
+index 589d768..245769a 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -253,7 +253,7 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
@@ -159,7 +159,7 @@ index 589d768..a02e0f1 100644
      install(DIRECTORY "${FFMPEG_BIN_DIR}/"
          DESTINATION bin
          FILES_MATCHING
-@@ -608,3 +634,10 @@ endif()
+@@ -608,3 +634,12 @@ endif()
  install(DIRECTORY include/
      DESTINATION include
  )
@@ -169,6 +169,8 @@ index 589d768..a02e0f1 100644
 +if(PS2X_BUILD_VU_REPLAY)
 +    add_executable(vu1_replay tools/vu1_replay.cpp)
 +    target_link_libraries(vu1_replay PRIVATE ps2_runtime)
++    add_executable(vu0_test tools/vu0_test.cpp)
++    target_link_libraries(vu0_test PRIVATE ps2_runtime)
 +endif()
 diff --git a/ps2xRuntime/cmake/ReleaseMode.cmake b/ps2xRuntime/cmake/ReleaseMode.cmake
 index 92ef0d5..d24ec97 100644
@@ -1786,6 +1788,61 @@ index f19e281..dc56f72 100644
          if (m_state.pc + 8u > codeSize)
              break;
  
+diff --git a/ps2xRuntime/tools/vu0_test.cpp b/ps2xRuntime/tools/vu0_test.cpp
+new file mode 100644
+index 0000000..577500b
+--- /dev/null
++++ b/ps2xRuntime/tools/vu0_test.cpp
+@@ -0,0 +1,49 @@
++// Runs a VU0 microprogram from a raw microcode file through the runtime's VU
++// interpreter with vf28-31 set to a test matrix, and prints vf28-31 after.
++// Used to check timing-sensitive programs (e.g. Xenosaga's matrix inverse)
++// against a reference result.
++//
++//   vu0_test microcode.bin <start pc hex> m00 m01 ... m33   (16 floats, row major)
++
++#include "ps2_runtime.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/ps2_vu1.h"
++#include "runtime/gs/gs_frontend.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <vector>
++
++int main(int argc, char **argv)
++{
++    if (argc < 3 + 16)
++    {
++        std::fprintf(stderr, "usage: %s microcode.bin startpc m00..m33\n", argv[0]);
++        return 1;
++    }
++    std::ifstream in(argv[1], std::ios::binary);
++    std::vector<uint8_t> code((std::istreambuf_iterator<char>(in)), {});
++    code.resize(PS2_VU0_CODE_SIZE, 0);
++    std::vector<uint8_t> data(PS2_VU0_DATA_SIZE, 0);
++
++    PS2Memory memory;
++    if (!memory.initialize())
++        return 1;
++    GS gs;
++    gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &memory.gs());
++
++    VU1Interpreter vu(VU1Interpreter::Unit::VU0);
++    VU1State &s = vu.state();
++    for (int r = 0; r < 4; ++r)
++        for (int c = 0; c < 4; ++c)
++            s.vf[28 + r][c] = static_cast<float>(std::atof(argv[3 + r * 4 + c]));
++    s.vf[0][3] = 1.0f;
++    vu.execute(code.data(), PS2_VU0_CODE_SIZE, data.data(), PS2_VU0_DATA_SIZE, gs, nullptr,
++               static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 16)), 0, 0, 4096);
++    for (int r = 0; r < 4; ++r)
++        std::printf("%g %g %g %g\n", s.vf[28 + r][0], s.vf[28 + r][1], s.vf[28 + r][2], s.vf[28 + r][3]);
++    std::printf("cycles %llu\n", static_cast<unsigned long long>(s.cycles));
++    return 0;
++}
 diff --git a/ps2xRuntime/tools/vu1_replay.cpp b/ps2xRuntime/tools/vu1_replay.cpp
 new file mode 100644
 index 0000000..37d388d

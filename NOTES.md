@@ -42,12 +42,25 @@ It reads `sceGsGetGParam`, whose stub used byte fields; the SDK struct is four
 shorts (interlace=1, omode=2, ffmode=0 on the real console), fixed in the
 patch (Stubs/Helpers/Support.h). Display registers now match real hardware.
 
-## Next: stray stretched polygons, missing body parts
+## In progress: collapsed legs / stray polygons (2026-11-01, runs/ram2)
 
-Proportions and camera now match PCSX2. Left: one long polygon stretched
-across the scene from a character's head, and lower bodies (Shion's legs)
-missing or cut short. Likely skinning (bone matrices) or VU1 microcode
-precision; `sceGsSetDefDrawEnv` is still a stub too.
+Legs collapse upward to the hips and hair is flung out (see shots/). Findings:
+- Object placement matrices (part +0x180/+0x80) match the PCSX2 state exactly,
+  as do heap addresses, so RAM can be diffed directly (XS_RAM_DUMP=1 writes
+  xs_ram.bin; compare with runs/pcsx2/eeMemory.bin).
+- The VU1 skinning packets differ: per bone the packet has UNPACK V4-32 of 4
+  qwords (quaternion-like values, some ~2x the real ones) then UNPACK of a 4x4
+  matrix, which in the port is zeros/NaN/huge (e.g. 0xc00e30-0xc00f40 in
+  xs_ram.bin vs eeMemory.bin). Source arrays near 0x112af20 differ too.
+- Ruled out: VU0 inverse microprogram (tools/vu0_test.cpp runs it through the
+  interpreter: correct), mirrored rotations, VOPMULA/VOPMSUB and broadcast
+  multiply-add translations, VRSQRT (translator ignores the numerator, but this
+  game always uses vf0w = 1).
+- Next suspects: xglQuaternion2Matrix / xglQuaternionInterpolateLinear (pure
+  VU0 macro code; decode with tools/cop2dis.py), the code that fills the
+  per-bone quaternion block, and the remaining sceGsSetDefDrawEnv stub.
+
+
 
 ## 3D black screen: root cause found (2026-10-31, run4)
 
