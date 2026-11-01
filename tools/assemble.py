@@ -18,10 +18,16 @@ import shutil
 import sys
 from pathlib import Path
 
-ROOT = Path.home() / "xenosaga"
+import os
+
+# Project layout (override with environment variables):
+#   <XS_ROOT>/port/        this repository
+#   <XS_ROOT>/recomp/      generated code (tools/setup_recomp.py)
+#   <PS2RECOMP>/           PS2Recomp checkout (default <XS_ROOT>/PS2Recomp)
+ROOT = Path(os.environ.get("XS_ROOT", Path(__file__).resolve().parents[2]))
 RECOMP = ROOT / "recomp"
 PORT_SRC = ROOT / "port" / "src"
-RUNTIME = Path.home() / "PS2Recomp" / "ps2xRuntime"
+RUNTIME = Path(os.environ.get("PS2RECOMP", ROOT / "PS2Recomp")) / "ps2xRuntime"
 RUNNER = RUNTIME / "src" / "runner"
 INCLUDE = RUNTIME / "include"
 

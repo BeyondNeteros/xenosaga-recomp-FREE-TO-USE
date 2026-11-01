@@ -7,14 +7,18 @@ built by statically recompiling the original game code with [PS2Recomp](https://
 
 ## Status
 
-Exploring: the game code recompiles; the first boot tests are in progress.
+Early: boots to the title screen and into the game, but 3D scenes don't render yet.
 
 | Part | State |
 |---|---|
-| Main executable (`SLUS_204.69`) | Recompiles cleanly (4,526 functions) |
+| Main executable (`SLUS_204.69`) | Recompiles cleanly |
 | Overlays (`OV01/02/10/11/12.OVL`) | Recompile cleanly; swapped in at runtime |
-| Boot | In progress |
-| Graphics, audio, FMV | Not started |
+| Boot, disc access (dual-layer ISO) | Working |
+| Title screen, menus, text boxes | Rendering (title looks hazy) |
+| In-game FMVs | Playing (title attract movie not yet) |
+| Controls | Working |
+| 3D scenes | Not rendering (bad world-to-clip matrix); VU1 far too slow |
+| Sound | Skipped (sound driver RPC not working yet) |
 
 ## How it works
 
@@ -30,6 +34,8 @@ Exploring: the game code recompiles; the first boot tests are in progress.
 - `tools/assemble.py` merges the generated main and overlay code into the PS2Recomp runtime build
 
 ## Building (developer notes)
+
+See `CLAUDE.md` for the full setup. In short:
 
 1. Dump your own disc. Copy `SYSTEM.CNF`, `SLUS_204.69`, and `OV*.OVL` from its root into a folder.
 2. Run `ps2_analyzer` and `ps2_recomp` on `SLUS_204.69` (output in `recomp/output`).
