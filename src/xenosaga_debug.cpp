@@ -463,8 +463,34 @@ namespace
     }
 }
 
+// xglMatrixStackFrustum(l=f12, r=f13, b=f14, t=f15, n=f16, f=f17) runs a VU0
+// program that multiplies a frustum into the matrix stack (vf28-31). Log the
+// inputs and vf28-31 before/after for the first calls.
+namespace
+{
+    std::atomic<int> g_frustumCalls{0};
+    void tracedFrustum(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        const int n = g_frustumCalls++;
+        float before[16];
+        readCur(c, before); // vf27-30
+        xglMatrixStackFrustum_0x22a548(r, c, rt);
+        if (n < 6)
+        {
+            std::printf("[xenosaga] xglMatrixStackFrustum l=%g r=%g b=%g t=%g n=%g f=%g\n", c->f[12], c->f[13], c->f[14],
+                        c->f[15], c->f[16], c->f[17]);
+            float after[16];
+            for (int i = 0; i < 4; ++i)
+                _mm_storeu_ps(after + i * 4, c->vu0_vf[28 + i]);
+            printMatrix("vf28-31 after", after);
+            std::fflush(stdout);
+        }
+    }
+}
+
 void xs_traceDisplay(PS2Runtime &runtime)
 {
+    runtime.registerFunction(0x0022A548u, tracedFrustum);
     runtime.registerFunction(0x00235FF8u, tracedModelFlush);
     runtime.registerFunction(0x00237DA0u, tracedAddTexture);
     runtime.registerFunction(0x00237C38u, tracedTextureTrans);

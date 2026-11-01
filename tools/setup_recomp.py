@@ -30,6 +30,9 @@ OVERLAYS = ["ov01", "ov02", "ov10", "ov11", "ov12"]
 UNSTUB = {
     "sceGsSetDefLoadImage": (0x4D50C0, 0x3B),
     "sceGsSetDefStoreImage": None,
+    # Writes the display registers the camera derives its aspect ratio from;
+    # the stub's values (MAGH 0, DX 2136...) squashed the 3D view horizontally.
+    "sceGsSetDefDispEnv": None,
 }
 
 

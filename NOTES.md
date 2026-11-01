@@ -31,12 +31,23 @@ Also changed on the way (kept, no visible effect on their own): the GIF arbiter
 now runs packets in submission order (`PS2X_GIF_PRIORITY_SORT=1` restores the
 old path-priority sort), and the texture page cache is invalidated by uploads.
 
-## Next: stretched geometry
+## Squashed 3D view: fixed (2026-11-01, runs/fix2)
 
-With textures right, models show long spikes (vertices pulled far up from the
-heads) and look squashed. Likely skinning/bone matrices or a VU1 transform
-issue; the VU0 matrix-stack fix may have exposed a second matrix bug. Compare
-against the PCSX2 state (vu1Memory.bin has the VU1 data of a real frame).
+The camera frustum's X scale was 6.7x too big. xglCameraViewScreen derives the
+pixel aspect from the game's dispEnv DISPLAY register (MAGH), which comes from
+`sceGsSetDefDispEnv` - another stubbed libgraph builder, writing DX=2136,
+DY=2047, MAGH=0 instead of the real DX=636, DY=50, MAGH=4, DW=2559 (checked in
+the PCSX2 state). Now recompiled from the game (UNSTUB in setup_recomp.py).
+It reads `sceGsGetGParam`, whose stub used byte fields; the SDK struct is four
+shorts (interlace=1, omode=2, ffmode=0 on the real console), fixed in the
+patch (Stubs/Helpers/Support.h). Display registers now match real hardware.
+
+## Next: stray stretched polygons, missing body parts
+
+Proportions and camera now match PCSX2. Left: one long polygon stretched
+across the scene from a character's head, and lower bodies (Shion's legs)
+missing or cut short. Likely skinning (bone matrices) or VU1 microcode
+precision; `sceGsSetDefDrawEnv` is still a stub too.
 
 ## 3D black screen: root cause found (2026-10-31, run4)
 
