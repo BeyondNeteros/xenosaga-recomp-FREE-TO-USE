@@ -119,8 +119,17 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
   packets (tags, AD registers, primitive types, vertex ranges).
 - The current-matrix tracer prints the last VU0 matrix operations whenever
   `ps2__CurMatrixGet` returns a bad matrix (see NOTES.md).
-- Beyond has to drive the game (New Game, skipping FMVs); Claude can launch it
-  and read the log and frame.
+- **Unattended runs:** `bash port/tools/run_game.sh <name> <seconds> --input
+  port/inputs/newgame-to-tutorial.txt` boots the installed exe with the launcher's
+  env, replays a pad script and copies log/frame/VRAM dump to `runs/<name>/`.
+  That script reaches the "Virtual Tutorial" 3D scene in about 3 minutes with
+  nobody at the PC. `--record file.txt` writes live controller input as a new
+  script. Replay/record live in the runtime's `ps2_pad.cpp` (code adapted from the
+  console-controller skill; stock key/pad mapping unchanged); scripts are
+  `frame buttons [lx ly rx ry]` where frame = port-0 pad reads, and
+  `padmap.py check --script` (console-controller skill) validates them.
+  The game reads only the controller while one is connected (keyboard ignored).
+- Screen capture of the game window shows black (GL); read `xs_frame.bmp`.
 
 ## Key game facts
 

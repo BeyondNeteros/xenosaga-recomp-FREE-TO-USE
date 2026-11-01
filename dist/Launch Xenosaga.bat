@@ -33,6 +33,9 @@ set "XS_NO_SOUND=1"
 set "XS_DISC_IMAGE=%DISC%"
 rem Debug: when VU1 is the bottleneck, record 300 VU1 calls to vu1_capture.bin.
 set "PS2X_VU_CAPTURE=1"
+rem Debug: log GS texture uploads (first 600) to xenosaga.log.
+set "PS2X_GS_TRXLOG=1"
+set "PS2X_GS_TRXDUMP=3a80,38b2,3a00"
 
 echo Starting Xenosaga Episode I: Recompiled...
 echo Log: "%~dp0xenosaga.log"

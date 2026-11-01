@@ -321,7 +321,7 @@ index aed4cb5..82ba73c 100644
      }
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..fb5f2c8 100644
+index 9281d5f..a6136f6 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,3 +1,4 @@
@@ -329,7 +329,60 @@ index 9281d5f..fb5f2c8 100644
  #include "runtime/gs/gs_frontend.h"
  #include "runtime/gs/gs_cpu_backend.h"
  #include "ps2_log.h"
-@@ -640,6 +641,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -6,9 +7,52 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <sstream>
++#include <set>
++
++namespace
++{
++    // PS2X_GS_TRXLOG=1: log host->local transfers (where textures go, in what
++    // format) and whether each one received all its bytes. Each distinct
++    // transfer shape is logged once (up to 3000 lines).
++    struct TrxLog
++    {
++        bool on = std::getenv("PS2X_GS_TRXLOG") != nullptr;
++        int lines = 0;
++        uint64_t expected = 0, received = 0;
++        uint32_t dbp = 0, dbw = 0, dpsm = 0, rrw = 0, rrh = 0, x = 0, y = 0;
++        bool open = false;
++        std::FILE *dumpFile = nullptr;
++        bool more() { return on && lines < 3000; }
++        void close(const char *why)
++        {
++            if (open && more() && received != expected)
++            {
++                ++lines;
++                std::printf("[gs:trx] SHORT dbp=0x%x got %llu of %llu bytes (%s)\n", dbp,
++                            (unsigned long long)received, (unsigned long long)expected, why);
++            }
++            open = false;
++        }
++    };
++    TrxLog s_trxLog;
++
++    uint64_t trxBytes(uint32_t psm, uint64_t pixels)
++    {
++        switch (psm)
++        {
++        case 0x00: case 0x30: return pixels * 4;
++        case 0x01: case 0x31: return pixels * 3;
++        case 0x02: case 0x0A: case 0x32: case 0x3A: return pixels * 2;
++        case 0x13: case 0x1B: return pixels;
++        default: return (pixels + 1) / 2;
++        }
++    }
++}
++
+ 
+ namespace
+ {
+@@ -640,6 +684,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -337,6 +390,85 @@ index 9281d5f..fb5f2c8 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16 || !m_backend)
          return;
+@@ -730,7 +775,14 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+             // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
+             uint32_t imageBytes = nloop * 16;
+             if (offset + imageBytes > sizeBytes)
++            {
++                if (s_trxLog.more())
++                {
++                    ++s_trxLog.lines;
++                    std::printf("[gs:trx] IMAGE tag wants %u bytes, packet has %u left\n", imageBytes, sizeBytes - offset);
++                }
+                 imageBytes = sizeBytes - offset;
++            }
+             processImageData(data + offset, imageBytes);
+             offset += imageBytes;
+         }
+@@ -1384,6 +1436,28 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     case GS_REG_TRXDIR:
+     {
+         m_trxdir = static_cast<uint32_t>(value & 0x3);
++        if (s_trxLog.on)
++        {
++            s_trxLog.close("next TRXDIR");
++            static std::set<uint64_t> seen;
++            const uint64_t key = (uint64_t(m_bitbltbuf.dbp) << 48) ^ (uint64_t(m_bitbltbuf.dpsm) << 42) ^
++                                 (uint64_t(m_bitbltbuf.dbw) << 36) ^ (uint64_t(m_trxreg.rrw) << 24) ^
++                                 (uint64_t(m_trxreg.rrh) << 12) ^ (uint64_t(m_trxpos.dsax) << 6) ^ m_trxpos.dsay;
++            if (m_trxdir == 0u)
++            {
++                // Always track the byte count; print the setup only for new shapes.
++                s_trxLog = TrxLog{true, s_trxLog.lines, trxBytes(m_bitbltbuf.dpsm, uint64_t(m_trxreg.rrw) * m_trxreg.rrh), 0,
++                                  m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxreg.rrw, m_trxreg.rrh,
++                                  m_trxpos.dsax, m_trxpos.dsay, true};
++            }
++            if (m_trxdir == 0u && s_trxLog.more() && seen.insert(key).second)
++            {
++                ++s_trxLog.lines;
++                std::printf("[gs:trx] dbp=0x%x dbw=%u dpsm=0x%x %ux%u at (%u,%u)\n", m_bitbltbuf.dbp,
++                            unsigned(m_bitbltbuf.dbw), unsigned(m_bitbltbuf.dpsm), unsigned(m_trxreg.rrw),
++                            unsigned(m_trxreg.rrh), unsigned(m_trxpos.dsax), unsigned(m_trxpos.dsay));
++            }
++        }
+ 
+         if (m_backend)
+         {
+@@ -1608,8 +1682,34 @@ void GS::vertexKick(bool drawing)
+     }
+ }
+ 
++
+ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ {
++    if (s_trxLog.open)
++    {
++        // PS2X_GS_TRXDUMP=3a80,38b2: append the raw bytes of the first upload to
++        // each listed dbp to xs_trx_<dbp>.bin in the working directory.
++        static const char *dumpList = std::getenv("PS2X_GS_TRXDUMP");
++        static std::set<uint32_t> dumped;
++        if (dumpList && s_trxLog.received == 0)
++        {
++            char key[16];
++            std::snprintf(key, sizeof(key), "%x", s_trxLog.dbp);
++            const std::string list = std::string(",") + dumpList + ",";
++            if (list.find(std::string(",") + key + ",") != std::string::npos && dumped.insert(s_trxLog.dbp).second)
++                s_trxLog.dumpFile = std::fopen((std::string("xs_trx_") + key + ".bin").c_str(), "wb");
++        }
++        if (s_trxLog.dumpFile)
++        {
++            std::fwrite(data, 1, sizeBytes, s_trxLog.dumpFile);
++            if (s_trxLog.received + sizeBytes >= s_trxLog.expected)
++            {
++                std::fclose(s_trxLog.dumpFile);
++                s_trxLog.dumpFile = nullptr;
++            }
++        }
++        s_trxLog.received += sizeBytes;
++    }
+     if (m_backend)
+         m_backend->UploadImage(data, sizeBytes);
+ }
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
 index 37b6a4d..7463fdb 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
@@ -364,6 +496,350 @@ index 37b6a4d..7463fdb 100644
                          lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                          ++tagsProcessed;
  
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..e55e157 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,11 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
+ 
+ namespace
+ {
+@@ -23,9 +28,291 @@ namespace
+     constexpr uint16_t PAD_L1 = 0x0400u;
+     constexpr uint16_t PAD_R2 = 0x0200u;
+     constexpr uint16_t PAD_L2 = 0x0100u;
++
++    // One port-0 report as the replay/record code sees it (buttons active-low).
++    struct Report
++    {
++        uint16_t buttons = 0xFFFFu;
++        uint8_t lx = kPadStickCenter, ly = kPadStickCenter, rx = kPadStickCenter, ry = kPadStickCenter;
++    };
++
++    // Input replay/recording adapted from the console-controller skill
++    // (padmap.py gen --replay), so the stock mapping above stays unchanged.
++    // ---- input replay (PS2X_INPUT_SCRIPT) and recording (PS2X_INPUT_RECORD) ----
++    struct ScriptLine
++    {
++        uint32_t frame;
++        uint16_t pressed; // active-high here, flipped when written to the report
++        uint8_t lx, ly, rx, ry;
++    };
++
++    struct NamedMask
++    {
++        const char *name;
++        uint16_t mask;
++    };
++
++    constexpr NamedMask kScriptButtons[] = {
++        {"UP", PAD_UP}, {"DOWN", PAD_DOWN}, {"LEFT", PAD_LEFT}, {"RIGHT", PAD_RIGHT},
++        {"CROSS", PAD_CROSS}, {"CIRCLE", PAD_CIRCLE}, {"SQUARE", PAD_SQUARE},
++        {"TRIANGLE", PAD_TRIANGLE}, {"L1", PAD_L1}, {"R1", PAD_R1}, {"L2", PAD_L2},
++        {"R2", PAD_R2}, {"L3", PAD_L3}, {"R3", PAD_R3}, {"START", PAD_START},
++        {"SELECT", PAD_SELECT},
++    };
++
++    struct ReplayState
++    {
++        std::mutex lock;
++        bool initialized = false;
++        bool active = false;
++        bool announcedEnd = false;
++        std::vector<ScriptLine> lines;
++        size_t next = 0;
++        uint32_t frame = 0;
++        Report current{};
++        std::FILE *record = nullptr;
++        bool haveLast = false;
++        Report last{};
++    };
++
++    ReplayState &replayState()
++    {
++        static ReplayState state;
++        return state;
++    }
++
++    std::vector<std::string> splitWords(const std::string &line)
++    {
++        std::vector<std::string> words;
++        std::string word;
++        for (char c : line)
++        {
++            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
++            {
++                if (!word.empty())
++                    words.push_back(word);
++                word.clear();
++            }
++            else
++            {
++                word.push_back(c);
++            }
++        }
++        if (!word.empty())
++            words.push_back(word);
++        return words;
++    }
++
++    bool parseNumber(const std::string &text, unsigned long max, unsigned long &out)
++    {
++        if (text.empty())
++            return false;
++        int base = 10;
++        size_t start = 0;
++        if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
++        {
++            base = 16;
++            start = 2;
++        }
++        char *end = nullptr;
++        const unsigned long value = std::strtoul(text.c_str() + start, &end, base);
++        if (!end || *end != '\0' || end == text.c_str() + start || value > max)
++            return false;
++        out = value;
++        return true;
++    }
++
++    bool parseButtons(const std::string &token, uint16_t &pressed)
++    {
++        pressed = 0u;
++        if (token == "-" || token == "none" || token == "NONE")
++            return true;
++        if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X'))
++        {
++            unsigned long mask = 0;
++            if (!parseNumber(token, 0xFFFFul, mask))
++                return false;
++            pressed = static_cast<uint16_t>(mask);
++            return true;
++        }
++        size_t start = 0;
++        while (true)
++        {
++            const size_t plus = token.find('+', start);
++            std::string name = token.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
++            for (char &c : name)
++            {
++                if (c >= 'a' && c <= 'z')
++                    c = static_cast<char>(c - 'a' + 'A');
++            }
++            bool found = false;
++            for (const auto &entry : kScriptButtons)
++            {
++                if (name == entry.name)
++                {
++                    pressed = static_cast<uint16_t>(pressed | entry.mask);
++                    found = true;
++                    break;
++                }
++            }
++            if (!found)
++                return false;
++            if (plus == std::string::npos)
++                return true;
++            start = plus + 1;
++        }
++    }
++
++    bool loadScript(const char *path, std::vector<ScriptLine> &out)
++    {
++        std::FILE *file = std::fopen(path, "r");
++        if (!file)
++        {
++            std::fprintf(stderr, "[pad-replay] cannot open %s\n", path);
++            return false;
++        }
++        char buffer[512];
++        unsigned lineNumber = 0;
++        uint32_t lastFrame = 0;
++        bool ok = true;
++        while (std::fgets(buffer, sizeof(buffer), file))
++        {
++            ++lineNumber;
++            std::string line(buffer);
++            const size_t hash = line.find('#');
++            if (hash != std::string::npos)
++                line.erase(hash);
++            const std::vector<std::string> words = splitWords(line);
++            if (words.empty())
++                continue;
++            ScriptLine entry{0u, 0u, kPadStickCenter, kPadStickCenter, kPadStickCenter, kPadStickCenter};
++            unsigned long value = 0;
++            bool lineOk = (words.size() == 2 || words.size() == 6) &&
++                          parseNumber(words[0], 0xFFFFFFFFul, value);
++            if (lineOk)
++                entry.frame = static_cast<uint32_t>(value);
++            lineOk = lineOk && parseButtons(words[1], entry.pressed);
++            if (lineOk && words.size() == 6)
++            {
++                uint8_t *sticks[4] = {&entry.lx, &entry.ly, &entry.rx, &entry.ry};
++                for (int i = 0; i < 4 && lineOk; ++i)
++                {
++                    lineOk = parseNumber(words[2 + i], 255ul, value);
++                    *sticks[i] = static_cast<uint8_t>(value);
++                }
++            }
++            if (lineOk && !out.empty() && entry.frame < lastFrame)
++                lineOk = false;
++            if (!lineOk)
++            {
++                std::fprintf(stderr, "[pad-replay] %s line %u is not 'frame buttons [lx ly rx ry]' in frame order; replay disabled\n",
++                             path, lineNumber);
++                ok = false;
++                break;
++            }
++            lastFrame = entry.frame;
++            out.push_back(entry);
++        }
++        std::fclose(file);
++        if (!ok)
++            out.clear();
++        return ok;
++    }
++
++    void initReplayLocked(ReplayState &state)
++    {
++        if (state.initialized)
++            return;
++        state.initialized = true;
++        const char *script = std::getenv("PS2X_INPUT_SCRIPT");
++        if (script && script[0] != '\0')
++        {
++            if (loadScript(script, state.lines))
++            {
++                state.active = true;
++                std::fprintf(stderr, "[pad-replay] loaded %u lines from %s\n",
++                             static_cast<unsigned>(state.lines.size()), script);
++            }
++            return;
++        }
++        const char *recordPath = std::getenv("PS2X_INPUT_RECORD");
++        if (recordPath && recordPath[0] != '\0')
++        {
++            state.record = std::fopen(recordPath, "w");
++            if (state.record)
++            {
++                std::fprintf(state.record, "# recorded by ps2_pad.cpp: frame buttons lx ly rx ry (one line per change)\n");
++                std::fflush(state.record);
++                std::fprintf(stderr, "[pad-record] writing %s\n", recordPath);
++            }
++            else
++            {
++                std::fprintf(stderr, "[pad-record] cannot open %s\n", recordPath);
++            }
++        }
++    }
++
++    // Port 0 only. Returns true and fills the report while a script is playing.
++    bool replayReport(Report &out)
++    {
++        ReplayState &state = replayState();
++        std::lock_guard<std::mutex> guard(state.lock);
++        initReplayLocked(state);
++        if (!state.active)
++            return false;
++        while (state.next < state.lines.size() && state.lines[state.next].frame <= state.frame)
++        {
++            const ScriptLine &line = state.lines[state.next];
++            state.current.buttons = static_cast<uint16_t>(~line.pressed);
++            state.current.lx = line.lx;
++            state.current.ly = line.ly;
++            state.current.rx = line.rx;
++            state.current.ry = line.ry;
++            ++state.next;
++        }
++        if (state.next >= state.lines.size() && !state.announcedEnd)
++        {
++            state.announcedEnd = true;
++            std::fprintf(stderr, "[pad-replay] script finished at frame %u\n", state.frame);
++        }
++        out = state.current;
++        ++state.frame;
++        return true;
++    }
++
++    void recordReport(const Report &report)
++    {
++        ReplayState &state = replayState();
++        std::lock_guard<std::mutex> guard(state.lock);
++        const uint32_t frame = state.frame++;
++        if (!state.record)
++            return;
++        if (state.haveLast && state.last.buttons == report.buttons && state.last.lx == report.lx &&
++            state.last.ly == report.ly && state.last.rx == report.rx && state.last.ry == report.ry)
++            return;
++        state.haveLast = true;
++        state.last = report;
++        std::string names;
++        const uint16_t pressed = static_cast<uint16_t>(~report.buttons);
++        for (const auto &entry : kScriptButtons)
++        {
++            if (pressed & entry.mask)
++            {
++                if (!names.empty())
++                    names.push_back('+');
++                names += entry.name;
++            }
++        }
++        if (names.empty())
++            names = "-";
++        std::fprintf(state.record, "%u %s %u %u %u %u\n", frame, names.c_str(),
++                     static_cast<unsigned>(report.lx), static_cast<unsigned>(report.ly),
++                     static_cast<unsigned>(report.rx), static_cast<unsigned>(report.ry));
++        std::fflush(state.record);
++    }
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+ {
+     if (!data || size < 32)
+         return false;
+@@ -37,6 +324,18 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     data[3] = 0xFF;
+     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+ 
++    Report replayed;
++    if (port == 0 && replayReport(replayed))
++    {
++        data[2] = static_cast<uint8_t>(replayed.buttons & 0xFF);
++        data[3] = static_cast<uint8_t>(replayed.buttons >> 8);
++        data[4] = replayed.rx;
++        data[5] = replayed.ry;
++        data[6] = replayed.lx;
++        data[7] = replayed.ly;
++        return true;
++    }
++
+     uint16_t btns = 0xFFFFu;
+     constexpr int kGamepad = 0;
+     const bool useGamepad = IsGamepadAvailable(kGamepad);
+@@ -121,5 +420,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+ 
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
++    if (port == 0)
++    {
++        Report live;
++        live.buttons = btns;
++        live.rx = data[4];
++        live.ry = data[5];
++        live.lx = data[6];
++        live.ly = data[7];
++        recordReport(live);
++    }
+     return true;
+ }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
 index 45cb9d2..d4e4031 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
