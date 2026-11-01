@@ -104,7 +104,30 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
-## Next: VU1 speed
+## Speed status (2026-11-01, runs/speed1)
+
+The heartbeat now prints `fps: game X, vsync Y` (game = DISPFB1 flips per
+second, sampled every 1 ms). Tutorial scene: **game 2.6 fps** (the game targets
+30, i.e. 2 vsyncs per frame), VU1 still ~85% of host time.
+
+Interpreter work so far (vu1_replay on runs/sqrt1 capture, checksum must stay
+a416285182b00444): 112 -> 73 ns per VU cycle. Changes: decoded pair returned by
+reference, single-pass pipeline commit, per-pipeline "next ready" deadlines so
+idle pipelines are not scanned, normalizeOperand inlined. Remaining profile:
+commit 19%, hazard check (calculatePairReadyCycle) 14%, run loop 13%, exact
+FMAC / flag maths ~20%.
+
+Arithmetic: ~4.5M VU1 cycles per game frame. 30 fps with headroom needs about
+3 ns per VU cycle (25x), and even a free VU1 leaves the rest at ~6.7x of
+current speed, so EE/GS (~15%) must roughly halve too. Plan: a VU1 fast path
+that runs instructions in order (hardware interlocks make that give the same
+register results) and models only what software can observe: 4-cycle
+MAC/status/clip flag delay, Q/P latency, branch delay slots, E-bit/T/D;
+XGKICK copied at kick time. First as a lean interpreter validated against the
+accurate one on captures (checksum + GIF dump), then compiled per microprogram
+(hash of uploaded code -> generated C++).
+
+## Next: VU1 speed (older notes)
 
 VU1 interpreter is ~110-160 ns per VU cycle (needs ~30x). It is a
 cycle-accurate model: every instruction pair is copied out of the decode cache

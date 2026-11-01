@@ -235,8 +235,26 @@ void xs_startHeartbeat(PS2Runtime &runtime)
     }
     std::cout << "[xenosaga] heartbeat every " << seconds << "s (" << g_mainSymbols.size() << " symbols)" << std::endl;
 
+    // Game frame rate: the game flips DISPFB1 between its two framebuffers once
+    // per finished frame, so count changes of it (sampled every 1 ms).
+    static std::atomic<uint64_t> flips{0};
+    std::thread([&runtime]() {
+        uint64_t last = 0;
+        while (!runtime.isStopRequested())
+        {
+            const uint64_t fb = runtime.memory().gs().dispfb1;
+            if (fb != last)
+            {
+                last = fb;
+                flips.fetch_add(1, std::memory_order_relaxed);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }).detach();
+
     std::thread([&runtime, seconds]() {
         uint64_t lastCycle = 0;
+        uint64_t lastVsync = runtime.memory().gs().vsyncTick.load();
         for (int beat = 1;; ++beat)
         {
             std::this_thread::sleep_for(std::chrono::seconds(seconds));
@@ -247,6 +265,12 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                       << (snap.eeCycle == lastCycle ? " (stalled)" : "")
                       << " running=" << snap.runningThreadId << std::endl;
             lastCycle = snap.eeCycle;
+            {
+                const uint64_t vsync = runtime.memory().gs().vsyncTick.load();
+                std::printf("  fps: game %.1f, vsync %.1f\n", flips.exchange(0) / double(seconds),
+                            (vsync - lastVsync) / double(seconds));
+                lastVsync = vsync;
+            }
             {
                 static const char *names[] = {"vu1", "gs", "vif1"};
                 std::printf("  host time over last %ds:", seconds);
