@@ -62,6 +62,99 @@ const char *xsEnv(const char *key)
     return it == envCache().end() ? nullptr : it->second.c_str();
 }
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#include <mmsystem.h>
+namespace
+{
+    // XS_PROFILE=start,seconds: from `start` seconds after boot, sample the
+    // instruction pointer of every other thread in the process each ~1 ms for
+    // `seconds`, then write xs_profile.txt next to the ELF: per-thread sample
+    // counts, per-module totals, and "exe+offset count" lines (resolve with
+    // nm -C ps2EntryRunner.exe; offsets are relative to the image base).
+    void runSamplingProfiler(int startSeconds, int seconds)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(startSeconds));
+        std::printf("[xs-profile] sampling for %ds\n", seconds);
+        std::fflush(stdout);
+        const DWORD self = GetCurrentThreadId();
+        std::map<DWORD, HANDLE> threads;
+        std::map<uint64_t, unsigned> pcs;
+        std::map<DWORD, unsigned> perThread;
+        timeBeginPeriod(1);
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        for (unsigned tick = 0; std::chrono::steady_clock::now() < end; ++tick)
+        {
+            if ((tick % 500u) == 0u) // pick up new threads now and then
+            {
+                HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                THREADENTRY32 te{};
+                te.dwSize = sizeof(te);
+                for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+                    if (te.th32OwnerProcessID == GetCurrentProcessId() && te.th32ThreadID != self &&
+                        !threads.count(te.th32ThreadID))
+                        if (HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID))
+                            threads[te.th32ThreadID] = h;
+                CloseHandle(snap);
+            }
+            for (const auto &t : threads)
+            {
+                if (SuspendThread(t.second) == static_cast<DWORD>(-1))
+                    continue;
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(t.second, &ctx))
+                {
+                    ++pcs[ctx.Rip];
+                    ++perThread[t.first];
+                }
+                ResumeThread(t.second);
+            }
+            Sleep(1);
+        }
+        timeEndPeriod(1);
+
+        const uint64_t exeBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+        std::map<std::string, unsigned> modules;
+        std::map<uint64_t, unsigned> exeOffsets;
+        for (const auto &kv : pcs)
+        {
+            HMODULE mod = nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(kv.first), &mod);
+            char name[MAX_PATH] = "?";
+            if (mod)
+                GetModuleFileNameA(mod, name, MAX_PATH);
+            modules[name] += kv.second;
+            if (reinterpret_cast<uint64_t>(mod) == exeBase)
+                exeOffsets[kv.first - exeBase] += kv.second;
+        }
+        const std::filesystem::path out = PS2Runtime::getIoPaths().elfDirectory / "xs_profile.txt";
+        if (FILE *f = std::fopen(out.string().c_str(), "w"))
+        {
+            for (const auto &kv : perThread)
+                std::fprintf(f, "thread %lu %u\n", static_cast<unsigned long>(kv.first), kv.second);
+            for (const auto &kv : modules)
+                std::fprintf(f, "module %u %s\n", kv.second, kv.first.c_str());
+            for (const auto &kv : exeOffsets)
+                std::fprintf(f, "exe %llx %u\n", static_cast<unsigned long long>(kv.first), kv.second);
+            std::fclose(f);
+        }
+        for (const auto &t : threads)
+            CloseHandle(t.second);
+        std::printf("[xs-profile] wrote %s\n", out.string().c_str());
+        std::fflush(stdout);
+    }
+}
+#endif
+
 
 void xglRenderDispEnvInit_0x22d338(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xglRenderDispOff_0x22d7b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -234,6 +327,14 @@ void xs_startHeartbeat(PS2Runtime &runtime)
         g_mainSymbols = readFunctionSymbols(elf);
     }
     std::cout << "[xenosaga] heartbeat every " << seconds << "s (" << g_mainSymbols.size() << " symbols)" << std::endl;
+#ifdef _WIN32
+    if (const char *prof = std::getenv("XS_PROFILE"))
+    {
+        int start = 0, length = 20;
+        std::sscanf(prof, "%d,%d", &start, &length);
+        std::thread(runSamplingProfiler, start, length).detach();
+    }
+#endif
 
     // Game frame rate: the game flips DISPFB1 between its two framebuffers once
     // per finished frame, so count changes of it (sampled every 1 ms).

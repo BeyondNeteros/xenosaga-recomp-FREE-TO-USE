@@ -146,7 +146,7 @@ index 509fd07..33ff0f5 100644
  
      std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..85d0cd6 100644
+index 589d768..18cb861 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -253,7 +253,7 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
@@ -207,16 +207,24 @@ index 589d768..85d0cd6 100644
      install(DIRECTORY "${FFMPEG_BIN_DIR}/"
          DESTINATION bin
          FILES_MATCHING
-@@ -608,3 +634,12 @@ endif()
+@@ -608,3 +634,20 @@ endif()
  install(DIRECTORY include/
      DESTINATION include
  )
 +
 +# Offline VU1 replay/profiling tool (PS2X_VU_CAPTURE=1 recordings).
++# The software rasterizer calls floor/ceil per pixel: let GCC inline them as
++# SSE4.1 roundss (same results; we never read errno or FP exception flags).
++if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++    set_source_files_properties(src/lib/gs/gs_cpu_backend.cpp PROPERTIES COMPILE_OPTIONS "-fno-math-errno;-fno-trapping-math")
++endif()
++
 +option(PS2X_BUILD_VU_REPLAY "Build the vu1_replay profiling tool" OFF)
 +if(PS2X_BUILD_VU_REPLAY)
 +    add_executable(vu1_replay tools/vu1_replay.cpp)
 +    target_link_libraries(vu1_replay PRIVATE ps2_runtime $<$<BOOL:${WIN32}>:winmm>)
++    add_executable(gs_replay tools/gs_replay.cpp)
++    target_link_libraries(gs_replay PRIVATE ps2_runtime $<$<BOOL:${WIN32}>:winmm>)
 +    add_executable(vu0_test tools/vu0_test.cpp)
 +    target_link_libraries(vu0_test PRIVATE ps2_runtime)
 +endif()
@@ -302,6 +310,60 @@ index 0485d50..40c7680 100644
  
  // QFSRV: Quadword Funnel Shift Right Variable
  // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 4c3f641..cee62b5 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -100,7 +100,15 @@ class GS
+ {
+ public:
+     GS();
+-    ~GS() = default;
++    ~GS();
++
++    // Asynchronous mode: GS input (GIF packets, uploads, register writes,
++    // clears) is queued in order and processed on a worker thread, like the
++    // real GS running alongside the EE. Calls that read GS results back
++    // (local->host transfers, VRAM reads, presentation latch) and sync()
++    // first wait for everything submitted before them.
++    void setAsync(bool enabled);
++    void sync();
+ 
+     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
+     void reset();
+@@ -149,6 +157,10 @@ public:
+     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+ 
+ private:
++    struct AsyncQueue;
++    std::unique_ptr<AsyncQueue> m_async;
++    bool deferToWorker() const;
++
+     void snapshotVRAM();
+     void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);
+     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..2dd3b4b 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -316,6 +316,9 @@ public:
+     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
+     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
+     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
++    // Called before the EE reads GS privileged registers or writes CSR, so
++    // an asynchronous GS has caught up (SIGNAL/FINISH/LABEL results).
++    void setGsSyncHook(std::function<void()> hook) { m_gsSyncHook = std::move(hook); }
+ 
+     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
+     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
+@@ -399,6 +402,7 @@ public:
+ 
+     GifPacketCallback m_gifPacketCallback;
+     GifArbiter *m_gifArbiter = nullptr;
++    std::function<void()> m_gsSyncHook;
+     Vu1MscalCallback m_vu1MscalCallback;
+     Vu1MscntCallback m_vu1MscntCallback;
+ 
 diff --git a/ps2xRuntime/include/runtime/ps2_profile.h b/ps2xRuntime/include/runtime/ps2_profile.h
 new file mode 100644
 index 0000000..6755bac
@@ -603,10 +665,34 @@ index b1bb6d8..b07caf1 100644
  
      struct GsDispEnvMem
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index f0ad507..ead302d 100644
+index f0ad507..fcd9965 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-@@ -1509,6 +1509,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -292,11 +292,22 @@ namespace
+         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
+     }
+ 
++    // Same result as std::lround (halves away from zero) without the libm
++    // call; exact because x - trunc(x) is exact for |x| < 2^23.
++    inline int roundHalfAwayFromZero(float x)
++    {
++        if (!(std::fabs(x) < 8388608.0f))
++            return static_cast<int>(std::lround(x));
++        const int i = static_cast<int>(x);
++        const float frac = x - static_cast<float>(i);
++        return i + (frac >= 0.5f ? 1 : 0) - (frac <= -0.5f ? 1 : 0);
++    }
++
+     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        return clampU8(roundHalfAwayFromZero(top + (bottom - top) * fy));
+     }
+ }
+ 
+@@ -1509,6 +1520,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
          m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
      };
  
@@ -615,7 +701,7 @@ index f0ad507..ead302d 100644
      while (offset < sizeBytes && m_transferState.direction == 0u)
      {
          switch (dpsm)
-@@ -1588,6 +1590,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1588,6 +1601,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  {
      if (!m_vram)
          return;
@@ -624,18 +710,22 @@ index f0ad507..ead302d 100644
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..be1371c 100644
+index 9281d5f..57e1234 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -1,14 +1,76 @@
+@@ -1,14 +1,198 @@
 +#include "runtime/ps2_profile.h"
  #include "runtime/gs/gs_frontend.h"
  #include "runtime/gs/gs_cpu_backend.h"
  #include "ps2_log.h"
  #include "runtime/ps2_memory.h"
  #include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <thread>
 +#include <chrono>
  #include <algorithm>
++#include <cfenv>
  #include <cmath>
  #include <cstdio>
 +#include <cstdlib>
@@ -643,6 +733,124 @@ index 9281d5f..be1371c 100644
  #include <iostream>
  #include <sstream>
 +#include <set>
++
++// PS2X_GS_CAPTURE=seconds,frames: once `seconds` have passed since the first
++// GIF packet, wait for a frame boundary (DISPFB1 change), then record every
++// call into the GS frontend for `frames` displayed frames to gs_capture.bin in
++// the working directory: register state and VRAM at the start, each call, and
++// VRAM at the end. tools/gs_replay.cpp replays it (benchmark + exactness check).
++// The capture holds game data (VRAM): never commit it.
++namespace gscap
++{
++    enum Record : uint8_t
++    {
++        End = 0,
++        GifPacket = 1,
++        NativePacked = 2,
++        UploadNative = 3,
++        WriteRegister = 4,
++        ClearContext = 5,
++        ClearActive = 6,
++        Frame = 7,
++    };
++
++    uint64_t g_regShadow[256];
++    bool g_regWritten[256];
++    FILE *g_file = nullptr;
++    int g_framesLeft = 0;
++    bool g_done = false;
++
++    struct Config
++    {
++        bool enabled = false;
++        double seconds = 0;
++        int frames = 1;
++        Config()
++        {
++            if (const char *env = std::getenv("PS2X_GS_CAPTURE"))
++            {
++                enabled = true;
++                std::sscanf(env, "%lf,%d", &seconds, &frames);
++            }
++        }
++    };
++    const Config &config()
++    {
++        static const Config cfg;
++        return cfg;
++    }
++
++    void put(const void *p, size_t n) { std::fwrite(p, 1, n, g_file); }
++    template <typename T> void put(T v) { put(&v, sizeof(v)); }
++
++    void begin(const uint8_t *vram, uint32_t vramSize)
++    {
++        g_file = std::fopen("gs_capture.bin", "wb");
++        if (!g_file)
++        {
++            g_done = true;
++            return;
++        }
++        put("GSC1", 4);
++        put<uint32_t>(vramSize);
++        uint32_t count = 0;
++        for (bool w : g_regWritten)
++            count += w ? 1u : 0u;
++        put<uint32_t>(count);
++        for (uint32_t r = 0; r < 256; ++r)
++            if (g_regWritten[r])
++            {
++                put<uint8_t>(static_cast<uint8_t>(r));
++                put<uint64_t>(g_regShadow[r]);
++            }
++        put(vram, vramSize);
++        g_framesLeft = config().frames;
++        std::printf("[gs:capture] started (%d frames)\n", g_framesLeft);
++    }
++
++    void finish(const uint8_t *vram, uint32_t vramSize)
++    {
++        put<uint8_t>(End);
++        put(vram, vramSize);
++        std::fclose(g_file);
++        g_file = nullptr;
++        g_done = true;
++        std::printf("[gs:capture] wrote gs_capture.bin\n");
++    }
++
++    // Called at the top of processGIFPacket: starts/stops at frame boundaries.
++    void onPacket(uint64_t dispfb1, const uint8_t *vram, uint32_t vramSize)
++    {
++        if (!config().enabled || g_done)
++            return;
++        static uint64_t lastFb = dispfb1;
++        static const auto start = std::chrono::steady_clock::now();
++        const bool boundary = dispfb1 != lastFb;
++        lastFb = dispfb1;
++        if (!boundary)
++            return;
++        if (!g_file)
++        {
++            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= config().seconds)
++                begin(vram, vramSize);
++            return;
++        }
++        put<uint8_t>(Frame);
++        if (--g_framesLeft <= 0)
++            finish(vram, vramSize);
++    }
++
++    void record(Record type, const void *data, uint32_t size)
++    {
++        if (!g_file)
++            return;
++        // Bit 7: the call ran with round-toward-zero (inside a VU1 program's
++        // XGKICK), which changes the rasterizer's float maths.
++        put<uint8_t>(static_cast<uint8_t>(type | (std::fegetround() == FE_TOWARDZERO ? 0x80u : 0u)));
++        put<uint32_t>(size);
++        put(data, size);
++    }
++}
 +
 +namespace
 +{
@@ -704,15 +912,179 @@ index 9281d5f..be1371c 100644
  
  namespace
  {
-@@ -640,6 +702,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -105,12 +289,137 @@ namespace
+ }
+ 
+ 
++struct GS::AsyncQueue
++{
++    enum Type : uint8_t
++    {
++        GifPacket,
++        NativePacked,
++        UploadNative,
++        WriteRegister,
++        ClearContext,
++        ClearActive,
++    };
++    struct Command
++    {
++        Type type;
++        std::vector<uint8_t> data;
++        uint64_t args[4];
++    };
++
++    std::thread worker;
++    std::thread::id workerId;
++    std::mutex mutex;
++    std::condition_variable wake;
++    std::condition_variable done;
++    std::deque<Command> queue;
++    uint64_t submitted = 0;
++    uint64_t processed = 0;
++    bool stop = false;
++
++    void push(Command &&cmd)
++    {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            queue.push_back(std::move(cmd));
++            ++submitted;
++        }
++        wake.notify_one();
++    }
++};
++
+ GS::GS()
+     : m_backend(std::make_unique<GSCpuBackend>())
+ {
+     reset();
+ }
+ 
++GS::~GS()
++{
++    setAsync(false);
++}
++
++bool GS::deferToWorker() const
++{
++    return m_async && std::this_thread::get_id() != m_async->workerId;
++}
++
++void GS::setAsync(bool enabled)
++{
++    if (enabled == static_cast<bool>(m_async))
++        return;
++    if (!enabled)
++    {
++        {
++            std::lock_guard<std::mutex> lock(m_async->mutex);
++            m_async->stop = true;
++        }
++        m_async->wake.notify_all();
++        m_async->worker.join();
++        m_async.reset();
++        return;
++    }
++
++    auto async = std::make_unique<AsyncQueue>();
++    AsyncQueue *q = async.get();
++    m_async = std::move(async);
++    q->worker = std::thread([this, q]()
++                            {
++        std::deque<AsyncQueue::Command> batch;
++        for (;;)
++        {
++            {
++                std::unique_lock<std::mutex> lock(q->mutex);
++                q->wake.wait(lock, [q] { return q->stop || !q->queue.empty(); });
++                if (q->queue.empty())
++                    return; // stop requested and nothing left
++                batch.swap(q->queue);
++            }
++            for (AsyncQueue::Command &cmd : batch)
++            {
++                const uint8_t *d = cmd.data.data();
++                const uint32_t n = static_cast<uint32_t>(cmd.data.size());
++                switch (cmd.type)
++                {
++                case AsyncQueue::GifPacket:
++                    processGIFPacket(d, n);
++                    break;
++                case AsyncQueue::NativePacked:
++                    processNativePackedGIFPacket(d, n);
++                    break;
++                case AsyncQueue::UploadNative:
++                    uploadImageNative(cmd.args[0], cmd.args[1], cmd.args[2], cmd.args[3], d, n);
++                    break;
++                case AsyncQueue::WriteRegister:
++                    writeRegister(static_cast<uint8_t>(cmd.args[0]), cmd.args[1]);
++                    break;
++                case AsyncQueue::ClearContext:
++                    clearFramebufferContext(static_cast<uint32_t>(cmd.args[0]), static_cast<uint32_t>(cmd.args[1]));
++                    break;
++                case AsyncQueue::ClearActive:
++                    clearActiveFramebuffer(static_cast<uint32_t>(cmd.args[0]));
++                    break;
++                }
++            }
++            {
++                std::lock_guard<std::mutex> lock(q->mutex);
++                q->processed += batch.size();
++            }
++            q->done.notify_all();
++            batch.clear();
++        } });
++    m_async->workerId = m_async->worker.get_id();
++}
++
++void GS::sync()
++{
++    if (!deferToWorker())
++        return;
++    std::unique_lock<std::mutex> lock(m_async->mutex);
++    const uint64_t target = m_async->submitted;
++    m_async->done.wait(lock, [&] { return m_async->processed >= target; });
++}
++
+ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ {
+     m_localMemoryStorage = vram;
+@@ -124,6 +433,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ 
+ void GS::reset()
+ {
++    sync();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::memset(m_ctx, 0, sizeof(m_ctx));
+     m_prim = {};
+@@ -526,6 +836,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+ 
+ void GS::latchHostPresentationFrame()
+ {
++    sync(); // show everything the game submitted before this vsync
+     GSPresentationRequest request{};
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+@@ -640,13 +951,50 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
++    if (deferToWorker())
++    {
++        if (data && sizeBytes >= 16)
++            m_async->push({AsyncQueue::GifPacket, std::vector<uint8_t>(data, data + sizeBytes), {}});
++        return;
++    }
 +    ps2_profile::Scope profileScope(ps2_profile::GsPacket);
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16 || !m_backend)
          return;
-@@ -647,6 +710,32 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
++    if (m_privRegs)
++        gscap::onPacket(m_privRegs->dispfb1, m_localMemoryStorage, m_localMemorySize);
++    gscap::record(gscap::GifPacket, data, sizeBytes);
++
      if (tryProcessNativeImageUploadPacket(data, sizeBytes))
          return;
  
@@ -745,7 +1117,7 @@ index 9281d5f..be1371c 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
          if (packetIndex < 48u)
-@@ -730,7 +819,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -730,7 +1078,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
              // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
              uint32_t imageBytes = nloop * 16;
              if (offset + imageBytes > sizeBytes)
@@ -755,7 +1127,82 @@ index 9281d5f..be1371c 100644
              processImageData(data + offset, imageBytes);
              offset += imageBytes;
          }
-@@ -1384,6 +1475,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -739,6 +1089,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    if (deferToWorker())
++    {
++        // Same acceptance test as the synchronous path, so callers can still
++        // fall back to the generic GIF path when this returns false.
++        if (!data || sizeBytes < 16u || !m_backend || !validatePackedGifPacket(data, sizeBytes))
++            return false;
++        m_async->push({AsyncQueue::NativePacked, std::vector<uint8_t>(data, data + sizeBytes), {}});
++        return true;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16u || !m_backend)
+         return false;
+@@ -773,6 +1132,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     if (!processed)
+         return false;
+ 
++    gscap::record(gscap::NativePacked, data, sizeBytes);
+     ++m_nativePackedGIFPacketCount;
+     return true;
+ }
+@@ -784,7 +1144,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            const uint8_t *data,
+                            uint32_t sizeBytes)
+ {
++    if (deferToWorker())
++    {
++        if (data && sizeBytes != 0)
++            m_async->push({AsyncQueue::UploadNative, std::vector<uint8_t>(data, data + sizeBytes),
++                           {bitbltbuf, trxpos, trxreg, trxdir}});
++        return;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (gscap::g_file)
++    {
++        std::vector<uint8_t> rec(32u + sizeBytes);
++        const uint64_t regs[4] = {bitbltbuf, trxpos, trxreg, trxdir};
++        std::memcpy(rec.data(), regs, 32u);
++        if (data && sizeBytes)
++            std::memcpy(rec.data() + 32u, data, sizeBytes);
++        gscap::record(gscap::UploadNative, rec.data(), static_cast<uint32_t>(rec.size()));
++    }
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+ 
+@@ -1062,12 +1438,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ 
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
++    if (deferToWorker())
++    {
++        m_async->push({AsyncQueue::WriteRegister, {}, {regAddr, value}});
++        return;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (gscap::g_file)
++    {
++        uint8_t rec[9];
++        rec[0] = regAddr;
++        std::memcpy(rec + 1, &value, 8);
++        gscap::record(gscap::WriteRegister, rec, 9u);
++    }
+     writeRegisterUnlocked(regAddr, value);
+ }
+ 
+ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+ {
++    gscap::g_regShadow[regAddr] = value;
++    gscap::g_regWritten[regAddr] = true;
+     const bool interestingReg =
+         regAddr == GS_REG_PRIM ||
+         regAddr == GS_REG_RGBAQ ||
+@@ -1384,6 +1774,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      case GS_REG_TRXDIR:
      {
          m_trxdir = static_cast<uint32_t>(value & 0x3);
@@ -802,7 +1249,7 @@ index 9281d5f..be1371c 100644
  
          if (m_backend)
          {
-@@ -1578,6 +1709,86 @@ void GS::vertexKick(bool drawing)
+@@ -1578,6 +2008,86 @@ void GS::vertexKick(bool drawing)
          GSPrimitiveBatch batch = buildDrawBatch(needed);
          updatePreferredDisplaySourceForDraw(batch);
          m_backend->Submit(batch);
@@ -889,7 +1336,7 @@ index 9281d5f..be1371c 100644
          recordDrawDebugEventUnlocked(needed);
      }
  
-@@ -1608,10 +1819,48 @@ void GS::vertexKick(bool drawing)
+@@ -1608,27 +2118,82 @@ void GS::vertexKick(bool drawing)
      }
  }
  
@@ -938,6 +1385,55 @@ index 9281d5f..be1371c 100644
  }
  
  
+ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+ {
++    if (deferToWorker())
++    {
++        m_async->push({AsyncQueue::ClearContext, {}, {contextIndex, rgba}});
++        return true; // callers ignore the result
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (gscap::g_file)
++    {
++        const uint32_t rec[2] = {contextIndex, rgba};
++        gscap::record(gscap::ClearContext, rec, 8u);
++    }
+     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+ }
+ 
+ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ {
++    if (deferToWorker())
++    {
++        m_async->push({AsyncQueue::ClearActive, {}, {rgba}});
++        return true;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    gscap::record(gscap::ClearActive, &rgba, 4u);
+     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+ }
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    sync();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+@@ -1664,12 +2229,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ 
+ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
++    const_cast<GS *>(this)->sync();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
+ }
+ 
+ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
++    sync();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (m_backend)
+         m_backend->WriteVram(psm, base, bw, x, y, value);
 diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
 index c0507c7..0ad96a5 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
@@ -964,7 +1460,7 @@ index c0507c7..0ad96a5 100644
                       [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                       {
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..7463fdb 100644
+index 37b6a4d..7e30092 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -1,3 +1,4 @@
@@ -972,7 +1468,52 @@ index 37b6a4d..7463fdb 100644
  #include "runtime/ps2_memory.h"
  #include "runtime/ps2_address.h"
  #include "runtime/gs/gs_frontend.h"
-@@ -1439,6 +1440,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -744,6 +745,8 @@ uint32_t PS2Memory::read32(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
++        if (m_gsSyncHook)
++            m_gsSyncHook();
+         uint32_t off = address & 7;
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+@@ -792,6 +795,8 @@ uint64_t PS2Memory::read64(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
++        if (m_gsSyncHook)
++            m_gsSyncHook();
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+         {
+@@ -959,6 +964,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+         {
+             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
+             // Done as a single atomic RMW -- see writeCsrHalf's comment.
++            if (m_gsSyncHook)
++                m_gsSyncHook();
+             writeCsrHalf(gs_regs.csr, off, value);
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+@@ -1018,6 +1025,8 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+         {
+             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
+             // atomic RMW -- see writeCsrFull's comment.
++            if (m_gsSyncHook)
++                m_gsSyncHook();
+             writeCsrFull(gs_regs.csr, value);
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+@@ -1168,6 +1177,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+         {
++            if (m_gsSyncHook)
++                m_gsSyncHook();
+             writeCsrHalf(gs_regs.csr, off, value);
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+@@ -1439,6 +1450,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                          uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                          const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
                          uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
@@ -990,6 +1531,15 @@ index 37b6a4d..7463fdb 100644
                          lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                          ++tagsProcessed;
  
+@@ -2302,6 +2324,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
++        if (m_gsSyncHook)
++            m_gsSyncHook();
+         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
+         // path above; kept correct for direct callers.
+         const uint32_t off = address & 7u;
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
 index 8590f14..e55e157 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
@@ -1335,7 +1885,7 @@ index 8590f14..e55e157 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..bced858 100644
+index 45cb9d2..17a6271 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -1453,7 +2003,20 @@ index 45cb9d2..bced858 100644
  namespace ps2_stubs
  {
      void resetSifState();
-@@ -679,9 +783,18 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,6 +772,12 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
++    {
++        // PS2X_GS_ASYNC=0 runs the GS on the calling thread as before.
++        const char *asyncEnv = std::getenv("PS2X_GS_ASYNC");
++        m_gs.setAsync(!(asyncEnv && asyncEnv[0] == '0'));
++        m_memory.setGsSyncHook([this]() { m_gs.sync(); });
++    }
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+@@ -679,9 +789,18 @@ bool PS2Runtime::syncCoreSubsystems()
                                           (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                       m_vu1.state().tBitEnabled =
                                           (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
@@ -1472,7 +2035,7 @@ index 45cb9d2..bced858 100644
                                       cpuContext->vu0_vpu_stat =
                                           (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                           (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-@@ -697,9 +810,18 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -697,9 +816,18 @@ bool PS2Runtime::syncCoreSubsystems()
                                           (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                       m_vu1.state().tBitEnabled =
                                           (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
@@ -1491,7 +2054,7 @@ index 45cb9d2..bced858 100644
                                       cpuContext->vu0_vpu_stat =
                                           (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                           (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-@@ -1134,6 +1256,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1134,6 +1262,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -1499,7 +2062,7 @@ index 45cb9d2..bced858 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1411,6 +1534,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1411,6 +1540,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  
@@ -2661,6 +3224,268 @@ index 94be789..165e032 100644
  
      // The lower instruction encoding uses bits 31:25 for the primary opcode
      switch (opHi)
+diff --git a/ps2xRuntime/tools/gs_replay.cpp b/ps2xRuntime/tools/gs_replay.cpp
+new file mode 100644
+index 0000000..440d8a9
+--- /dev/null
++++ b/ps2xRuntime/tools/gs_replay.cpp
+@@ -0,0 +1,256 @@
++// Replays a GS capture recorded with PS2X_GS_CAPTURE=seconds,frames
++// (gs_capture.bin) through the runtime's GS frontend and CPU backend, for
++// profiling and for checking that renderer optimizations don't change a pixel.
++//
++//   gs_replay gs_capture.bin [repeat]
++//
++// Prints the time per pass, a hash of the final VRAM, and whether it matches
++// the VRAM the game had at the end of the capture. VU_REPLAY_PROFILE=1 writes
++// sampled instruction pointers like vu1_replay does (gs_replay_samples.txt).
++
++#include "ps2_runtime.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/gs/gs_frontend.h"
++
++#include <cfenv>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++
++#ifdef _WIN32
++#include <windows.h>
++#include <atomic>
++#include <map>
++#include <thread>
++#endif
++
++namespace
++{
++    struct Record
++    {
++        uint8_t type;
++        std::vector<uint8_t> data;
++    };
++
++    uint64_t fnv1a(const uint8_t *p, size_t n)
++    {
++        uint64_t h = 1469598103934665603ull;
++        for (size_t i = 0; i < n; ++i)
++            h = (h ^ p[i]) * 1099511628211ull;
++        return h;
++    }
++
++    bool isPreludeSafe(uint8_t reg)
++    {
++        switch (reg)
++        {
++        case 0x04: case 0x05: case 0x0C: case 0x0D: // vertex kicks
++        case 0x0F:                                  // A+D
++        case 0x3F:                                  // TEXFLUSH
++        case 0x53: case 0x54:                       // TRXDIR, HWREG (start transfers)
++        case 0x60: case 0x61: case 0x62:            // SIGNAL, FINISH, LABEL
++            return false;
++        default:
++            return true;
++        }
++    }
++
++#ifdef _WIN32
++    std::atomic<bool> g_profStop{false};
++#endif
++}
++
++int main(int argc, char **argv)
++{
++    if (argc < 2)
++    {
++        std::fprintf(stderr, "usage: %s gs_capture.bin [repeat]\n", argv[0]);
++        return 1;
++    }
++    const int repeat = argc > 2 ? std::atoi(argv[2]) : 3;
++
++    std::ifstream in(argv[1], std::ios::binary);
++    char magic[4];
++    uint32_t vramSize = 0, regCount = 0;
++    in.read(magic, 4);
++    in.read(reinterpret_cast<char *>(&vramSize), 4);
++    in.read(reinterpret_cast<char *>(&regCount), 4);
++    if (!in || std::memcmp(magic, "GSC1", 4) != 0 || vramSize != PS2_GS_VRAM_SIZE)
++    {
++        std::fprintf(stderr, "bad capture\n");
++        return 1;
++    }
++    std::vector<std::pair<uint8_t, uint64_t>> regs(regCount);
++    for (auto &r : regs)
++    {
++        in.read(reinterpret_cast<char *>(&r.first), 1);
++        in.read(reinterpret_cast<char *>(&r.second), 8);
++    }
++    std::vector<uint8_t> vramStart(vramSize), vramEnd(vramSize);
++    in.read(reinterpret_cast<char *>(vramStart.data()), vramSize);
++    std::vector<Record> records;
++    uint32_t frames = 0;
++    for (;;)
++    {
++        uint8_t type = 0;
++        if (!in.read(reinterpret_cast<char *>(&type), 1))
++            break;
++        if (type == 0)
++        {
++            in.read(reinterpret_cast<char *>(vramEnd.data()), vramSize);
++            break;
++        }
++        if (type == 7)
++        {
++            ++frames;
++            continue;
++        }
++        uint32_t size = 0;
++        in.read(reinterpret_cast<char *>(&size), 4);
++        Record r{type, std::vector<uint8_t>(size)};
++        in.read(reinterpret_cast<char *>(r.data.data()), size);
++        records.push_back(std::move(r));
++    }
++    if (!in)
++    {
++        std::fprintf(stderr, "truncated capture\n");
++        return 1;
++    }
++    std::printf("loaded %zu records, %u frame boundaries, %u registers\n", records.size(), frames, regCount);
++
++#ifdef _WIN32
++    std::vector<uint64_t> samples;
++    std::thread profThread;
++    HANDLE mainThread = nullptr;
++    if (std::getenv("VU_REPLAY_PROFILE"))
++    {
++        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mainThread, 0, FALSE,
++                        DUPLICATE_SAME_ACCESS);
++        samples.reserve(1 << 20);
++        timeBeginPeriod(1);
++        profThread = std::thread([mainThread, &samples] {
++            while (!g_profStop.load())
++            {
++                if (SuspendThread(mainThread) != static_cast<DWORD>(-1))
++                {
++                    CONTEXT ctx{};
++                    ctx.ContextFlags = CONTEXT_CONTROL;
++                    if (GetThreadContext(mainThread, &ctx))
++                        samples.push_back(ctx.Rip);
++                    ResumeThread(mainThread);
++                }
++                Sleep(1);
++            }
++        });
++    }
++#endif
++
++    PS2Memory memory;
++    if (!memory.initialize())
++        return 1;
++    uint8_t *vram = memory.getGSVRAM();
++    double totalMs = 0;
++    uint64_t firstHash = 0;
++    for (int pass = 0; pass < repeat; ++pass)
++    {
++        GS gs;
++        gs.init(vram, vramSize, &memory.gs());
++        std::memcpy(vram, vramStart.data(), vramSize);
++        for (const auto &r : regs)
++            if (isPreludeSafe(r.first))
++                gs.writeRegister(r.first, r.second);
++        gs.writeRegister(0x3F, 0); // TEXFLUSH: VRAM was replaced behind the backend
++
++        const auto t0 = std::chrono::steady_clock::now();
++        for (const Record &r : records)
++        {
++            std::fesetround((r.type & 0x80u) ? FE_TOWARDZERO : FE_TONEAREST);
++            const uint8_t *d = r.data.data();
++            const uint32_t n = static_cast<uint32_t>(r.data.size());
++            switch (r.type & 0x7Fu)
++            {
++            case 1:
++                gs.processGIFPacket(d, n);
++                break;
++            case 2:
++                gs.processNativePackedGIFPacket(d, n);
++                break;
++            case 3:
++            {
++                uint64_t rr[4];
++                std::memcpy(rr, d, 32);
++                gs.uploadImageNative(rr[0], rr[1], rr[2], rr[3], d + 32, n - 32u);
++                break;
++            }
++            case 4:
++            {
++                uint64_t value;
++                std::memcpy(&value, d + 1, 8);
++                gs.writeRegister(d[0], value);
++                break;
++            }
++            case 5:
++            {
++                uint32_t v[2];
++                std::memcpy(v, d, 8);
++                gs.clearFramebufferContext(v[0], v[1]);
++                break;
++            }
++            case 6:
++            {
++                uint32_t v;
++                std::memcpy(&v, d, 4);
++                gs.clearActiveFramebuffer(v);
++                break;
++            }
++            }
++        }
++        std::fesetround(FE_TONEAREST);
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        if (pass > 0 || repeat == 1)
++            totalMs += ms;
++        const uint64_t hash = fnv1a(vram, vramSize);
++        if (pass == 0)
++        {
++            firstHash = hash;
++            size_t diff = 0;
++            for (uint32_t i = 0; i < vramSize; ++i)
++                diff += vram[i] != vramEnd[i];
++            std::printf("vs game's end VRAM: %s (%zu bytes differ)\n", diff ? "DIFFERENT" : "identical", diff);
++            if (const char *out = std::getenv("GS_REPLAY_DUMP"))
++            {
++                std::ofstream o(out, std::ios::binary);
++                o.write(reinterpret_cast<const char *>(vram), vramSize);
++            }
++        }
++        else if (hash != firstHash)
++            std::printf("pass %d: VRAM hash differs from pass 0 (nondeterministic?)\n", pass);
++    }
++    const int timed = repeat > 1 ? repeat - 1 : 1;
++    std::printf("per pass: %.2f ms  (%.2f ms per frame)\n", totalMs / timed, totalMs / timed / (frames ? frames : 1));
++    std::printf("vram hash: %016llx\n", static_cast<unsigned long long>(firstHash));
++
++#ifdef _WIN32
++    if (profThread.joinable())
++    {
++        g_profStop = true;
++        profThread.join();
++        std::map<uint64_t, unsigned> counts;
++        for (uint64_t a : samples)
++            ++counts[a];
++        const uint64_t exeBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
++        if (FILE *f = std::fopen("gs_replay_samples.txt", "w"))
++        {
++            for (const auto &kv : counts)
++                if (kv.first >= exeBase)
++                    std::fprintf(f, "%llx %u\n", static_cast<unsigned long long>(kv.first - exeBase), kv.second);
++            std::fclose(f);
++        }
++    }
++#endif
++    return 0;
++}
 diff --git a/ps2xRuntime/tools/vu0_test.cpp b/ps2xRuntime/tools/vu0_test.cpp
 new file mode 100644
 index 0000000..94c29a5
