@@ -378,8 +378,97 @@ namespace
     }
 }
 
+// Texture upload path for 3D models: nmlPacketAddTexture picks either the
+// model's own texture list (nmlPacketTextureTrans) or a shared texture
+// (xglPacketTextureTrans, model+0x240). Log the first calls with the fields
+// that decide it, to see whether 3D textures are ever sent to the GS.
+namespace
+{
+    uint32_t rdWord(const uint8_t *rdram, uint32_t addr) { uint32_t v; std::memcpy(&v, rdram + (addr & 0x01FFFFFCu), 4); return v; }
+    std::atomic<int> g_texCalls[3];
+
+    std::atomic<int> g_flushCalls{0};
+    void tracedModelFlush(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        // Every 25 flushes: how often the 3D texture upload path ran since the last line.
+        if (++g_flushCalls % 25 == 0)
+        {
+            std::printf("[xenosaga] flushes=%d nmlPacketAddTexture=%d nmlPacketTextureTrans=%d xglPacketTextureTrans=%d\n",
+                        g_flushCalls.load(), g_texCalls[0].load(), g_texCalls[1].load(), g_texCalls[2].load());
+            std::fflush(stdout);
+        }
+        nmlModelFlush_0x235ff8(r, c, rt);
+    }
+
+    void tracedAddTexture(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        const uint32_t model = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
+        const int n = g_texCalls[0]++;
+        if (n < 12)
+        {
+            const uint32_t info = rdWord(r, model + 0x254);
+            std::printf("[xenosaga] nmlPacketAddTexture model=0x%x flags=0x%x info=0x%x info+0x6c=0x%x shared(0x240)=0x%x last=0x%x\n",
+                        model, rdWord(r, model + 0x250), info, info ? rdWord(r, info + 0x6c) : 0u, rdWord(r, model + 0x240),
+                        rdWord(r, static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28])) - 0x36e4u));
+        }
+        nmlPacketAddTexture_0x237da0(r, c, rt);
+    }
+    void tracedTextureTrans(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        const uint32_t model = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
+        if (g_texCalls[1]++ < 12)
+        {
+            const uint32_t info = rdWord(r, model + 0x254);
+            const uint32_t list = info + rdWord(r, info + 0x6c);
+            std::printf("[xenosaga] nmlPacketTextureTrans model=0x%x list=0x%x count=%d bank=%u\n", model, list,
+                        int(rdWord(r, list)), unsigned(rdWord(r, 0x004a90f8u) >> 16));
+        }
+        nmlPacketTextureTrans_0x237c38(r, c, rt);
+    }
+    void tracedXglTextureTrans(uint8_t *r, R5900Context *c, PS2Runtime *rt)
+    {
+        const uint32_t obj = static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[4]));
+        const int n = g_texCalls[2]++;
+        static const char *seq = std::getenv("PS2X_GS_SEQLOG");
+        // Every call once the GS sequence log runs (it starts at about the same
+        // time), otherwise the first 12: the XTX entries become CT32 uploads at
+        // dbp = (bank*2048 + entry[8]) / 64.
+        if (n < 12 || (seq && n < 400))
+        {
+            const uint32_t count = rdWord(r, obj + 8), table = obj + rdWord(r, obj + 0xc);
+            const uint32_t bank = rdWord(r, 0x004a90f8u) >> 16;
+            std::printf("[gs:seq] xglPacketTextureTrans obj=0x%x count=%u bank=%u", obj, count, bank);
+            for (uint32_t k = 0; k < count && k < 4; ++k)
+            {
+                const uint32_t e = table + k * 20;
+                std::printf(" [dbp=0x%x wh=%ux%u]", (bank * 2048u + rdWord(r, e + 8)) / 64u, rdWord(r, e) & 0xFFFFu,
+                            rdWord(r, e + 4) & 0xFFFFu);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+        // Calls 300-302: dump the DMA tags this call appended to the packet
+        // (gp-0x3480 points at the packet; its first word is the write pointer).
+        const uint32_t pkt = rdWord(r, static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28])) - 0x3480u);
+        const uint32_t before = rdWord(r, pkt);
+        xglPacketTextureTrans_0x22c268(r, c, rt);
+        if (n >= 300 && n < 303)
+        {
+            const uint32_t after = rdWord(r, pkt);
+            std::printf("[xenosaga] packet 0x%x grew 0x%x -> 0x%x:\n", pkt, before, after);
+            for (uint32_t a = before & ~15u; a < after && a < before + 0x200u; a += 16)
+                std::printf("    %08x: %08x %08x %08x %08x\n", a, rdWord(r, a), rdWord(r, a + 4), rdWord(r, a + 8), rdWord(r, a + 12));
+            std::fflush(stdout);
+        }
+    }
+}
+
 void xs_traceDisplay(PS2Runtime &runtime)
 {
+    runtime.registerFunction(0x00235FF8u, tracedModelFlush);
+    runtime.registerFunction(0x00237DA0u, tracedAddTexture);
+    runtime.registerFunction(0x00237C38u, tracedTextureTrans);
+    runtime.registerFunction(0x0022C268u, tracedXglTextureTrans);
     runtime.registerFunction(0x0022D7F8u, tracedRenderInit);
     runtime.registerFunction(0x0022D338u, tracedDispEnvInit);
     runtime.registerFunction(0x0022D7B8u, tracedDispOff);

@@ -1,3 +1,70 @@
+diff --git a/ps2xRecomp/include/ps2recomp/ps2_recompiler.h b/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
+index dd62275..4219c02 100644
+--- a/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
++++ b/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
+@@ -68,6 +68,7 @@ namespace ps2recomp
+         std::unordered_map<std::string, bool> m_skipFunctions;
+         std::unordered_set<uint32_t> m_skipFunctionStarts;
+         std::unordered_set<std::string> m_stubFunctions;
++        std::unordered_set<std::string> m_forceRecompileFunctions;
+         std::unordered_set<uint32_t> m_stubFunctionStarts;
+         std::unordered_map<uint32_t, std::string> m_stubHandlerBindingsByStart;
+         std::unordered_set<uint32_t> m_entryPointHintStarts;
+diff --git a/ps2xRecomp/include/ps2recomp/types.h b/ps2xRecomp/include/ps2recomp/types.h
+index 9bd687d..09edc39 100644
+--- a/ps2xRecomp/include/ps2recomp/types.h
++++ b/ps2xRecomp/include/ps2recomp/types.h
+@@ -187,6 +187,8 @@ namespace ps2recomp
+         std::vector<std::string> skipFunctions;
+         std::unordered_map<uint32_t, std::string> patches;
+         std::vector<std::string> stubImplementations;
++        // Names always recompiled from guest code, even if a runtime stub exists for them.
++        std::vector<std::string> forceRecompile;
+         std::vector<std::string> entryPointHints;
+         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
+         std::vector<JumpTable> jumpTables;
+diff --git a/ps2xRecomp/src/lib/config_manager.cpp b/ps2xRecomp/src/lib/config_manager.cpp
+index 97dc2dd..e685a7a 100644
+--- a/ps2xRecomp/src/lib/config_manager.cpp
++++ b/ps2xRecomp/src/lib/config_manager.cpp
+@@ -74,6 +74,11 @@ namespace ps2recomp
+                 config.stubImplementations = toml::find<std::vector<std::string>>(data, "stubs");
+             }
+ 
++            if (general.contains("recompile") && general.at("recompile").is_array())
++            {
++                config.forceRecompile = toml::find<std::vector<std::string>>(general, "recompile");
++            }
++
+             auto appendEntryPointHints = [&](const toml::value &table, const char *key)
+             {
+                 if (!table.contains(key) || !table.at(key).is_array())
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 8c1c7c5..dbd1978 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -864,6 +864,8 @@ namespace ps2recomp
+                     m_skipFunctionStarts.insert(*selector.start);
+                 }
+             }
++            m_forceRecompileFunctions = std::unordered_set<std::string>(m_config.forceRecompile.begin(),
++                                                                       m_config.forceRecompile.end());
+             for (const auto &name : m_config.stubImplementations)
+             {
+                 const FunctionSelector selector = parseFunctionSelector(name);
+@@ -2221,6 +2223,12 @@ namespace ps2recomp
+ 
+     bool PS2Recompiler::isStubFunction(const Function &function) const
+     {
++        // [general] recompile = ["name", ...] overrides built-in runtime stubs: use it
++        // when the game's own code is right and the stub is not (e.g. pure data builders).
++        if (m_forceRecompileFunctions.contains(function.name))
++        {
++            return false;
++        }
+         if (m_stubFunctionStarts.contains(function.start))
+         {
+             return true;
 diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
 index 509fd07..fd92760 100644
 --- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
@@ -320,16 +387,39 @@ index aed4cb5..82ba73c 100644
          setReturnS32(ctx, 0);
      }
  
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..ead302d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1509,6 +1509,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
+     };
+ 
++    // Uploads can rewrite the page the texture sampler has cached.
++    m_texturePageCache.Invalidate();
+     while (offset < sizeBytes && m_transferState.direction == 0u)
+     {
+         switch (dpsm)
+@@ -1588,6 +1590,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+ {
+     if (!m_vram)
+         return;
++    m_texturePageCache.Invalidate();
+ 
+     const uint32_t rrw = m_transfer.trxreg.rrw;
+     const uint32_t rrh = m_transfer.trxreg.rrh;
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..a6136f6 100644
+index 9281d5f..dd4810b 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -1,3 +1,4 @@
+@@ -1,14 +1,76 @@
 +#include "runtime/ps2_profile.h"
  #include "runtime/gs/gs_frontend.h"
  #include "runtime/gs/gs_cpu_backend.h"
  #include "ps2_log.h"
-@@ -6,9 +7,52 @@
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
++#include <chrono>
  #include <algorithm>
  #include <cmath>
  #include <cstdio>
@@ -366,6 +456,23 @@ index 9281d5f..a6136f6 100644
 +    };
 +    TrxLog s_trxLog;
 +
++    int &gsSeqBudget();
++    bool gsSeqLogActive()
++    {
++        static const char *env = std::getenv("PS2X_GS_SEQLOG");
++        if (!env)
++            return false;
++        static const auto start = std::chrono::steady_clock::now();
++        if (std::chrono::steady_clock::now() - start < std::chrono::seconds(std::atoi(env)))
++            return false;
++        return gsSeqBudget() > 0;
++    }
++    int &gsSeqBudget()
++    {
++        static int budget = 600; // spent by each printed event
++        return budget;
++    }
++
 +    uint64_t trxBytes(uint32_t psm, uint64_t pixels)
 +    {
 +        switch (psm)
@@ -382,7 +489,7 @@ index 9281d5f..a6136f6 100644
  
  namespace
  {
-@@ -640,6 +684,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -640,6 +702,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -390,22 +497,17 @@ index 9281d5f..a6136f6 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16 || !m_backend)
          return;
-@@ -730,7 +775,14 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -730,7 +793,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
              // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
              uint32_t imageBytes = nloop * 16;
              if (offset + imageBytes > sizeBytes)
 +            {
-+                if (s_trxLog.more())
-+                {
-+                    ++s_trxLog.lines;
-+                    std::printf("[gs:trx] IMAGE tag wants %u bytes, packet has %u left\n", imageBytes, sizeBytes - offset);
-+                }
                  imageBytes = sizeBytes - offset;
 +            }
              processImageData(data + offset, imageBytes);
              offset += imageBytes;
          }
-@@ -1384,6 +1436,28 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1384,6 +1449,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      case GS_REG_TRXDIR:
      {
          m_trxdir = static_cast<uint32_t>(value & 0x3);
@@ -423,6 +525,15 @@ index 9281d5f..a6136f6 100644
 +                                  m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxreg.rrw, m_trxreg.rrh,
 +                                  m_trxpos.dsax, m_trxpos.dsay, true};
 +            }
++            // PS2X_GS_SEQLOG=<seconds>: after that long, print the next 600 GS events
++            // in order (uploads into block 0x3000+ and textured draws whose TEX0
++            // changed), to check upload/draw ordering.
++            if (m_trxdir == 0u && m_bitbltbuf.dbp >= 0x3000u && gsSeqLogActive() && gsSeqBudget()--)
++            {
++                std::printf("[gs:seq] upload dbp=0x%x dbw=%u dpsm=0x%x %ux%u\n", m_bitbltbuf.dbp, unsigned(m_bitbltbuf.dbw),
++                            unsigned(m_bitbltbuf.dpsm), unsigned(m_trxreg.rrw), unsigned(m_trxreg.rrh));
++                std::fflush(stdout); // test runs end with a forced kill
++            }
 +            if (m_trxdir == 0u && s_trxLog.more() && seen.insert(key).second)
 +            {
 +                ++s_trxLog.lines;
@@ -430,17 +541,114 @@ index 9281d5f..a6136f6 100644
 +                            unsigned(m_bitbltbuf.dbw), unsigned(m_bitbltbuf.dpsm), unsigned(m_trxreg.rrw),
 +                            unsigned(m_trxreg.rrh), unsigned(m_trxpos.dsax), unsigned(m_trxpos.dsay));
 +            }
++            if (m_trxdir == 2u && s_trxLog.more() && seen.insert(key ^ (uint64_t(m_bitbltbuf.sbp) << 20) ^ 1u).second)
++            {
++                ++s_trxLog.lines;
++                std::printf("[gs:trx] COPY sbp=0x%x sbw=%u spsm=0x%x (%u,%u) -> dbp=0x%x dbw=%u dpsm=0x%x (%u,%u) %ux%u\n",
++                            m_bitbltbuf.sbp, unsigned(m_bitbltbuf.sbw), unsigned(m_bitbltbuf.spsm),
++                            unsigned(m_trxpos.ssax), unsigned(m_trxpos.ssay), m_bitbltbuf.dbp,
++                            unsigned(m_bitbltbuf.dbw), unsigned(m_bitbltbuf.dpsm), unsigned(m_trxpos.dsax),
++                            unsigned(m_trxpos.dsay), unsigned(m_trxreg.rrw), unsigned(m_trxreg.rrh));
++            }
 +        }
  
          if (m_backend)
          {
-@@ -1608,8 +1682,34 @@ void GS::vertexKick(bool drawing)
+@@ -1578,6 +1683,86 @@ void GS::vertexKick(bool drawing)
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
+         updatePreferredDisplaySourceForDraw(batch);
+         m_backend->Submit(batch);
++        if (batch.state.prim.tme && gsSeqLogActive())
++        {
++            static uint64_t lastTex0Key = 0;
++            const GSTex0Reg &t = batch.state.context.tex0;
++            const uint64_t k = (uint64_t(t.tbp0) << 32) ^ (uint64_t(t.cbp) << 12) ^ (uint64_t(t.psm) << 6) ^ t.tbw;
++            if (k != lastTex0Key)
++            {
++                lastTex0Key = k;
++                --gsSeqBudget();
++                std::printf("[gs:seq] draw tbp=0x%x tbw=%u psm=0x%x cbp=0x%x fst=%d\n", t.tbp0, unsigned(t.tbw),
++                            unsigned(t.psm), t.cbp, int(batch.state.prim.fst));
++                std::fflush(stdout);
++            }
++        }
++        // PS2X_GS_TEXDUMP=<seconds>: that long after the first draw, save GS
++        // memory at each of the next 24 distinct textured 3D draw setups (T8/T4),
++        // with the draw's TEX0/CLAMP/TEXCLUT and first vertex, to
++        // xs_texdump_<n>.bin + xs_texdump.txt, to see exactly what it samples.
++        static const char *texDumpEnv = std::getenv("PS2X_GS_TEXDUMP");
++        if (texDumpEnv && batch.state.prim.tme && !batch.state.prim.fst && m_localMemoryStorage)
++        {
++            static const auto firstDraw = std::chrono::steady_clock::now();
++            static std::set<uint64_t> dumpedKeys;
++            static int dumps = 0;
++            const GSContext &c = batch.state.context;
++            const bool paletted = c.tex0.psm == 0x13 || c.tex0.psm == 0x14 || c.tex0.psm == 0x1B ||
++                                  c.tex0.psm == 0x24 || c.tex0.psm == 0x2C;
++            const auto elapsed = std::chrono::steady_clock::now() - firstDraw;
++            const uint64_t key = (uint64_t(c.tex0.tbp0) << 40) ^ (uint64_t(c.tex0.cbp) << 20) ^
++                                 (uint64_t(c.tex0.psm) << 14) ^ (c.clamp % 16381u);
++            if (paletted && dumps < 24 && elapsed > std::chrono::seconds(std::atoi(texDumpEnv)) &&
++                dumpedKeys.insert(key).second)
++            {
++                char name[40];
++                std::snprintf(name, sizeof(name), "xs_texdump_%02d.bin", dumps);
++                if (std::FILE *f = std::fopen(name, "wb"))
++                {
++                    std::fwrite(m_localMemoryStorage, 1, m_localMemorySize, f);
++                    std::fclose(f);
++                }
++                if (std::FILE *t = std::fopen("xs_texdump.txt", dumps == 0 ? "w" : "a"))
++                {
++                    const GSVertex &v = batch.vertices[0];
++                    std::fprintf(t, "%02d tbp=0x%x tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=0x%x cpsm=0x%x csm=%u csa=%u cld=%u "
++                                    "clamp=0x%llx texclut=%u,%u,%u tex1=0x%llx prim=%d s=%g t=%g q=%g x=%g y=%g\n",
++                                 dumps, c.tex0.tbp0, unsigned(c.tex0.tbw), unsigned(c.tex0.psm), unsigned(c.tex0.tw),
++                                 unsigned(c.tex0.th), unsigned(c.tex0.tcc), unsigned(c.tex0.tfx), c.tex0.cbp,
++                                 unsigned(c.tex0.cpsm), unsigned(c.tex0.csm), unsigned(c.tex0.csa), unsigned(c.tex0.cld),
++                                 (unsigned long long)c.clamp, unsigned(batch.state.texclut.cbw),
++                                 unsigned(batch.state.texclut.cou), unsigned(batch.state.texclut.cov),
++                                 (unsigned long long)c.tex1, int(batch.state.prim.type), v.s, v.t, v.q, v.x, v.y);
++                    std::fclose(t);
++                }
++                ++dumps;
++            }
++        }
++        if (s_trxLog.on)
++        {
++            // With PS2X_GS_TRXLOG, report each distinct draw setup whose colour or
++            // depth target lies in the texture area (page 0x180+ = block 0x3000+).
++            const GSContext &c = batch.state.context;
++            const bool zWrites = !c.zbuf.zmask;
++            if (c.frame.fbp >= 0x180u || (zWrites && c.zbuf.zbp >= 0x180u))
++            {
++                static std::set<uint64_t> seenDraws;
++                const uint64_t key = (uint64_t(c.frame.fbp) << 40) ^ (uint64_t(c.frame.fbw) << 32) ^
++                                     (uint64_t(c.frame.psm) << 26) ^ (uint64_t(c.zbuf.zbp) << 12) ^
++                                     (uint64_t(zWrites) << 11) ^ (uint64_t(batch.state.prim.type) << 8) ^ c.frame.fbmsk % 251u;
++                if (s_trxLog.more() && seenDraws.insert(key).second)
++                {
++                    ++s_trxLog.lines;
++                    std::printf("[gs:draw-into-tex] fbp=0x%x fbw=%u psm=0x%x fbmsk=0x%x zbp=0x%x zwrite=%d prim=%d "
++                                "v0=(%.0f,%.0f) v1=(%.0f,%.0f) tme=%d tbp=0x%x tpsm=0x%x\n",
++                                c.frame.fbp, c.frame.fbw, unsigned(c.frame.psm), c.frame.fbmsk, c.zbuf.zbp, int(zWrites),
++                                int(batch.state.prim.type), batch.vertices[0].x, batch.vertices[0].y,
++                                batch.vertices[1].x, batch.vertices[1].y, int(batch.state.prim.tme),
++                                c.tex0.tbp0, unsigned(c.tex0.psm));
++                }
++            }
++        }
+         recordDrawDebugEventUnlocked(needed);
+     }
+ 
+@@ -1608,10 +1793,48 @@ void GS::vertexKick(bool drawing)
      }
  }
  
 +
  void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
  {
++    uint32_t snapshotDbp = UINT32_MAX;
 +    if (s_trxLog.open)
 +    {
 +        // PS2X_GS_TRXDUMP=3a80,38b2: append the raw bytes of the first upload to
@@ -462,13 +670,51 @@ index 9281d5f..a6136f6 100644
 +            {
 +                std::fclose(s_trxLog.dumpFile);
 +                s_trxLog.dumpFile = nullptr;
++                snapshotDbp = s_trxLog.dbp; // also save GS memory once this upload is written
 +            }
 +        }
 +        s_trxLog.received += sizeBytes;
 +    }
      if (m_backend)
          m_backend->UploadImage(data, sizeBytes);
++    if (snapshotDbp != UINT32_MAX && m_localMemoryStorage)
++    {
++        char name[48];
++        std::snprintf(name, sizeof(name), "xs_vram_after_%x.bin", snapshotDbp);
++        if (std::FILE *f = std::fopen(name, "wb"))
++        {
++            std::fwrite(m_localMemoryStorage, 1, m_localMemorySize, f);
++            std::fclose(f);
++        }
++    }
  }
+ 
+ 
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c0507c7..0ad96a5 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+@@ -38,6 +39,13 @@ void GifArbiter::drain()
+     if (!m_processFn)
+         return;
+ 
++    // Packets run in the order they were submitted. Sorting by path priority
++    // made a PATH1/PATH2 draw overtake PATH3 texture uploads queued before it
++    // (processPendingTransfers queues GIF DMA first, then runs VIF1), so draws
++    // sampled the previous texture (Xenosaga: noise on every 3D surface).
++    // PS2X_GIF_PRIORITY_SORT=1 restores the old behaviour for comparison.
++    static const bool prioritySort = std::getenv("PS2X_GIF_PRIORITY_SORT") != nullptr;
++    if (prioritySort)
+     std::stable_sort(m_queue.begin(), m_queue.end(),
+                      [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+                      {
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
 index 37b6a4d..7463fdb 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp

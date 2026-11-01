@@ -23,6 +23,46 @@ from pathlib import Path
 ROOT = Path(os.environ.get("XS_ROOT", Path(__file__).resolve().parents[2]))
 OVERLAYS = ["ov01", "ov02", "ov10", "ov11", "ov12"]
 
+# SDK functions ps2_analyzer stubs that must run as the game's own code.
+# sceGsSetDefLoadImage/StoreImage only fill a GIF packet struct; PS2Recomp's
+# stub writes a different layout, which broke every 3D texture upload.
+# Each entry: name -> (switch jump table address, entry count) or None.
+UNSTUB = {
+    "sceGsSetDefLoadImage": (0x4D50C0, 0x3B),
+    "sceGsSetDefStoreImage": None,
+}
+
+
+def read_elf_words(elf: bytes, vaddr: int, count: int):
+    phoff, = struct.unpack_from("<I", elf, 28)
+    phentsize, phnum = struct.unpack_from("<HH", elf, 42)
+    for i in range(phnum):
+        ptype, off, va, _, filesz = struct.unpack_from("<IIIII", elf, phoff + i * phentsize)
+        if ptype == 1 and va <= vaddr < va + filesz:
+            return list(struct.unpack_from(f"<{count}I", elf, off + vaddr - va))
+    sys.exit(f"0x{vaddr:x} is not in a loaded segment")
+
+
+def unstub(config: Path, elf: bytes):
+    text = config.read_text()
+    for name, table in UNSTUB.items():
+        lines = [l for l in text.splitlines() if l.strip().startswith(f'"{name}@')]
+        if not lines:
+            sys.exit(f"{name} is not in the stub list any more; update UNSTUB")
+        text = text.replace(lines[0] + "\n", "")
+        if table:
+            addr, count = table
+            entries = ",\n".join(f'  {{ index = {i}, target = "0x{t:x}" }}'
+                                 for i, t in enumerate(read_elf_words(elf, addr, count)))
+            text = text.replace("[jump_tables]\n",
+                                f'[jump_tables]\n[[jump_tables.table]]\naddress = "0x{addr:x}"\nentries = [\n{entries},\n]\n\n', 1)
+        print(f"unstubbed {name}")
+    # The recompiler also stubs known SDK names on its own; this list (a PS2Recomp
+    # option added by ps2recomp-runtime.patch) overrides that.
+    names = ", ".join(f'"{n}"' for n in UNSTUB)
+    text = text.replace("stubs = [", f"recompile = [{names}]\nstubs = [", 1)
+    config.write_text(text)
+
 
 def find_tool(bin_dir: Path, name: str) -> str:
     for cand in (bin_dir / name, bin_dir / (name + ".exe")):
@@ -61,6 +101,7 @@ def main():
     elf = out / "SLUS_204.69"
     shutil.copy2(find_file(src, "SLUS_204.69"), elf)
     run([analyzer, elf.name, "config.toml"], out)
+    unstub(out / "config.toml", elf.read_bytes())
     run([recomp, "config.toml"], out)
 
     for ov in OVERLAYS:

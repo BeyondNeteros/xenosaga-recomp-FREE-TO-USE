@@ -1,4 +1,43 @@
 
+## Garbage 3D textures: fixed (2026-11-01, runs/fix1)
+
+Scenes rendered with noise on every 3D surface. Cause: PS2Recomp replaces
+`sceGsSetDefLoadImage`/`sceGsSetDefStoreImage` (libgraph) with a hand-written
+runtime stub that writes a different struct (x/y/w/h/address) instead of the
+real 6-qword GIF packet (A+D giftag, BITBLTBUF, TRXPOS, TRXREG, TRXDIR, image
+giftag) and returns 0 instead of 6. Xenosaga uploads every model's textures
+each frame through `xglPacketTextureTrans` (XTX objects -> CT32 512x128 uploads
+to 0x3800/0x3c00, read back as one T8 TBW16 atlas), so all of those uploads were
+garbage and the 3D draws sampled whatever was left there (the 4-bit font).
+
+Fix: recompile the game's own functions. The recompiler stubs known SDK names
+by itself (`ps2_runtime_calls::isStubName`), so the patch adds a config option
+`[general] recompile = ["name", ...]` that wins over that, and
+`tools/setup_recomp.py` (UNSTUB) removes the two from `stubs`, adds the
+function's jump table (0x4d50c0, read from the ELF) and writes `recompile`.
+Other `sceGsSetDef*` functions (DispEnv, DrawEnv) are still stubbed and may
+have the same problem; review them against the SDK code.
+
+How it was found (tools worth reusing): `tools/run_game.sh` unattended runs;
+`PS2X_GS_TRXLOG` (upload log), `PS2X_GS_TRXDUMP=<dbp,..>` (raw upload bytes +
+GS memory right after), `PS2X_GS_TEXDUMP=<s>` (GS memory + TEX0/CLAMP at
+textured draws), `PS2X_GS_SEQLOG=<s>` (ordered uploads/draws; the timer starts
+at the first textured draw, so ~100 s reaches the tutorial scene),
+`tools/gsvram.py` (decode GS memory), and a PCSX2 save state of the same scene
+(runs/pcsx2: the .p2s is a zip with zstd entries; GS.bin holds VRAM at byte
+offset 425; eeMemory.bin is main RAM) as ground truth.
+
+Also changed on the way (kept, no visible effect on their own): the GIF arbiter
+now runs packets in submission order (`PS2X_GIF_PRIORITY_SORT=1` restores the
+old path-priority sort), and the texture page cache is invalidated by uploads.
+
+## Next: stretched geometry
+
+With textures right, models show long spikes (vertices pulled far up from the
+heads) and look squashed. Likely skinning/bone matrices or a VU1 transform
+issue; the VU0 matrix-stack fix may have exposed a second matrix bug. Compare
+against the PCSX2 state (vu1Memory.bin has the VU1 data of a real frame).
+
 ## 3D black screen: root cause found (2026-10-31, run4)
 
 The run4 matrix trace (runs/run4/xenosaga.log) showed the matrix that
