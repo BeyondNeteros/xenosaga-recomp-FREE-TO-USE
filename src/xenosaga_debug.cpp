@@ -9,6 +9,7 @@
 #include "runtime/ps2_profile.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_frontend.h"
+#include "ps2x/iop/iop_types.h"
 
 #include <algorithm>
 #include <cmath>
@@ -416,6 +417,10 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                     spr.write(reinterpret_cast<const char *>(runtime.memory().getScratchpad()), PS2_SCRATCHPAD_SIZE);
                 }
             }
+            // IOP threads (ps2xIOP): state and pc of each, to spot a stuck driver.
+            for (const std::string &line : runtime.iopDebugSnapshot().diagnostics)
+                if (line.rfind("iop ", 0) == 0)
+                    std::cout << "  " << line << std::endl;
             for (const auto &t : snap.threads)
             {
                 if (t.status == EeThreadStatus::Dormant)

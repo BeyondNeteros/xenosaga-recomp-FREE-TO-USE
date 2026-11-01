@@ -104,6 +104,30 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Sound driver running (2026-11-01, runs/snd12)
+
+With `XS_NO_SOUND=0` the game's own IOP modules (LIBSD, SSD = Monolith's
+sequencer, RSSD = its RPC server) run on ps2xIOP and the game reaches the
+tutorial at the same speed, sending thousands of sound commands. Still silent:
+there is no SPU2 emulation yet (next step). Fixes on the way:
+- ps2xIOP: after a module starts, its new threads run until they block
+  (`settleReadyThreads`), so RSSD's RPC server is registered before the game's
+  one-shot bind (it gives up otherwise).
+- IOP -> EE RPC: sifcmd sceSifBindRpc/sceSifCallRpc/sceSifCheckStatRpc on the
+  IOP now reach servers the game registered (`IopHost::hasEeRpcServer` /
+  `callEeRpc`, `IopSubsystem::completeEeRpc`); blocking callers sleep until
+  the reply, end functions run on completion (as the SDK, in both modes).
+- EE side: real `sceSifRpcLoop` (sleeps, runs the server, replies, resumes at
+  its own entry decoded from the caller's j/jal at ctx->branch_pc, since the
+  stub wrapper sets pc = ra) and `sceSifGetNextRequest`/`sceSifExecRequest`
+  (SsdSpuDmaCompleted polls with these).
+- `sceSifRegisterRpc` read cfunc/cbuf/qd from the stack; the EE ABI passes
+  them in t0-t2.
+- Diagnostics: `PS2X_RPC_LOG=1` (every SIF RPC event, both directions),
+  `PS2X_IOP_HWLOG=1` (IOP SPU2 DMA registers and interrupts), IOP thread
+  states in the heartbeat, `tools/irxdis.py` (disassemble a loaded IRX).
+- Launcher still sets XS_NO_SOUND=1 until audio actually plays.
+
 ## VU1 native blocks (2026-11-01, runs/native1)
 
 - Static blocks have a key (hash of start pair, code words and pair classes).
