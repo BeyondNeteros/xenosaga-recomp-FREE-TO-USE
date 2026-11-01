@@ -26,6 +26,8 @@ taskkill //IM XenosagaRecomp.exe //F >/dev/null 2>&1 || true
 cd "$GAME"
 rm -f xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin xs_spr.bin
 export XS_NO_SOUND=1 XS_DISC_IMAGE="$DISC" PS2X_VU_CAPTURE=1 PS2X_GS_TRXLOG=1
+# VU1 blocks without native code yet (input for tools/vu1gen.py).
+export PS2X_VU1_BLOCKLOG="$(cygpath -w "$GAME" 2>/dev/null || echo "$GAME")\vu1_blocks.vbl"
 # Extra debug env passes through, e.g. PS2X_GS_TRXDUMP=3a80,38b2 bash port/tools/run_game.sh ...
 # Debug switches: pass them with --env; variables set in front of the command
 # did not always reach the game.

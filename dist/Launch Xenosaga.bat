@@ -33,6 +33,9 @@ set "XS_NO_SOUND=1"
 set "XS_DISC_IMAGE=%DISC%"
 rem Debug: when VU1 is the bottleneck, record 300 VU1 calls to vu1_capture.bin.
 set "PS2X_VU_CAPTURE=1"
+rem VU1 code blocks without a native version yet are listed in vu1_blocks.vbl,
+rem so the next build can include them (tools/vu1gen.py).
+set "PS2X_VU1_BLOCKLOG=%~dp0vu1_blocks.vbl"
 rem Debug: log GS texture uploads (first 600) to xenosaga.log.
 set "PS2X_GS_TRXLOG=1"
 set "PS2X_GS_TRXDUMP=3a80,38b2,3a00"

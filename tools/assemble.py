@@ -141,6 +141,11 @@ def main():
     for p in PORT_SRC.glob("*.h"):
         shutil.copy2(p, INCLUDE / p.name)
         print(f"port: {p.name}")
+    # Native VU1 blocks from tools/vu1gen.py (generated from game code).
+    vu1_blocks = RECOMP / "xenosaga_vu1_blocks.cpp"
+    if vu1_blocks.exists():
+        shutil.copy2(vu1_blocks, RUNNER / vu1_blocks.name)
+        print(f"vu1 blocks: {vu1_blocks.name}")
 
 
 if __name__ == "__main__":

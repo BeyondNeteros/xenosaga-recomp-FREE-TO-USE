@@ -122,6 +122,9 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
   PS2Recomp at e563698 + the runtime patch from port commit a9b3cd4, built into
   `PS2Recomp-ref/build`) and compares checksums and GIF output. Run it after any
   VU1 change. `runs/prof/prof.sh <capture>` profiles vu1_replay.
+- VU1 native blocks: `python port/tools/vu1gen.py runs/vu1blocks/*.vbl "<install folder>/vu1_blocks.vbl"`
+  regenerates the C++ for every VU1 block logged so far (see NOTES.md); then
+  reconfigure and rebuild. Never commit the logs or the generated file.
 - `port/tools/vudis.py capture.bin <record> <start> <end>` disassembles VU1
   microcode from a capture; `port/tools/gifparse.py gif.bin` summarizes GIF
   packets (tags, AD registers, primitive types, vertex ranges).

@@ -104,6 +104,29 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## VU1 native blocks (2026-11-01, runs/native1)
+
+- Static blocks have a key (hash of start pair, code words and pair classes).
+  Generated C++ for known keys is registered at startup
+  (`VU1Interpreter::registerCompiledBlocks`) and replaces the per-pair loop
+  for that block; everything else still runs in the interpreter
+  (`PS2X_VU1_NATIVE=0` turns native blocks off).
+- Generated code calls `include/runtime/ps2_vu1_fastops.h` with constant
+  instruction words: the upper fast paths (FMAC, MAX/MINI, ITOF/FTOI, ABS),
+  the full pair logic (I-bit, shadowing, branch-VI backup) and the common
+  lower ops (LQ/SQ/ILW/ISW/IADDIU/ISUBIU/IADD/ISUB/IADDI/IAND/IOR/MOVE/MR32/
+  LQI/SQI) fold down to straight-line code; other lower ops call execLower.
+- Workflow: `PS2X_VU1_BLOCKLOG=<file>` logs blocks without native code (the
+  launcher and run_game.sh write `vu1_blocks.vbl` in the game folder; for
+  captures: run vu1_replay over runs/*/vu1_capture.bin with it set). Then
+  `python port/tools/vu1gen.py <logs...>` writes recomp/xenosaga_vu1_blocks.cpp
+  and copies it into the runner (assemble.py copies it too); reconfigure
+  cmake and rebuild. vu1_replay compiles it too, so vu1_check.sh covers it.
+  The log and generated file are game-derived: never commit them.
+- Current set: 57 blocks / 947 pairs from the 75 captures. vu1_replay 17.3 ->
+  13.1 ns per VU cycle (75/75 identical); game ~9.9 -> 12.0 fps. GS thread
+  now ~50% busy.
+
 ## VU1 next steps (2026-11-01, runs/plain1)
 
 - Static blocks now classify each pair once: "plain" pairs (no branch, E/D/T,
