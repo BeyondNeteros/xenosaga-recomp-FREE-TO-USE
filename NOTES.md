@@ -131,6 +131,10 @@ Traced with XS_BATTLE_TRACE on the deterministic tutorial-battle replay
    and the think data at 0x436F40. Placeholders are now never read/written
    (rpcIsPlaceholderServer); the pools no longer zero guest RAM. TLS pool
    still writes guest RAM (not yet checked).
+- Result (runs/bfix4): the tutorial battle now runs - arena, characters,
+  "Drone M" target, battle tutorial text, Knuckle/Firecracker menu and GTW;
+  30 fps, memory flat ~270 MB. To check with real play: field battles,
+  Shion's HP display ("0000/0080" in later frames), post-battle field.
 - OV01 layout facts: unit table 0xA57240 (3 party + 5 enemy slots),
   batdat.bin -> 0x426F40 (data\yamamotoatdat.bin, 29 sectors), think
   data 0x436F40 (16 KB, copied from the map archive by dataThinkDataSet in
