@@ -109,6 +109,31 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Field battle freeze: IOP interrupts ignored CpuDisableIntr (2026-11-02, runs/field-freeze, irqfix1)
+
+Beyond's first field battle froze (fps 0). EE thread 7 spun in
+`SsdSpuDmaCompleted` (0x2409b0) waiting for bit 2 of 0x4AA080 ("wave DMA
+busy", set by `SsdNextWaveData`/`RssdBackNextWaveThread` with cmd 0x21). Only
+`RssdBackgroundNextWave` (EE RPC sid 0x901 fn 0x25) clears it. On the IOP,
+RSSD's `RssdSpuDmaTransferCallback` sends fn 0x25; SSD calls it from
+`SsdWaveTransferInterruptProcess` when the SPU2 DMA for the wave finishes.
+All IOP threads were asleep: the completion was lost.
+
+SSD's `SsdDmaStartTransfer` edits its DMA queue (`+0x180` current buffer,
+`+0x1c` next links) between CpuDisableIntr/CpuEnableIntr (intrman #8/#9).
+`iop_emulator.cpp` dispatched DMA completion interrupts after every
+instruction regardless, so one landing inside that window could finish the
+current buffer while the thread appended to it: that transfer never starts
+and never calls back. Fix: `runCpu` services interrupts and guest callbacks
+only while interrupts are enabled, and stretches the timeslice (up to 200k
+extra instructions) so a thread is not switched out inside a critical
+section. Between slices nothing changed. Tutorial battle replay (play3)
+still plays to the results screen at 30 fps. The race is random; it needs
+Beyond's field play to confirm.
+
+Tools: `py -m pip install capstone pyelftools`; the scratchpad `irxdis.py`
+disassembles IRX functions by symbol (RSSD/SSD keep their symbol tables).
+
 ## Battles play through (2026-11-02, runs/rep6)
 
 - Enemy model missing + turn stall: the battle copies the field's enemy

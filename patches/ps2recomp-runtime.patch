@@ -1022,7 +1022,7 @@ index da3be3b..6c9af35 100644
          if (enabled == m_enabled.end() || !enabled->second)
              return false;
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..089ac32 100644
+index e5f63a9..7d89f4b 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -17,6 +17,7 @@
@@ -1033,7 +1033,32 @@ index e5f63a9..089ac32 100644
  #include <algorithm>
  #include <cctype>
  #include <map>
-@@ -483,6 +484,21 @@ namespace ps2x::iop::detail
+@@ -402,10 +403,22 @@ namespace ps2x::iop::detail
+             CpuState *previous = activeCpu;
+             activeCpu = &cpu;
+             const uint64_t start = totalInstructions;
+-            while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
+-            {
++            // Code between CpuDisableIntr/CpuSuspendIntr and the matching
++            // enable must not be interrupted (the sound driver edits its DMA
++            // queue there; a completion landing inside loses a transfer and
++            // the EE waits for it forever). Interrupts stay pending until the
++            // enable, and the timeslice runs on until then (bounded).
++            constexpr uint64_t kCriticalSectionGrace = 200000u;
++            while (!cpu.stopped && !cpu.yielded)
++            {
++                const uint64_t ran = totalInstructions - start;
++                if (ran >= instructionBudget &&
++                    (memory.interruptControl() != 0u || ran >= instructionBudget + kCriticalSectionGrace))
++                    break;
+                 if (!step(cpu))
+                     break;
++                if (memory.interruptControl() == 0u)
++                    continue;
+                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                     servicePendingDmaInterrupts();
+                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+@@ -483,6 +496,21 @@ namespace ps2x::iop::detail
          // Not that good to use exception handling for control flow but will do for now
          void servicePendingDmaInterrupts()
          {
@@ -1055,7 +1080,7 @@ index e5f63a9..089ac32 100644
              if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
                  return;
  
-@@ -588,6 +604,34 @@ namespace ps2x::iop::detail
+@@ -588,6 +616,34 @@ namespace ps2x::iop::detail
              }
          }
  
@@ -1090,7 +1115,7 @@ index e5f63a9..089ac32 100644
          ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
          {
              ModuleLoadResult result{true, -1, -1};
-@@ -632,6 +676,13 @@ namespace ps2x::iop::detail
+@@ -632,6 +688,13 @@ namespace ps2x::iop::detail
              result.startResult = static_cast<int32_t>(startResult);
              modules[module.id] = std::move(module);
  
@@ -1104,7 +1129,7 @@ index e5f63a9..089ac32 100644
              std::ostringstream out;
              out << "[IOP] loaded IRX id=" << result.moduleId
                  << " entry=0x" << std::hex << modules[result.moduleId].entry
-@@ -822,6 +873,33 @@ namespace ps2x::iop::detail
+@@ -822,6 +885,33 @@ namespace ps2x::iop::detail
          return static_cast<uint32_t>(m_impl->kernel.threadCount());
      }
  
