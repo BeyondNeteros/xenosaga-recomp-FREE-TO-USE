@@ -3563,7 +3563,7 @@ index 5e9a446..c9e168d 100644
 +    bool queueEeRpcFromIop(PS2Runtime *runtime, ps2x::iop::EeRpcCall call);
  }
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index f0ad507..6ec46a4 100644
+index f0ad507..4ca16da 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -8,8 +8,11 @@
@@ -3629,7 +3629,40 @@ index f0ad507..6ec46a4 100644
      }
  }
  
-@@ -510,9 +551,390 @@ GSCpuBackend::GSCpuBackend()
+@@ -442,6 +483,32 @@ namespace
+     }
+ }
+ 
++
++#ifdef _WIN32
++extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread(void);
++extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void *thread, int priority);
++#endif
++namespace
++{
++    // PS2X_THREAD_PRIORITIES=0 leaves every thread at normal priority. On
++    // hybrid CPUs (P- and E-cores) Windows puts higher-priority threads on
++    // P-cores: the VIF1/VU1 worker sets the frame rate, the GS band helpers
++    // have headroom.
++    void setHostThreadPriority(int priority)
++    {
++#ifdef _WIN32
++        static const bool enabled = [] {
++            const char *env = std::getenv("PS2X_THREAD_PRIORITIES");
++            return !(env && env[0] == '0');
++        }();
++        if (enabled)
++            SetThreadPriority(GetCurrentThread(), priority);
++#else
++        (void)priority;
++#endif
++    }
++}
++
+ GSCpuBackend::GSCpuBackend()
+ {
+     using namespace GSMem;
+@@ -510,9 +577,391 @@ GSCpuBackend::GSCpuBackend()
              break;
          }
      }
@@ -3984,6 +4017,7 @@ index f0ad507..6ec46a4 100644
 +        for (uint32_t band = 1; band < m_bandCount; ++band)
 +            m_workers.emplace_back([this, band]()
 +                                   {
++                setHostThreadPriority(-1); // THREAD_PRIORITY_BELOW_NORMAL
 +                uint64_t seen = 0;
 +                for (;;)
 +                {
@@ -4020,7 +4054,7 @@ index f0ad507..6ec46a4 100644
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
      if (vram && vramSize < GSMem::MEMORY_SIZE)
-@@ -532,6 +954,7 @@ void GSCpuBackend::Reset()
+@@ -532,6 +981,7 @@ void GSCpuBackend::Reset()
  
  void GSCpuBackend::ResetUnlocked()
  {
@@ -4028,7 +4062,7 @@ index f0ad507..6ec46a4 100644
      m_clut.fill(0u);
      m_clutCbp.fill(0u);
      m_texturePageCache.Invalidate();
-@@ -548,7 +971,55 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -548,7 +998,55 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
@@ -4085,7 +4119,7 @@ index f0ad507..6ec46a4 100644
  }
  
  void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
-@@ -585,7 +1056,21 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -585,7 +1083,21 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
          return;
      }
  
@@ -4107,7 +4141,7 @@ index f0ad507..6ec46a4 100644
  }
  
  void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
-@@ -638,7 +1123,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+@@ -638,7 +1150,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
  
  void GSCpuBackend::Flush()
  {
@@ -4117,7 +4151,7 @@ index f0ad507..6ec46a4 100644
  }
  
  void GSCpuBackend::TextureFlush()
-@@ -655,6 +1141,7 @@ void GSCpuBackend::Sync(GSSyncReason)
+@@ -655,6 +1168,7 @@ void GSCpuBackend::Sync(GSSyncReason)
  uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4125,7 +4159,7 @@ index f0ad507..6ec46a4 100644
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
  
-@@ -670,12 +1157,13 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+@@ -670,12 +1184,13 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
      if (!m_vram)
          return 0u;
  
@@ -4140,7 +4174,7 @@ index f0ad507..6ec46a4 100644
      WriteVramUnlocked(psm, base, bw, x, y, value);
  }
  
-@@ -689,6 +1177,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+@@ -689,6 +1204,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
  void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4148,7 +4182,7 @@ index f0ad507..6ec46a4 100644
      if (!m_vram || m_vramSize == 0u)
      {
          out.clear();
-@@ -848,6 +1337,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -848,6 +1364,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
  {
@@ -4157,7 +4191,7 @@ index f0ad507..6ec46a4 100644
      const auto &ctx = state.context;
      if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
          return;
-@@ -1033,21 +1524,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -1033,21 +1551,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
          clutIndex = block + (sourceIndex & 0x0Fu);
      }
  
@@ -4183,7 +4217,7 @@ index f0ad507..6ec46a4 100644
      default:
          break;
      }
-@@ -1083,80 +1575,53 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1083,80 +1602,53 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          texVf = t * invQ * static_cast<float>(texH);
      }
  
@@ -4307,7 +4341,7 @@ index f0ad507..6ec46a4 100644
  }
  
  void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
-@@ -1236,6 +1701,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1236,6 +1728,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
  
          for (int y = drawY0; y <= drawY1; ++y)
          {
@@ -4316,7 +4350,7 @@ index f0ad507..6ec46a4 100644
              float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
              float texVf = v0f + (v1f - v0f) * ty;
  
-@@ -1313,6 +1780,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1313,6 +1807,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
  
      for (int y = minY; y <= maxY; ++y)
      {
@@ -4325,7 +4359,7 @@ index f0ad507..6ec46a4 100644
          float py = static_cast<float>(y) + 0.5f;
          for (int x = minX; x <= maxX; ++x)
          {
-@@ -1463,6 +1932,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1463,6 +1959,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4333,7 +4367,7 @@ index f0ad507..6ec46a4 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1480,6 +1950,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1480,6 +1977,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4341,7 +4375,7 @@ index f0ad507..6ec46a4 100644
      if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
          return;
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-@@ -1509,6 +1980,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1509,6 +2007,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
          m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
      };
  
@@ -4350,7 +4384,7 @@ index f0ad507..6ec46a4 100644
      while (offset < sizeBytes && m_transferState.direction == 0u)
      {
          switch (dpsm)
-@@ -1588,6 +2061,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1588,6 +2088,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  {
      if (!m_vram)
          return;
@@ -4358,7 +4392,7 @@ index f0ad507..6ec46a4 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1697,6 +2171,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1697,6 +2198,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4366,7 +4400,7 @@ index f0ad507..6ec46a4 100644
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
      const size_t count = std::min<size_t>(maxBytes, m_localToHostBuffer.size() - m_localToHostReadPos);
-@@ -1709,6 +2184,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1709,6 +2211,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -5201,7 +5235,7 @@ index 89d8576..097a5c7 100644
                               uint32_t address,
                               uint32_t a0,
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..6a23245 100644
+index 37b6a4d..264a4f6 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -1,4 +1,6 @@
@@ -5211,7 +5245,7 @@ index 37b6a4d..6a23245 100644
  #include "runtime/ps2_address.h"
  #include "runtime/gs/gs_frontend.h"
  #include "ps2_log.h"
-@@ -242,10 +244,87 @@ PS2Memory::PS2Memory()
+@@ -242,10 +244,114 @@ PS2Memory::PS2Memory()
      : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
  {
      ps2SetScratchpadHostPtr(nullptr);
@@ -5231,9 +5265,36 @@ index 37b6a4d..6a23245 100644
 +    return t_onVif1Worker;
 +}
 +
++
++#ifdef _WIN32
++extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread(void);
++extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void *thread, int priority);
++#endif
++namespace
++{
++    // PS2X_THREAD_PRIORITIES=0 leaves every thread at normal priority. On
++    // hybrid CPUs (P- and E-cores) Windows puts higher-priority threads on
++    // P-cores: the VIF1/VU1 worker sets the frame rate, the GS band helpers
++    // have headroom.
++    void setHostThreadPriority(int priority)
++    {
++#ifdef _WIN32
++        static const bool enabled = [] {
++            const char *env = std::getenv("PS2X_THREAD_PRIORITIES");
++            return !(env && env[0] == '0');
++        }();
++        if (enabled)
++            SetThreadPriority(GetCurrentThread(), priority);
++#else
++        (void)priority;
++#endif
++    }
++}
++
 +void PS2Memory::vif1WorkerLoop()
 +{
 +    t_onVif1Worker = true;
++    setHostThreadPriority(2); // THREAD_PRIORITY_HIGHEST
 +    std::unique_lock<std::mutex> lock(m_vif1Mutex);
 +    for (;;)
 +    {
@@ -5299,7 +5360,7 @@ index 37b6a4d..6a23245 100644
      if (m_rdram)
      {
          delete[] m_rdram;
-@@ -529,6 +608,8 @@ bool PS2Memory::isScratchpad(uint32_t address) const
+@@ -529,6 +635,8 @@ bool PS2Memory::isScratchpad(uint32_t address) const
  
  uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
  {
@@ -5308,7 +5369,7 @@ index 37b6a4d..6a23245 100644
      return const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
  }
  
-@@ -744,6 +825,15 @@ uint32_t PS2Memory::read32(uint32_t address)
+@@ -744,6 +852,15 @@ uint32_t PS2Memory::read32(uint32_t address)
  
      if (isGsPrivReg(address))
      {
@@ -5324,7 +5385,7 @@ index 37b6a4d..6a23245 100644
          uint32_t off = address & 7;
          const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
          if (regOff == kGsCsrRegOffset)
-@@ -792,6 +882,15 @@ uint64_t PS2Memory::read64(uint32_t address)
+@@ -792,6 +909,15 @@ uint64_t PS2Memory::read64(uint32_t address)
  
      if (isGsPrivReg(address))
      {
@@ -5340,7 +5401,7 @@ index 37b6a4d..6a23245 100644
          const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
          if (regOff == kGsCsrRegOffset)
          {
-@@ -953,12 +1052,16 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+@@ -953,12 +1079,16 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
  
      if (isGsPrivReg(address))
      {
@@ -5357,7 +5418,7 @@ index 37b6a4d..6a23245 100644
              writeCsrHalf(gs_regs.csr, off, value);
          }
          else if (uint64_t *reg = gsRegPtr(gs_regs, address))
-@@ -1013,11 +1116,15 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+@@ -1013,11 +1143,15 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
  
      if (isGsPrivReg(address))
      {
@@ -5373,7 +5434,7 @@ index 37b6a4d..6a23245 100644
              writeCsrFull(gs_regs.csr, value);
          }
          else if (uint64_t *reg = gsRegPtr(gs_regs, address))
-@@ -1070,6 +1177,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+@@ -1070,6 +1204,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
      const bool scratch = isScratchpad(address);
      uint32_t physAddr = translateAddress(address);
  
@@ -5382,7 +5443,7 @@ index 37b6a4d..6a23245 100644
      if (!scratch && physAddr == 0x10004000u) // VIF0_FIFO
      {
          alignas(16) uint8_t fifoData[16];
-@@ -1124,6 +1233,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+@@ -1124,6 +1260,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
  
  bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
  {
@@ -5390,7 +5451,7 @@ index 37b6a4d..6a23245 100644
      size_t timerIndex = 0u;
      uint32_t timerOffset = 0u;
      if (decodeEeTimerRegister(address, timerIndex, timerOffset))
-@@ -1160,6 +1270,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1160,6 +1297,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
  
      if (isGsPrivReg(address))
      {
@@ -5398,7 +5459,7 @@ index 37b6a4d..6a23245 100644
          // NB: unreachable from write8/16/32/64 today since those all funnel IO
          // register writes through addresses in PS2_IO_BASE's range, which is
          // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
-@@ -1168,6 +1279,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1168,6 +1306,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
          const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
          if (regOff == kGsCsrRegOffset)
          {
@@ -5408,7 +5469,7 @@ index 37b6a4d..6a23245 100644
              writeCsrHalf(gs_regs.csr, off, value);
          }
          else if (uint64_t *reg = gsRegPtr(gs_regs, address))
-@@ -1439,6 +1553,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1439,6 +1580,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                          uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                          const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
                          uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
@@ -5426,7 +5487,7 @@ index 37b6a4d..6a23245 100644
                          lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                          ++tagsProcessed;
  
-@@ -1662,6 +1787,8 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+@@ -1662,6 +1814,8 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
  
  void PS2Memory::processPendingTransfers()
  {
@@ -5435,7 +5496,7 @@ index 37b6a4d..6a23245 100644
      const bool hadGif = !m_pendingGifTransfers.empty();
      uint32_t observedGifQwc = 0u;
      for (const auto &transfer : m_pendingGifTransfers)
-@@ -1801,7 +1928,39 @@ void PS2Memory::processPendingTransfers()
+@@ -1801,7 +1955,39 @@ void PS2Memory::processPendingTransfers()
      }
      m_pendingVif0Transfers.clear();
  
@@ -5476,7 +5537,7 @@ index 37b6a4d..6a23245 100644
      for (auto &p : m_pendingVif1Transfers)
      {
          if (!p.chainData.empty())
-@@ -1859,7 +2018,7 @@ void PS2Memory::processPendingTransfers()
+@@ -1859,7 +2045,7 @@ void PS2Memory::processPendingTransfers()
      }
      m_pendingVif1Transfers.clear();
  
@@ -5485,7 +5546,7 @@ index 37b6a4d..6a23245 100644
          m_gifArbiter->drain();
  
      static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-@@ -2280,6 +2439,7 @@ int PS2Memory::pollDmaRegisters()
+@@ -2280,6 +2466,7 @@ int PS2Memory::pollDmaRegisters()
  
  uint32_t PS2Memory::readIORegister(uint32_t address)
  {
@@ -5493,7 +5554,7 @@ index 37b6a4d..6a23245 100644
      size_t timerIndex = 0u;
      uint32_t timerOffset = 0u;
      if (decodeEeTimerRegister(address, timerIndex, timerOffset))
-@@ -2302,6 +2462,15 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+@@ -2302,6 +2489,15 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
  
      if (isGsPrivReg(address))
      {

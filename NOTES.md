@@ -109,6 +109,20 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## 30 fps reached in the tutorial (2026-11-02, runs/prio-on, prio-off)
+
+- The PC is an i7-13700KF (8 P-cores + 8 E-cores, 24 threads). The VIF1/VU1
+  worker now runs at THREAD_PRIORITY_HIGHEST and the GS band helpers at
+  BELOW_NORMAL, so Windows keeps the worker on a P-core
+  (`PS2X_THREAD_PRIORITIES=0` turns this off).
+- Remaining interpreter fallbacks per capture pass are only a few thousand
+  (CLIP, DIV, FCAND, XGKICK...), not worth inlining for speed.
+- Game (PGO retrained): priorities on = locked 30.0 fps, VU1 worker 81% busy,
+  EE idle 64% (waiting for vsync); priorities off = ~30.0 but at the edge
+  (worker 91%, no idle). Memory flat ~260 MB, picture correct.
+- Next (Beyond's order): modernize (widescreen, 60/120 fps), then the parked
+  items: battles are skipped; recheck music in other scenes.
+
 ## Bigger GS batches, native MTIR/MFIR (2026-11-02, runs/opt30a)
 
 - GS: a batch drains after 48 distinct write ranges / 96 read ranges (was
