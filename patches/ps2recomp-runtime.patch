@@ -4409,10 +4409,10 @@ index f0ad507..4ca16da 100644
          return false;
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..9c70dac 100644
+index 9281d5f..fad8db8 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -1,14 +1,199 @@
+@@ -1,14 +1,211 @@
 +#include <immintrin.h>
 +#include "runtime/ps2_profile.h"
  #include "runtime/gs/gs_frontend.h"
@@ -4519,7 +4519,12 @@ index 9281d5f..9c70dac 100644
 +    }
 +
 +    // Called at the top of processGIFPacket: starts/stops at frame boundaries.
-+    void onPacket(uint64_t dispfb1, const uint8_t *vram, uint32_t vramSize)
++    // ps2x_armGsCapture(): start at the next frame boundary even before
++    // `seconds` (still needs PS2X_GS_CAPTURE for the frame count).
++    std::atomic<bool> g_armed{false};
++
++    template <typename FlushFn>
++    void onPacket(uint64_t dispfb1, const uint8_t *vram, uint32_t vramSize, FlushFn flush)
 +    {
 +        if (!config().enabled || g_done)
 +            return;
@@ -4531,13 +4536,20 @@ index 9281d5f..9c70dac 100644
 +            return;
 +        if (!g_file)
 +        {
-+            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= config().seconds)
++            if (g_armed.load(std::memory_order_relaxed) ||
++                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= config().seconds)
++            {
++                flush();
 +                begin(vram, vramSize);
++            }
 +            return;
 +        }
 +        put<uint8_t>(Frame);
 +        if (--g_framesLeft <= 0)
++        {
++            flush();
 +            finish(vram, vramSize);
++        }
 +    }
 +
 +    void record(Record type, const void *data, uint32_t size)
@@ -4612,7 +4624,7 @@ index 9281d5f..9c70dac 100644
  
  namespace
  {
-@@ -105,12 +290,166 @@ namespace
+@@ -105,12 +302,166 @@ namespace
  }
  
  
@@ -4779,7 +4791,7 @@ index 9281d5f..9c70dac 100644
  void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  {
      m_localMemoryStorage = vram;
-@@ -124,6 +463,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+@@ -124,6 +475,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  
  void GS::reset()
  {
@@ -4787,7 +4799,7 @@ index 9281d5f..9c70dac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      std::memset(m_ctx, 0, sizeof(m_ctx));
      m_prim = {};
-@@ -526,6 +866,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+@@ -526,6 +878,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
  
  void GS::latchHostPresentationFrame()
  {
@@ -4795,7 +4807,7 @@ index 9281d5f..9c70dac 100644
      GSPresentationRequest request{};
      {
          std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-@@ -640,13 +981,54 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -640,13 +993,56 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -4812,9 +4824,11 @@ index 9281d5f..9c70dac 100644
  
 +    if (m_privRegs && gscap::config().enabled && !gscap::g_done)
 +    {
-+        if (m_backend)
-+            m_backend->Flush(); // the capture snapshots VRAM: draw queued primitives first
-+        gscap::onPacket(m_privRegs->dispfb1, m_localMemoryStorage, m_localMemorySize);
++        // The capture snapshots VRAM when it starts and ends: draw queued
++        // primitives first, but only then (flushing every packet made the
++        // game crawl while a capture was merely armed).
++        gscap::onPacket(m_privRegs->dispfb1, m_localMemoryStorage, m_localMemorySize,
++                        [this] { if (m_backend) m_backend->Flush(); });
 +    }
 +    gscap::record(gscap::GifPacket, data, sizeBytes);
 +
@@ -4850,7 +4864,7 @@ index 9281d5f..9c70dac 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
          if (packetIndex < 48u)
-@@ -730,7 +1112,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -730,7 +1126,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
              // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
              uint32_t imageBytes = nloop * 16;
              if (offset + imageBytes > sizeBytes)
@@ -4860,7 +4874,7 @@ index 9281d5f..9c70dac 100644
              processImageData(data + offset, imageBytes);
              offset += imageBytes;
          }
-@@ -739,6 +1123,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -739,6 +1137,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  
  bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -4876,7 +4890,7 @@ index 9281d5f..9c70dac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16u || !m_backend)
          return false;
-@@ -773,6 +1166,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -773,6 +1180,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
      if (!processed)
          return false;
  
@@ -4884,7 +4898,7 @@ index 9281d5f..9c70dac 100644
      ++m_nativePackedGIFPacketCount;
      return true;
  }
-@@ -784,7 +1178,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+@@ -784,7 +1192,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                             const uint8_t *data,
                             uint32_t sizeBytes)
  {
@@ -4908,7 +4922,7 @@ index 9281d5f..9c70dac 100644
      uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
  }
  
-@@ -1062,12 +1472,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,12 +1486,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -4935,7 +4949,7 @@ index 9281d5f..9c70dac 100644
      const bool interestingReg =
          regAddr == GS_REG_PRIM ||
          regAddr == GS_REG_RGBAQ ||
-@@ -1384,6 +1808,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1384,6 +1822,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      case GS_REG_TRXDIR:
      {
          m_trxdir = static_cast<uint32_t>(value & 0x3);
@@ -4982,7 +4996,7 @@ index 9281d5f..9c70dac 100644
  
          if (m_backend)
          {
-@@ -1578,6 +2042,86 @@ void GS::vertexKick(bool drawing)
+@@ -1578,6 +2056,86 @@ void GS::vertexKick(bool drawing)
          GSPrimitiveBatch batch = buildDrawBatch(needed);
          updatePreferredDisplaySourceForDraw(batch);
          m_backend->Submit(batch);
@@ -5069,7 +5083,7 @@ index 9281d5f..9c70dac 100644
          recordDrawDebugEventUnlocked(needed);
      }
  
-@@ -1608,27 +2152,82 @@ void GS::vertexKick(bool drawing)
+@@ -1608,27 +2166,82 @@ void GS::vertexKick(bool drawing)
      }
  }
  
@@ -5152,7 +5166,7 @@ index 9281d5f..9c70dac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1664,12 +2263,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+@@ -1664,12 +2277,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
  
  uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
@@ -5167,6 +5181,15 @@ index 9281d5f..9c70dac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (m_backend)
          m_backend->WriteVram(psm, base, bw, x, y, value);
+@@ -1734,3 +2349,8 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+         m_hasPreferredDisplaySource = true;
+     }
+ }
++
++void ps2x_armGsCapture()
++{
++    gscap::g_armed.store(true, std::memory_order_relaxed);
++}
 diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
 index c0507c7..0ad96a5 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp

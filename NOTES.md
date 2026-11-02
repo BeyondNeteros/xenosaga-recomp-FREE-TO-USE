@@ -131,8 +131,21 @@ looked at: sound (skipped), FMV playback quality, later scenes/battles
   fade that never finishes (fast build: battle UI faint over black; field
   black afterwards except characters/HUD), and something timing-related
   that makes the battle end at once in the slow build.
-- Replays don't trigger the battle reliably (enemy movement differs per
-  run); a save just before the battle area would make it reproducible.
+- runs/bplay2-inputs.txt (Beyond, 2026-11-02) reaches the scripted tutorial
+  battle ("Entering battle mode") and replays deterministically (~110 s).
+  XS_BATTLE_TRACE=1 logs OV01 battle functions called through the function
+  table (intra-overlay JAL/J are direct C++ calls and are not seen) and arms
+  the GS capture (PS2X_GS_CAPTURE=99999,90) at battleInit.
+- Tutorial battle: black 3D with UI, ends after ~3 s as a win with 0 EXP,
+  Shion max HP shown as 0000. battleEndChk: win when unitLiveNumGet2(1)==0
+  (alive = no 0x80 flag and calcStatGet(unit,0/4,0x2000) status bits clear).
+  unitTblGet(2)=8 units, side 0 = 3 units.
+- GS capture of the battle (runs/bplay2/gs_capture.bin) replays identical to
+  the game's VRAM; Z buffer is cleared normally each frame there (the
+  0xFFFFFC Z seen in Beyond's field battle dump comes from a per-frame
+  852 KB image upload over the Z area, cleared again by a small packet).
+- The capture used to Flush the GS on every packet while armed (game at
+  4 fps); it now flushes only when it starts/ends.
 - "disc file not found: \DATA\..." lines are loose-file probes; the disc
   has no DATA folder (everything is in XENOSAGA.xx archives).
 

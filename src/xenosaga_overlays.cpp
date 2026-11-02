@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 void xs_register_ov01(PS2Runtime::RecompiledFunction *t);
@@ -26,6 +27,7 @@ void xs_register_ov10(PS2Runtime::RecompiledFunction *t);
 void xs_register_ov11(PS2Runtime::RecompiledFunction *t);
 void xs_register_ov12(PS2Runtime::RecompiledFunction *t);
 void xs_configureDiscImage();
+void ps2x_armGsCapture(); // gs_frontend.cpp
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -139,6 +141,69 @@ namespace
             reg(g_ps2RecompiledFunctionTable);
     }
 
+    // XS_BATTLE_TRACE=1: log calls to OV01's battle functions (and arm the
+    // GS capture, PS2X_GS_CAPTURE, when a battle starts).
+    struct TracedFunction
+    {
+        uint32_t addr;
+        const char *name;
+        bool logReturn;
+        PS2Runtime::RecompiledFunction original;
+        uint32_t lastReturn;
+    };
+    TracedFunction g_battleTrace[] = {
+        {0x00A07770u, "battleInit", false, nullptr, ~0u},
+        {0x00A078B8u, "battleMain", false, nullptr, ~0u},
+        {0x00A078E8u, "battleAfter", false, nullptr, ~0u},
+        {0x00A0B518u, "battleEndChk", true, nullptr, ~0u},
+        {0x00A0B600u, "battleRetCodeSet", false, nullptr, ~0u},
+        {0x00A22668u, "battleProc", false, nullptr, ~0u},
+        {0x00A22850u, "battleProcEnd", false, nullptr, ~0u},
+        {0x00A236C0u, "encountEffDisp", false, nullptr, ~0u},
+        {0x00A24950u, "encEffVramCopy", false, nullptr, ~0u},
+        {0x00A24B90u, "grVramCopyFBtoFB", false, nullptr, ~0u},
+        {0x00A17148u, "calcStatGet", true, nullptr, ~0u},
+        {0x00A01000u, "unitLiveNumGet2", true, nullptr, ~0u},
+        {0x00A00D98u, "unitTblGet", true, nullptr, ~0u},
+    };
+
+    template <size_t I>
+    void tracedCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        TracedFunction &f = g_battleTrace[I];
+        static uint32_t calls = 0;
+        const bool log = !f.logReturn && ++calls <= 400u;
+        if (log)
+            std::printf("[battle] %s a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x\n", f.name, GPR_U32(ctx, 4), GPR_U32(ctx, 5),
+                        GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
+        if (I == 0)
+            ps2x_armGsCapture();
+        const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6);
+        f.original(rdram, ctx, runtime);
+        if (f.logReturn)
+        {
+            const uint32_t v0 = GPR_U32(ctx, 2);
+            static uint32_t retLogged = 0;
+            if (v0 != f.lastReturn || ++retLogged <= 300u)
+                std::printf("[battle] %s(%08x, %08x, %08x) -> %08x\n", f.name, a0, a1, a2, v0);
+            f.lastReturn = v0;
+        }
+    }
+
+    template <size_t... I>
+    void installBattleTrace(std::index_sequence<I...>)
+    {
+        static const PS2Runtime::RecompiledFunction wrappers[] = {tracedCall<I>...};
+        for (size_t i = 0; i < sizeof...(I); ++i)
+        {
+            const uint32_t slot = (g_battleTrace[i].addr - g_ps2RecompiledFunctionTableBase) >> 2;
+            if (slot >= g_ps2RecompiledFunctionTableSlotCount || !g_ps2RecompiledFunctionTable[slot])
+                continue;
+            g_battleTrace[i].original = g_ps2RecompiledFunctionTable[slot];
+            g_ps2RecompiledFunctionTable[slot] = wrappers[i];
+        }
+    }
+
     void xglCdLoadOverlay_hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
         const uint32_t id = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4])) & 0xFFu;
@@ -152,6 +217,9 @@ namespace
         if (!readOverlayFile(id, data, source) || !loadOverlayImage(rdram, data))
             std::cerr << "[xenosaga] failed to load overlay " << id << " (" << source << ")" << std::endl;
         activateOverlayFunctions(id);
+        if (id == 1)
+            if (const char *trace = std::getenv("XS_BATTLE_TRACE"); trace && trace[0] == '1')
+                installBattleTrace(std::make_index_sequence<sizeof(g_battleTrace) / sizeof(g_battleTrace[0])>{});
         g_currentOverlay = id;
         std::cout << "[xenosaga] overlay " << id << " active (" << source << ")" << std::endl;
     }
