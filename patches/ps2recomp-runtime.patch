@@ -1752,10 +1752,14 @@ index 0485d50..40c7680 100644
  // QFSRV: Quadword Funnel Shift Right Variable
  // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 2421f9e..5c8d838 100644
+index 2421f9e..66d15ac 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-@@ -4,13 +4,16 @@
+@@ -1,16 +1,20 @@
+ #pragma once
+ 
++#include <atomic>
+ #include "runtime/gs/gs_backend.h"
  #include "runtime/gs/gs_texture_page_cache.h"
  
  #include <array>
@@ -1772,7 +1776,7 @@ index 2421f9e..5c8d838 100644
  
      void Initialize(uint8_t *vram, uint32_t vramSize) override;
      void Reset() override;
-@@ -34,6 +37,43 @@ public:
+@@ -34,6 +38,43 @@ public:
      GSTransferSnapshot GetTransferSnapshot() const override;
  
  private:
@@ -3501,7 +3505,7 @@ index 5e9a446..c9e168d 100644
 +    bool queueEeRpcFromIop(PS2Runtime *runtime, ps2x::iop::EeRpcCall call);
  }
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index f0ad507..22d8d07 100644
+index f0ad507..c3ea1de 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -8,8 +8,11 @@
@@ -3516,7 +3520,7 @@ index f0ad507..22d8d07 100644
  #include <cstring>
  #include <fstream>
  #include <iostream>
-@@ -292,11 +295,22 @@ namespace
+@@ -292,11 +295,49 @@ namespace
          return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
      }
  
@@ -3537,10 +3541,37 @@ index f0ad507..22d8d07 100644
          const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
 -        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
 +        return clampU8(roundHalfAwayFromZero(top + (bottom - top) * fy));
++    }
++
++    // lerpChannel on all four channels at once: the same float operations in
++    // the same order per lane (no FMA), so the result is bit-identical.
++    uint32_t bilinear4(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, float fx, float fy)
++    {
++        const auto lanes = [](uint32_t c) { return _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(c)))); };
++        const __m128 f00 = lanes(c00), f10 = lanes(c10), f01 = lanes(c01), f11 = lanes(c11);
++        const __m128 vfx = _mm_set1_ps(fx);
++        const __m128 top = _mm_add_ps(f00, _mm_mul_ps(_mm_sub_ps(f10, f00), vfx));
++        const __m128 bottom = _mm_add_ps(f01, _mm_mul_ps(_mm_sub_ps(f11, f01), vfx));
++        const __m128 x = _mm_add_ps(top, _mm_mul_ps(_mm_sub_ps(bottom, top), _mm_set1_ps(fy)));
++        // roundHalfAwayFromZero (and the lround fallback) for |x| >= 2^23 / NaN: scalar.
++        const __m128 absX = _mm_andnot_ps(_mm_set1_ps(-0.0f), x);
++        if (_mm_movemask_ps(_mm_cmplt_ps(absX, _mm_set1_ps(8388608.0f))) != 0xF)
++            return static_cast<uint32_t>(lerpChannel(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy)) |
++                   (static_cast<uint32_t>(lerpChannel((c00 >> 8) & 0xFFu, (c10 >> 8) & 0xFFu, (c01 >> 8) & 0xFFu, (c11 >> 8) & 0xFFu, fx, fy)) << 8) |
++                   (static_cast<uint32_t>(lerpChannel((c00 >> 16) & 0xFFu, (c10 >> 16) & 0xFFu, (c01 >> 16) & 0xFFu, (c11 >> 16) & 0xFFu, fx, fy)) << 16) |
++                   (static_cast<uint32_t>(lerpChannel(c00 >> 24, c10 >> 24, c01 >> 24, c11 >> 24, fx, fy)) << 24);
++        const __m128i i = _mm_cvttps_epi32(x);
++        const __m128 frac = _mm_sub_ps(x, _mm_cvtepi32_ps(i));
++        // + (frac >= 0.5) - (frac <= -0.5): compare masks are -1 when true.
++        __m128i r = _mm_sub_epi32(i, _mm_castps_si128(_mm_cmpge_ps(frac, _mm_set1_ps(0.5f))));
++        r = _mm_add_epi32(r, _mm_castps_si128(_mm_cmple_ps(frac, _mm_set1_ps(-0.5f))));
++        // clampU8 + pack: signed saturation to 16 bits, then unsigned to 8 bits.
++        const __m128i packed = _mm_packus_epi16(_mm_packs_epi32(r, r), _mm_setzero_si128());
++        return static_cast<uint32_t>(_mm_cvtsi128_si32(packed));
      }
  }
  
-@@ -510,9 +524,377 @@ GSCpuBackend::GSCpuBackend()
+@@ -510,9 +551,390 @@ GSCpuBackend::GSCpuBackend()
              break;
          }
      }
@@ -3562,9 +3593,21 @@ index f0ad507..22d8d07 100644
 +    // VRAM that texture reads come from (null = live VRAM).
 +    thread_local const uint8_t *t_texVram = nullptr;
 +
++    // Last row asked about and its answer: pixels arrive row by row, so this
++    // skips the division for almost every pixel.
++    thread_local int t_ownsRowY = -1;
++    thread_local bool t_ownsRowResult = true;
++
 +    inline bool ownsRow(int y)
 +    {
-+        return t_bandCount == 1u || ((static_cast<uint32_t>(y) >> 3) % t_bandCount) == t_band;
++        if (t_bandCount == 1u)
++            return true;
++        if (y != t_ownsRowY)
++        {
++            t_ownsRowY = y;
++            t_ownsRowResult = ((static_cast<uint32_t>(y) >> 3) % t_bandCount) == t_band;
++        }
++        return t_ownsRowResult;
 +    }
 +
 +    constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
@@ -3860,6 +3903,7 @@ index f0ad507..22d8d07 100644
 +    _mm_setcsr((previousCsr & ~0x6000u) | 0x8040u);
 +    t_band = band;
 +    t_bandCount = m_bandCount;
++    t_ownsRowY = -1;
 +    for (const PendingPrimitive &prim : m_pending)
 +    {
 +        t_clut = m_clutSnapshots[prim.clut].data();
@@ -3918,7 +3962,7 @@ index f0ad507..22d8d07 100644
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
      if (vram && vramSize < GSMem::MEMORY_SIZE)
-@@ -532,6 +914,7 @@ void GSCpuBackend::Reset()
+@@ -532,6 +954,7 @@ void GSCpuBackend::Reset()
  
  void GSCpuBackend::ResetUnlocked()
  {
@@ -3926,7 +3970,7 @@ index f0ad507..22d8d07 100644
      m_clut.fill(0u);
      m_clutCbp.fill(0u);
      m_texturePageCache.Invalidate();
-@@ -548,7 +931,55 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -548,7 +971,55 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
@@ -3983,7 +4027,7 @@ index f0ad507..22d8d07 100644
  }
  
  void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
-@@ -585,7 +1016,21 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -585,7 +1056,21 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
          return;
      }
  
@@ -4005,7 +4049,7 @@ index f0ad507..22d8d07 100644
  }
  
  void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
-@@ -638,7 +1083,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+@@ -638,7 +1123,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
  
  void GSCpuBackend::Flush()
  {
@@ -4015,7 +4059,7 @@ index f0ad507..22d8d07 100644
  }
  
  void GSCpuBackend::TextureFlush()
-@@ -655,6 +1101,7 @@ void GSCpuBackend::Sync(GSSyncReason)
+@@ -655,6 +1141,7 @@ void GSCpuBackend::Sync(GSSyncReason)
  uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4023,7 +4067,7 @@ index f0ad507..22d8d07 100644
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
  
-@@ -670,12 +1117,13 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+@@ -670,12 +1157,13 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
      if (!m_vram)
          return 0u;
  
@@ -4038,7 +4082,7 @@ index f0ad507..22d8d07 100644
      WriteVramUnlocked(psm, base, bw, x, y, value);
  }
  
-@@ -689,6 +1137,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+@@ -689,6 +1177,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
  void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4046,7 +4090,7 @@ index f0ad507..22d8d07 100644
      if (!m_vram || m_vramSize == 0u)
      {
          out.clear();
-@@ -848,6 +1297,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -848,6 +1337,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
  {
@@ -4055,7 +4099,7 @@ index f0ad507..22d8d07 100644
      const auto &ctx = state.context;
      if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
          return;
-@@ -1033,21 +1484,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -1033,21 +1524,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
          clutIndex = block + (sourceIndex & 0x0Fu);
      }
  
@@ -4081,7 +4125,131 @@ index f0ad507..22d8d07 100644
      default:
          break;
      }
-@@ -1236,6 +1688,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1083,80 +1575,53 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+         texVf = t * invQ * static_cast<float>(texH);
+     }
+ 
+-    auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
++    // The format is fixed for the whole lookup: pick the texel decoder once
++    // (not per texel), then point- or bilinear-sample with it.
++    const auto sampleWith = [&](auto decode) -> uint32_t
+     {
+-        sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
+-        sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
+-
+-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+-
+-        switch (tex.psm)
++        const auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+         {
+-        case GS_PSM_CT32:
+-        case GS_PSM_Z32:
+-        case GS_PSM_CT24:
+-        case GS_PSM_Z24:
+-            return applyTexa(state.texa, tex.psm, out);
+-        case GS_PSM_CT16:
+-        case GS_PSM_CT16S:
+-        case GS_PSM_Z16:
+-        case GS_PSM_Z16S:
+-            return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
+-        case GS_PSM_T8:
+-        case GS_PSM_T8H:
+-        case GS_PSM_T4:
+-        case GS_PSM_T4HL:
+-        case GS_PSM_T4HH:
+-            return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
+-        }
+-
+-        return 0xFFFF00FFu;
++            sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
++            sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
++            return decode(ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV));
++        };
++        if (!state.linearFilter)
++            return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
++
++        const float sampleU = texUf - 0.5f;
++        const float sampleV = texVf - 0.5f;
++        const int u0 = static_cast<int>(std::floor(sampleU));
++        const int v0 = static_cast<int>(std::floor(sampleV));
++        const float fx = sampleU - static_cast<float>(u0);
++        const float fy = sampleV - static_cast<float>(v0);
++        const uint32_t c00 = samplePoint(u0, v0);
++        const uint32_t c10 = samplePoint(u0 + 1, v0);
++        const uint32_t c01 = samplePoint(u0, v0 + 1);
++        const uint32_t c11 = samplePoint(u0 + 1, v0 + 1);
++        return bilinear4(c00, c10, c01, c11, fx, fy);
+     };
+ 
+-    if (!state.linearFilter)
+-    {
+-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+-    }
+-
+-    const float sampleU = texUf - 0.5f;
+-    const float sampleV = texVf - 0.5f;
+-    const int u0 = static_cast<int>(std::floor(sampleU));
+-    const int v0 = static_cast<int>(std::floor(sampleV));
+-    const int u1 = u0 + 1;
+-    const int v1 = v0 + 1;
+-    const float fx = sampleU - static_cast<float>(u0);
+-    const float fy = sampleV - static_cast<float>(v0);
+-
+-    const uint32_t c00 = samplePoint(u0, v0);
+-    const uint32_t c10 = samplePoint(u1, v0);
+-    const uint32_t c01 = samplePoint(u0, v1);
+-    const uint32_t c11 = samplePoint(u1, v1);
+-
+-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
+-                                  static_cast<uint8_t>(c10 & 0xFFu),
+-                                  static_cast<uint8_t>(c01 & 0xFFu),
+-                                  static_cast<uint8_t>(c11 & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
+-                                  fx, fy);
+-
+-    return static_cast<uint32_t>(r) |
+-           (static_cast<uint32_t>(g) << 8) |
+-           (static_cast<uint32_t>(b) << 16) |
+-           (static_cast<uint32_t>(a) << 24);
++    switch (tex.psm)
++    {
++    case GS_PSM_CT32:
++    case GS_PSM_Z32:
++    case GS_PSM_CT24:
++    case GS_PSM_Z24:
++        return sampleWith([&](u32 out) { return applyTexa(state.texa, tex.psm, out); });
++    case GS_PSM_CT16:
++    case GS_PSM_CT16S:
++    case GS_PSM_Z16:
++    case GS_PSM_Z16S:
++        return sampleWith([&](u32 out) { return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out)); });
++    case GS_PSM_T8:
++    case GS_PSM_T8H:
++    case GS_PSM_T4:
++    case GS_PSM_T4HL:
++    case GS_PSM_T4HH:
++        return sampleWith([&](u32 out) { return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm); });
++    default:
++        return sampleWith([](u32) { return 0xFFFF00FFu; });
++    }
+ }
+ 
+ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1236,6 +1701,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
  
          for (int y = drawY0; y <= drawY1; ++y)
          {
@@ -4090,7 +4258,7 @@ index f0ad507..22d8d07 100644
              float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
              float texVf = v0f + (v1f - v0f) * ty;
  
-@@ -1313,6 +1767,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1313,6 +1780,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
  
      for (int y = minY; y <= maxY; ++y)
      {
@@ -4099,7 +4267,7 @@ index f0ad507..22d8d07 100644
          float py = static_cast<float>(y) + 0.5f;
          for (int x = minX; x <= maxX; ++x)
          {
-@@ -1463,6 +1919,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1463,6 +1932,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4107,7 +4275,7 @@ index f0ad507..22d8d07 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1480,6 +1937,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1480,6 +1950,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4115,7 +4283,7 @@ index f0ad507..22d8d07 100644
      if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
          return;
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-@@ -1509,6 +1967,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1509,6 +1980,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
          m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
      };
  
@@ -4124,7 +4292,7 @@ index f0ad507..22d8d07 100644
      while (offset < sizeBytes && m_transferState.direction == 0u)
      {
          switch (dpsm)
-@@ -1588,6 +2048,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1588,6 +2061,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  {
      if (!m_vram)
          return;
@@ -4132,7 +4300,7 @@ index f0ad507..22d8d07 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1697,6 +2158,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1697,6 +2171,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4140,7 +4308,7 @@ index f0ad507..22d8d07 100644
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
      const size_t count = std::min<size_t>(maxBytes, m_localToHostBuffer.size() - m_localToHostReadPos);
-@@ -1709,6 +2171,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1709,6 +2184,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
      std::lock_guard<std::mutex> lock(m_mutex);

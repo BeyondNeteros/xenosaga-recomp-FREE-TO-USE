@@ -109,6 +109,21 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## GS per-texel work (2026-11-02, runs/gsopt2)
+
+- SampleTexture picks the texel decoder (CT32/CT16/CLUT) once per lookup
+  instead of per texel; bilinear blends all four channels with SSE using the
+  same float operations per lane (`bilinear4`; scalar fallback for |x| >=
+  2^23 / NaN). Forcing it inline was slower (code size).
+- ownsRow caches the last row's answer (it divided per pixel).
+- gs_replay single thread 66.3 -> 56 ms per frame; VRAM identical (nearest
+  8 threads 9bd6e6333fd57e89; 1 thread recorded rounding = game's end VRAM).
+- Tried and dropped: spinning pool threads before sleeping. No gain in
+  gs_replay, and in game the spinning threads took CPU from the VU1 worker
+  (26.8 -> 25.2 fps).
+- Game (PGO retrained on the game): ~27.0 fps, GS thread 79% -> 73%. The
+  VU1 worker (vif1 ~91%) is the limit again.
+
 ## PGO trained on the game (2026-11-01, runs/pgogame1)
 
 - In-game profile (runs/prof2, XS_PROFILE) showed the hottest VU1 blocks in
