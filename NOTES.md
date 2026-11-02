@@ -125,7 +125,13 @@ looked at: sound (skipped), FMV playback quality, later scenes/battles
   the block); they skip the ring and fold their sticky Z/S bits into the next
   entry (`m_deadSticky`). Only 155/741 ops qualify (many blocks read flags).
 - 108/108 captures identical; 11.9 -> 9.15 ns per VU cycle; game (without the
-  dead-flag part yet) 18.7 -> 21.2 fps.
+  dead-flag part yet) 18.7 -> 21.2 fps; with it (runs/vu1opt2) ~20.5-21 fps,
+  same within run-to-run noise.
+- Path stats (one pass over the fbsnap1 capture): 99% of pairs run in
+  native blocks, ~10 pairs per block run; ~19k interpreter execLower calls
+  per 117k pairs, mostly block-end branches (IBEQ/IBNE/JR/B) and MTIR/MFIR/
+  DIV. Next: native branch pairs + chaining straight into the next block,
+  then cheaper per-pair cycle bookkeeping inside blocks.
 
 ## VU1 on its own thread (2026-11-01, runs/async1v)
 

@@ -6029,7 +6029,7 @@ index f872edd..d31be32 100644
              }
  
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index f19e281..4b5e4ca 100644
+index f19e281..8b291a4 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -1,3 +1,5 @@
@@ -6898,7 +6898,7 @@ index f19e281..4b5e4ca 100644
      return m_decodedCodeCache[pairIndex];
  }
  
-@@ -1620,6 +1788,530 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+@@ -1620,6 +1788,532 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
      run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
  }
  
@@ -7411,7 +7411,9 @@ index f19e281..4b5e4ca 100644
 +        const __m256i offs = _mm256_cvtepu16_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(f.offset)));
 +        const __m256i mask = _mm256_cmpgt_epi64(
 +            _mm256_and_si256(_mm256_set1_epi64x(f.mask), _mm256_setr_epi64x(1, 2, 4, 8)), _mm256_setzero_si256());
-+        _mm256_maskstore_epi64(reinterpret_cast<long long *>(m_vfReady[f.reg].data()), mask, _mm256_add_epi64(base, offs));
++        // Load/blend/store: vpmaskmovq stores are microcoded and slow on some CPUs.
++        __m256i *lanes = reinterpret_cast<__m256i *>(m_vfReady[f.reg].data());
++        _mm256_storeu_si256(lanes, _mm256_blendv_epi8(_mm256_loadu_si256(lanes), _mm256_add_epi64(base, offs), mask));
 +    }
 +    for (const StaticLane &l : block.finalWrites)
 +    {
@@ -7429,7 +7431,7 @@ index f19e281..4b5e4ca 100644
  void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                           uint8_t *vuData, uint32_t dataSize,
                           GS &gs, PS2Memory *memory, uint32_t maxCycles)
-@@ -1629,17 +2321,81 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1629,17 +2323,81 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_activeGs = &gs;
      m_activeMemory = memory;
  
@@ -7515,7 +7517,7 @@ index f19e281..4b5e4ca 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1660,6 +2416,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1660,6 +2418,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          if (m_cycle >= budgetEnd)
              break;
  
@@ -7528,7 +7530,7 @@ index f19e281..4b5e4ca 100644
          uint8_t writtenVi = 0u;
          int32_t oldVi = 0;
          for (uint32_t reg = 1; reg < 16u; ++reg)
-@@ -1766,64 +2528,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1766,64 +2530,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          markPairWrites(decoded);
          if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
              recordViWriteForBranch(writtenVi, oldVi);
@@ -7602,7 +7604,7 @@ index f19e281..4b5e4ca 100644
      if (programEnded)
      {
          flushPipelines();
-@@ -1833,6 +2554,6 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1833,6 +2556,6 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          m_pendingHaltT = false;
      }
      m_state.cycles = m_cycle;
