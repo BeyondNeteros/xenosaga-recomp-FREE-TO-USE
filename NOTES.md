@@ -109,6 +109,23 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Feedback sprites drawn in parallel (2026-11-01, runs/fbsnap1)
+
+- gs_replay stats showed the ordered (single-thread) path was more than half
+  of the GS time: ~300 feedback primitives per frame, but ~92% of their pixels
+  are 2 full-screen sprites per frame that sample their own frame buffer one
+  row below / one pixel to the right (shift/blur passes).
+- `isForwardFeedbackSprite`: a sprite on the same address/width/format whose
+  every nonzero-weight texel (same maths as DrawSprite/SampleTexture) is at or
+  after the pixel in raster order only ever sees pre-sprite values. Those are
+  drawn alone on all threads from a VRAM copy of the texture pages.
+- gs_replay (8 threads): 45 -> 34 ms per frame, VRAM hash unchanged at 1/4/8
+  threads. In game: GS thread 76% -> 42% busy, gssync 39% -> 1%, fps
+  unchanged (~16.5): the main thread (VIF1/VU1 ~78%) is now the only limit.
+- Left ordered: the ~300 small heat-haze triangles per frame (cheap).
+- The fps dips to 9-13 once the "Virtual Tutorial" text box is up (late in
+  the 260 s run; not compared with older runs yet).
+
 ## XGKICK batching (2026-11-01, runs/kick1)
 
 `advanceTo` steps the first cycle normally (the last pair's stores land),
