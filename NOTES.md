@@ -109,6 +109,23 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Battles: first look (2026-11-02, runs/rec1, battle-fast, battle-safe2)
+
+- Beyond recorded a new-game run into the first battle after the tutorial
+  (runs/rec1-inputs.txt; enemy movement differs per replay, so the battle
+  does not always trigger). XS_FRAME_KEEP=1 keeps a frame every heartbeat
+  (run_game.sh moves them to runs/<name>/frames).
+- Second area (field) draws fully and runs at 30 fps in the fast build.
+- Fast build (Beyond's run): the battle starts, its UI shows faintly over
+  black, and the field stays black after it except characters/HUD.
+- All speed-ups off (PS2X_VU1_NATIVE/STATIC/FAST=0, PS2X_VIF1_ASYNC=0): the
+  battle ends at once (results "Clear Time 00:00:04"), field fine after.
+- In every run only overlay 1 is ever activated (xglCdLoadOverlay is never
+  called again), so battle code presumably never gets its overlay (OV10/11/
+  12?) - next thing to find: how/where the game loads battle code.
+- "disc file not found: \DATA\..." lines are loose-file probes; the disc
+  has no DATA folder (everything is in XENOSAGA.xx archives).
+
 ## 30 fps reached in the tutorial (2026-11-02, runs/prio-on, prio-off)
 
 - The PC is an i7-13700KF (8 P-cores + 8 E-cores, 24 threads). The VIF1/VU1

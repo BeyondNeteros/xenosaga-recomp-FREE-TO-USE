@@ -50,5 +50,9 @@ mkdir -p "$out"
 for f in xenosaga.log xs_frame.bmp xs_vram.bin vu1_capture.bin xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin xs_spr.bin; do
     [ -f "$f" ] && cp -p "$f" "$out/"
 done
+# XS_FRAME_KEEP=1 frame series: move it into the run folder.
+if [ -d xs_frames ]; then
+    rm -rf "$out/frames"; mv xs_frames "$out/frames"
+fi
 echo "run $name done; results in runs/$name"
 grep -E "\[pad-(replay|record)\]" xenosaga.log | head -5 || true
