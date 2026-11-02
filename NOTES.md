@@ -109,6 +109,15 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## XGKICK batching (2026-11-01, runs/kick1)
+
+`advanceTo` steps the first cycle normally (the last pair's stores land),
+then applies the remaining commits and PATH1 progress in one step
+(`progressXgkickCycles`); the qword copy uses memcpy unless it wraps. Native
+blocks regenerated with the game's own block log (139 blocks). 103/103
+captures identical; game 15.4 -> 16.8 fps. Main thread ~80% VIF1/VU1, GS
+thread ~76%: both now limit.
+
 ## GS sync narrowed (2026-11-01, runs/sync1)
 
 The main thread spent 33% waiting for the async GS: every CSR write synced
