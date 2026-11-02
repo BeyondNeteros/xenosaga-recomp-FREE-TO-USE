@@ -28,8 +28,9 @@ if errorlevel 1 goto assemble_failed
 del "XenosagaRecomp.exe.part0" "XenosagaRecomp.exe.part1" "XenosagaRecomp.exe.part2"
 :exe_ready
 
-rem Sound is skipped until the sound driver connection is fixed.
-set "XS_NO_SOUND=1"
+rem Sound runs on the game's own sound driver and the emulated SPU2.
+rem Set XS_NO_SOUND=1 to skip the sound driver if a scene hangs on it.
+set "XS_NO_SOUND=0"
 set "XS_DISC_IMAGE=%DISC%"
 rem Debug: when VU1 is the bottleneck, record 300 VU1 calls to vu1_capture.bin.
 set "PS2X_VU_CAPTURE=1"

@@ -104,6 +104,27 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Sound playing (2026-11-01, runs/spu8)
+
+ps2xIOP now has an SPU2 (`src/emulator/core/iop_spu2.*`): register file for
+both cores, 2 MB sound RAM filled by IOP DMA ch4/ch7 and the data port,
+PS-ADPCM voices with loop flags, ADSR, pitch (linear interpolation), fixed
+volumes, dry + effect mixing, master/effect volumes, IRQ address -> IOP IRQ 9.
+The runtime plays it through a raylib audio stream (48 kHz, pulled on the
+audio thread, so pitch is right even below full speed; music tempo follows
+the game's speed). The launcher and run_game.sh now run with sound
+(XS_NO_SOUND=0).
+- Bugs found on the way: STATX must read 0 after reset (libsd init waits for
+  it) and 0x80 after a DMA; voice address high/low pairing.
+- The effect bus goes through a simple stand-in reverb (two feedback delays);
+  voices the game sends only to reverb were silent before.
+- Not yet: the SPU2's real reverb program, volume sweeps (treated as full),
+  noise, pitch modulation, AutoDMA (streamed audio input, likely needed for
+  voices/FMV), gaussian interpolation.
+- Diagnostics: `PS2X_SPU2_OUTPUT=0` mute, `PS2X_SPU2_WAV=<file>` record raw
+  output, `PS2X_SPU2_LOG=<n>` register accesses, `PS2X_SPU2_EVENTS=<n>` key-ons
+  and DMA transfers.
+
 ## Sound driver running (2026-11-01, runs/snd12)
 
 With `XS_NO_SOUND=0` the game's own IOP modules (LIBSD, SSD = Monolith's
