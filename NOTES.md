@@ -120,9 +120,19 @@ looked at: sound (skipped), FMV playback quality, later scenes/battles
   black, and the field stays black after it except characters/HUD.
 - All speed-ups off (PS2X_VU1_NATIVE/STATIC/FAST=0, PS2X_VIF1_ASYNC=0): the
   battle ends at once (results "Clear Time 00:00:04"), field fine after.
-- In every run only overlay 1 is ever activated (xglCdLoadOverlay is never
-  called again), so battle code presumably never gets its overlay (OV10/11/
-  12?) - next thing to find: how/where the game loads battle code.
+- Only overlay 1 is ever activated, but that is expected: field battles
+  live in OV01 itself (battleInit/battleMain/battleProc/battleDisp/
+  battleEndChk, encounter effect encEffVramCopy/grVramCopyFBtoFB). OV10 is
+  the Xenocard minigame (CardPlay*), OV12 the "rg_" robot minigame, OV02
+  the title/menu dispatcher (ControlEntry 0x218240 loads ov02, calls
+  0xA00E18 for the next module: id in bits 31-24, entry in 23-0).
+- So the battle bug is an emulation bug inside OV01. Suspects: the encounter
+  transition's VRAM copies (local->local transfers / FB-to-FB copy) and a
+  fade that never finishes (fast build: battle UI faint over black; field
+  black afterwards except characters/HUD), and something timing-related
+  that makes the battle end at once in the slow build.
+- Replays don't trigger the battle reliably (enemy movement differs per
+  run); a save just before the battle area would make it reproducible.
 - "disc file not found: \DATA\..." lines are loose-file probes; the disc
   has no DATA folder (everything is in XENOSAGA.xx archives).
 
