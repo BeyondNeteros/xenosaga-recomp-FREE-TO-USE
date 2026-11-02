@@ -75,6 +75,7 @@ const char *xsEnv(const char *key)
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <mmsystem.h>
 namespace
 {
@@ -396,8 +397,11 @@ void xs_startHeartbeat(PS2Runtime &runtime)
 #endif
             {
                 const uint64_t vsync = runtime.memory().gs().vsyncTick.load();
-                std::printf("  fps: game %.1f, vsync %.1f\n", flips.exchange(0) / double(seconds),
-                            (vsync - lastVsync) / double(seconds));
+                PROCESS_MEMORY_COUNTERS_EX mem{};
+                mem.cb = sizeof(mem);
+                K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&mem), sizeof(mem));
+                std::printf("  fps: game %.1f, vsync %.1f, memory %llu MB\n", flips.exchange(0) / double(seconds),
+                            (vsync - lastVsync) / double(seconds), static_cast<unsigned long long>(mem.PrivateUsage >> 20));
                 lastVsync = vsync;
             }
             {

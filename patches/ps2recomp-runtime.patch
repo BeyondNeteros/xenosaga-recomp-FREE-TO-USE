@@ -2216,10 +2216,10 @@ index 67c8184..dda50e7 100644
  #endif
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1_fastops.h b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
 new file mode 100644
-index 0000000..e9422ff
+index 0000000..a089c8d
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,761 @@
 +#ifndef PS2_VU1_FASTOPS_H
 +#define PS2_VU1_FASTOPS_H
 +
@@ -2646,7 +2646,19 @@ index 0000000..e9422ff
 +            {
 +                uint32_t words[4];
 +                std::memcpy(words, vu.m_state.vf[reg], sizeof(words));
-+                vu.queueStore(addr, words, d);
++                if (!vu.m_xgkick.active && data == vu.m_activeVuData)
++                {
++                    // A queued store becomes visible one cycle later, before
++                    // the next pair runs; only an active XGKICK (PATH1 reads
++                    // VU memory every cycle) could see the difference.
++                    uint32_t *dst = reinterpret_cast<uint32_t *>(data + addr);
++                    if constexpr ((d & 8u) != 0u) dst[0] = words[0];
++                    if constexpr ((d & 4u) != 0u) dst[1] = words[1];
++                    if constexpr ((d & 2u) != 0u) dst[2] = words[2];
++                    if constexpr ((d & 1u) != 0u) dst[3] = words[3];
++                }
++                else
++                    vu.queueStore(addr, words, d);
 +            }
 +        };
 +
@@ -2902,6 +2914,39 @@ index 0000000..e9422ff
 +        vu.m_viBranchBackupValid = false;
 +        if (writtenVi != 0u && dec.lowerUsage.delaysNextBranchRead)
 +            vu.recordViWriteForBranch(writtenVi, oldVi);
++    }
++
++    // pair<>() when the next pair's lower op is not a branch: nothing reads
++    // the branch-VI backup (it is only valid for the very next pair), so it
++    // is not recorded. End with plainEnd().
++    template <uint32_t U, uint32_t L>
++    static PS2X_VU1_INLINE void pairNB(Vu &vu, const Vu::DecodedInstructionPair &dec, uint8_t *data, uint32_t dataSize,
++                                       GS &gs, PS2Memory *memory)
++    {
++        if constexpr ((U & 0x80000000u) != 0u) // I-bit: the lower word is the immediate
++        {
++            upperC<U>(vu);
++            const uint32_t bits = L;
++            float immediate;
++            std::memcpy(&immediate, &bits, sizeof(immediate));
++            vu.m_state.i = vu.normalizeOperand(immediate);
++        }
++        else if (dec.upperVfShadowReg != 0u)
++        {
++            float oldVf[4];
++            float upperVf[4];
++            std::memcpy(oldVf, vu.m_state.vf[dec.upperVfShadowReg], sizeof(oldVf));
++            upperC<U>(vu);
++            std::memcpy(upperVf, vu.m_state.vf[dec.upperVfShadowReg], sizeof(upperVf));
++            std::memcpy(vu.m_state.vf[dec.upperVfShadowReg], oldVf, sizeof(oldVf));
++            lowerC<L, U>(vu, data, dataSize, gs, memory);
++            std::memcpy(vu.m_state.vf[dec.upperVfShadowReg], upperVf, sizeof(upperVf));
++        }
++        else
++        {
++            upperC<U>(vu);
++            lowerC<L, U>(vu, data, dataSize, gs, memory);
++        }
 +    }
 +
 +    static PS2X_VU1_INLINE bool finishPair(Vu &vu, const Vu::DecodedInstructionPair &dec, uint32_t codeSize)
@@ -4317,7 +4362,7 @@ index f0ad507..c3ea1de 100644
          return false;
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..1ac3bc3 100644
+index 9281d5f..9c70dac 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,14 +1,199 @@
@@ -4520,7 +4565,7 @@ index 9281d5f..1ac3bc3 100644
  
  namespace
  {
-@@ -105,12 +290,152 @@ namespace
+@@ -105,12 +290,166 @@ namespace
  }
  
  
@@ -4550,12 +4595,21 @@ index 9281d5f..1ac3bc3 100644
 +    std::deque<Command> queue;
 +    uint64_t submitted = 0;
 +    uint64_t processed = 0;
++    // Bytes queued but not processed yet. Producers (EE, VIF1/VU1 worker)
++    // wait above kMaxPendingBytes so a GS that falls behind cannot grow the
++    // queue without bound (it reached ~15 GB in a slow instrumented build).
++    static constexpr size_t kMaxPendingBytes = 64u * 1024u * 1024u;
++    size_t pendingBytes = 0;
 +    bool stop = false;
++
++    static size_t commandBytes(const Command &cmd) { return cmd.data.size() + sizeof(Command); }
 +
 +    void push(Command &&cmd)
 +    {
 +        {
-+            std::lock_guard<std::mutex> lock(mutex);
++            std::unique_lock<std::mutex> lock(mutex);
++            done.wait(lock, [&] { return stop || pendingBytes <= kMaxPendingBytes; });
++            pendingBytes += commandBytes(cmd);
 +            queue.push_back(std::move(cmd));
 +            ++submitted;
 +        }
@@ -4590,6 +4644,7 @@ index 9281d5f..1ac3bc3 100644
 +            m_async->stop = true;
 +        }
 +        m_async->wake.notify_all();
++        m_async->done.notify_all(); // producers waiting for queue space
 +        m_async->worker.join();
 +        m_async.reset();
 +        return;
@@ -4648,9 +4703,13 @@ index 9281d5f..1ac3bc3 100644
 +                if (m_backend)
 +                    m_backend->Flush();
 +            }
++            size_t batchBytes = 0;
++            for (const AsyncQueue::Command &cmd : batch)
++                batchBytes += AsyncQueue::commandBytes(cmd);
 +            {
 +                std::lock_guard<std::mutex> lock(q->mutex);
 +                q->processed += batch.size();
++                q->pendingBytes -= batchBytes;
 +            }
 +            q->done.notify_all();
 +            batch.clear();
@@ -4673,7 +4732,7 @@ index 9281d5f..1ac3bc3 100644
  void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  {
      m_localMemoryStorage = vram;
-@@ -124,6 +449,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+@@ -124,6 +463,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  
  void GS::reset()
  {
@@ -4681,7 +4740,7 @@ index 9281d5f..1ac3bc3 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      std::memset(m_ctx, 0, sizeof(m_ctx));
      m_prim = {};
-@@ -526,6 +852,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+@@ -526,6 +866,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
  
  void GS::latchHostPresentationFrame()
  {
@@ -4689,7 +4748,7 @@ index 9281d5f..1ac3bc3 100644
      GSPresentationRequest request{};
      {
          std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-@@ -640,13 +967,54 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -640,13 +981,54 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -4744,7 +4803,7 @@ index 9281d5f..1ac3bc3 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
          if (packetIndex < 48u)
-@@ -730,7 +1098,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -730,7 +1112,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
              // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
              uint32_t imageBytes = nloop * 16;
              if (offset + imageBytes > sizeBytes)
@@ -4754,7 +4813,7 @@ index 9281d5f..1ac3bc3 100644
              processImageData(data + offset, imageBytes);
              offset += imageBytes;
          }
-@@ -739,6 +1109,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -739,6 +1123,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  
  bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -4770,7 +4829,7 @@ index 9281d5f..1ac3bc3 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16u || !m_backend)
          return false;
-@@ -773,6 +1152,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -773,6 +1166,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
      if (!processed)
          return false;
  
@@ -4778,7 +4837,7 @@ index 9281d5f..1ac3bc3 100644
      ++m_nativePackedGIFPacketCount;
      return true;
  }
-@@ -784,7 +1164,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+@@ -784,7 +1178,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                             const uint8_t *data,
                             uint32_t sizeBytes)
  {
@@ -4802,7 +4861,7 @@ index 9281d5f..1ac3bc3 100644
      uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
  }
  
-@@ -1062,12 +1458,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,12 +1472,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -4829,7 +4888,7 @@ index 9281d5f..1ac3bc3 100644
      const bool interestingReg =
          regAddr == GS_REG_PRIM ||
          regAddr == GS_REG_RGBAQ ||
-@@ -1384,6 +1794,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1384,6 +1808,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      case GS_REG_TRXDIR:
      {
          m_trxdir = static_cast<uint32_t>(value & 0x3);
@@ -4876,7 +4935,7 @@ index 9281d5f..1ac3bc3 100644
  
          if (m_backend)
          {
-@@ -1578,6 +2028,86 @@ void GS::vertexKick(bool drawing)
+@@ -1578,6 +2042,86 @@ void GS::vertexKick(bool drawing)
          GSPrimitiveBatch batch = buildDrawBatch(needed);
          updatePreferredDisplaySourceForDraw(batch);
          m_backend->Submit(batch);
@@ -4963,7 +5022,7 @@ index 9281d5f..1ac3bc3 100644
          recordDrawDebugEventUnlocked(needed);
      }
  
-@@ -1608,27 +2138,82 @@ void GS::vertexKick(bool drawing)
+@@ -1608,27 +2152,82 @@ void GS::vertexKick(bool drawing)
      }
  }
  
@@ -5046,7 +5105,7 @@ index 9281d5f..1ac3bc3 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1664,12 +2249,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+@@ -1664,12 +2263,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
  
  uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
@@ -5782,7 +5841,7 @@ index 8590f14..e55e157 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..a6d08dd 100644
+index 45cb9d2..3b017e1 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -6092,15 +6151,27 @@ index 45cb9d2..a6d08dd 100644
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -735,6 +941,7 @@ bool PS2Runtime::initialize(const char *title)
+@@ -733,8 +939,19 @@ bool PS2Runtime::initialize(const char *title)
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++        // PS2X_WINDOW_MONITOR=n: open the window on monitor n (0 = primary).
++        if (const char *monitorEnv = std::getenv("PS2X_WINDOW_MONITOR"))
++        {
++            const int monitor = std::atoi(monitorEnv);
++            if (monitor >= 0 && monitor < GetMonitorCount())
++            {
++                const Vector2 origin = GetMonitorPosition(monitor);
++                SetWindowPosition(static_cast<int>(origin.x) + 64, static_cast<int>(origin.y) + 64);
++            }
++        }
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
 +        startSpu2AudioStream(m_iopSubsystem.get());
  #endif
          SetTargetFPS(60);
          if (m_debugUiInitCallback)
-@@ -1134,6 +1341,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1134,6 +1351,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -6108,7 +6179,7 @@ index 45cb9d2..a6d08dd 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1411,6 +1619,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1411,6 +1629,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  

@@ -109,6 +109,24 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Memory runaway fixed; 28-30 fps (2026-11-02, runs/vu1opt3)
+
+- Beyond saw freezes/crashes during a PGO training run: the process was at
+  ~15 GB. The GS async command queue had no limit; in the slow instrumented
+  build the GS thread fell behind the VIF1/VU1 worker and the queue grew
+  without bound. GS::AsyncQueue now blocks producers above 64 MB of queued
+  commands. The heartbeat fps line also prints process memory (normal
+  build: flat ~258 MB). Earlier "freeze and crash" reports were likely the
+  same thing plus run_game.sh force-closing the game.
+- VU1: SQ/SQI write VU memory directly when no XGKICK is active (a queued
+  store is visible before the next pair anyway); pairs needing the branch-VI
+  backup use `pairNB` when the next pair is not a branch (306 pairs).
+  116/116 captures identical.
+- `PS2X_WINDOW_MONITOR=n` opens the window on monitor n (run_game.sh passes
+  it through with --env).
+- Game (PGO retrained on the game): 27.2-30.2 fps, ~28.6 average; vif1
+  ~91%, GS ~81%: both limit now.
+
 ## GS per-texel work (2026-11-02, runs/gsopt2)
 
 - SampleTexture picks the texel decoder (CT32/CT16/CLUT) once per lookup

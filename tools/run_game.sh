@@ -25,6 +25,8 @@ done
 taskkill //IM XenosagaRecomp.exe //F >/dev/null 2>&1 || true
 cd "$GAME"
 rm -f xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin xs_spr.bin
+# PS2X_WINDOW_MONITOR=1 (env or --env) opens the window on the second
+# monitor, e.g. while Beyond is using the main one. Default: primary.
 export XS_NO_SOUND="${XS_NO_SOUND:-0}" XS_DISC_IMAGE="$DISC" PS2X_VU_CAPTURE=1 PS2X_GS_TRXLOG=1
 # VU1 blocks without native code yet (input for tools/vu1gen.py).
 export PS2X_VU1_BLOCKLOG="$(cygpath -w "$GAME" 2>/dev/null || echo "$GAME")\vu1_blocks.vbl"

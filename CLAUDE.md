@@ -136,6 +136,8 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
 - **Unattended runs:** `bash port/tools/run_game.sh <name> <seconds> --input
   port/inputs/newgame-to-tutorial.txt` boots the installed exe with the launcher's
   env, replays a pad script and copies log/frame/VRAM dump to `runs/<name>/`.
+  `--env PS2X_WINDOW_MONITOR=1` puts the window on the second monitor.
+  run_game.sh force-closes any running game: tell Beyond before runs.
   That script reaches the "Virtual Tutorial" 3D scene in about 3 minutes with
   nobody at the PC. `--record file.txt` writes live controller input as a new
   script. Replay/record live in the runtime's `ps2_pad.cpp` (code adapted from the

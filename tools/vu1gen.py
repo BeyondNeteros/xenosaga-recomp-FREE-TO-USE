@@ -62,6 +62,11 @@ def reads_flags(lower, upper):
     return not (upper & 0x80000000) and 0x10 <= ((lower >> 25) & 0x7F) <= 0x1C
 
 
+def is_branch(lower, upper):
+    # B/BAL/JR/JALR/IBxx (lower opcodes 0x20-0x2F); not when the lower word is an I-bit immediate.
+    return not (upper & 0x80000000) and 0x20 <= ((lower >> 25) & 0x7F) <= 0x2F
+
+
 def dead_flag_pairs(pairs):
     """Plain pairs whose FMAC flag entry nobody can observe. For op i take the
     next MAC/status writer j: if j is at least 4 pairs before the block's end
@@ -98,6 +103,12 @@ def emit_block(key, start, pairs):
     for i, (lower, upper, plain) in enumerate(pairs):
         if i > 0:
             lines.append(f"    F::step(vu, e + b.offsets[{i}]);")
+        if plain & 8 and i + 1 < len(pairs) and not is_branch(*pairs[i + 1][:2]):
+            # Shadow / branch-VI pair whose next pair is not a branch: the
+            # branch-VI backup would never be read, so skip recording it.
+            lines.append(f"    F::pairNB<0x{upper:08x}u, 0x{lower:08x}u>(vu, F::decoded(vu, s + {i}u), d, ds, gs, m);")
+            lines.append("    F::plainEnd(vu);")
+            continue
         if plain == 0 or plain & 8:
             # Branch / E / D / T / I-bit / last pair (0), or a pair needing the
             # shadow or branch-VI handling (8): full pair logic, constant words.
