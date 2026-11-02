@@ -109,6 +109,28 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Shareable builder and launcher (2026-11-02, launcher-test, runs/fresh1-2)
+
+`Xenosaga Launcher.bat` -> `launcher/launcher.ps1` (WinForms, no extra
+installs): pick ISO (checked in PowerShell: ISO 9660 root, SHA-1 of
+SLUS_204.69 = fd206d57...), install MSYS2 via winget + pacman packages,
+build, play, optimize, settings. Background art only from a local
+`launcher/background.png` (gitignored; Beyond's copy is local only).
+`tools/build_from_iso.py` does the build (stamps make it resumable, runs at
+below-normal priority): extract files from the ISO, clone PS2Recomp
+e563698 + runtime patch, tools, setup_recomp, assemble, runtime build
+(console hidden), copy exe + 82 DLLs to `game/`. assemble.py/vu1gen.py take
+XS_ROOT/XS_PORT/PS2RECOMP so the workspace can live in `work/`.
+
+Clean test from the ISO worked end to end (launcher-test/). The fresh build
+ran the opening at 16.6 fps (VU1 13.7 ns/cycle): no native VU1 blocks.
+After one Optimize with the blocks the game logged in 95 s: 27 fps (8.0
+ns/cycle; Beyond's PGO build is 7.0). So the first build ends with a tuning
+step: the game plays `inputs/newgame-to-tutorial.txt` by itself for 210 s
+with PS2X_VU1_BLOCKLOG, then the blocks are built in. Logs are archived in
+`work/vu1blocks/` (the game only logs blocks it has no native code for, so
+each Optimize must keep the earlier ones). Not in the builder yet: PGO.
+
 ## Gameplay options from Beyond's PCSX2 patch (2026-11-02, runs/opts1-4)
 
 settings.ini `[gameplay]`, implemented in `xenosaga_overlays.cpp` as

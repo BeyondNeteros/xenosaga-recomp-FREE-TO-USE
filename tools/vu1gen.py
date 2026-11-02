@@ -15,13 +15,14 @@ PS2Recomp/ps2xRuntime/src/runner (assemble.py also copies it). The output is
 derived from game code: never commit it.
 """
 import shutil
+import os
 import struct
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("XS_ROOT", Path(__file__).resolve().parents[2]))
 OUT = ROOT / "recomp" / "xenosaga_vu1_blocks.cpp"
-RUNNER = ROOT / "PS2Recomp" / "ps2xRuntime" / "src" / "runner"
+RUNNER = Path(os.environ.get("PS2RECOMP", ROOT / "PS2Recomp")) / "ps2xRuntime" / "src" / "runner"
 
 
 def read_logs(paths):

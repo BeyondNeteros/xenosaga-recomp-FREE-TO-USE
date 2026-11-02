@@ -21,10 +21,34 @@ areas, at a locked 30 fps in the tutorial.
 | Speed | 30 fps in the tutorial; first field area ~20 fps until a battle |
 | Display | 4:3 / 16:9 (experimental), fullscreen, sharp scaling, screenshots |
 
+## Getting the game running (players)
+
+This download contains no game code. You need your own copy of
+**Xenosaga Episode I (USA, SLUS-20469)** as a disc image (.iso), and a PC
+with Windows 10/11, a CPU from 2013 or newer (AVX2), and about 10 GB free.
+
+1. Double-click **`Xenosaga Launcher.bat`**.
+2. **Choose disc image...** and pick your .iso. The launcher checks it is
+   the right disc.
+3. **Install build tools** (first time only): installs MSYS2, a free
+   compiler toolkit, through Windows' winget (about 1.5 GB).
+4. **Build the game**: copies the game program off your disc, downloads
+   [PS2Recomp](https://github.com/ran-j/PS2Recomp), recompiles the game into
+   C++ and builds it. 15-30 minutes, once. Everything stays on your PC
+   (`work/` and `game/` next to the launcher).
+5. **PLAY**. Your disc image stays where it is; the game reads it directly.
+
+**Optimize** (after you've played a while): the game notes the graphics
+routines it runs, and Optimize builds fast versions of them in (a few
+minutes). **Settings** opens `settings.ini`.
+
+Want a picture behind the launcher? Put it at `launcher/background.png`.
+
 ## Playing
 
-Start the game with `Launch Xenosaga.bat`. On first start it writes
-`settings.ini` next to the exe; open it with Notepad to change the options.
+Start the game with the launcher's **PLAY** (a hand-made install uses
+`dist/Launch Xenosaga.bat`). On first start it writes `settings.ini` next to
+the exe; the launcher's **Settings** opens it.
 
 | Key | Does |
 | --- | --- |

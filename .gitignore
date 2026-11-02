@@ -11,3 +11,9 @@ xs_vram.bin
 *.bmp
 vu1_capture.bin
 xs_ram.bin
+
+# Launcher: the build workspace, the finished game, and personal files
+work/
+game/
+launcher.ini
+launcher/background.*

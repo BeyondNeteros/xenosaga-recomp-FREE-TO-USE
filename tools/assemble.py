@@ -26,7 +26,7 @@ import os
 #   <PS2RECOMP>/           PS2Recomp checkout (default <XS_ROOT>/PS2Recomp)
 ROOT = Path(os.environ.get("XS_ROOT", Path(__file__).resolve().parents[2]))
 RECOMP = ROOT / "recomp"
-PORT_SRC = ROOT / "port" / "src"
+PORT_SRC = Path(os.environ.get("XS_PORT", ROOT / "port")) / "src"
 RUNTIME = Path(os.environ.get("PS2RECOMP", ROOT / "PS2Recomp")) / "ps2xRuntime"
 RUNNER = RUNTIME / "src" / "runner"
 INCLUDE = RUNTIME / "include"
