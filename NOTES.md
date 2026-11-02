@@ -123,17 +123,15 @@ looked at: sound (skipped), FMV playback quality, later scenes/battles
   dispatchGuestBranch stops at a checkpoint, cleared by the scheduler before
   it resumes a thread); dispatchGuestBranch leaves ctx->pc alone when set.
   This affected any function whose loop starts at its first instruction.
-- Shion HP display ("0080/0000" etc.), investigated, not fixed: stats are
-  right (UP 0xA57E90: +0x00 max HP 80, +0x34 HP 80); menuNumPut gets 80
-  and builds the right digit sprites every frame (big font v=144, 12 px per
-  digit; small font v=160, 10 px). The small "8" (u=80..91, v=160..174,
-  TEX0 tbp 0x3800 tbw 16 T8) is drawn as "0"; KOS-MOS's small digits only
-  use u<=31. With PS2X_GS_THREADS=1 it is steady "0080/0000" (batching only
-  adds the flicker). The HUD font area at 0x3800 is re-uploaded during the
-  frame (xglPacketTextureTrans 256x128 / 512x128 / 472x128), so suspect the
-  texture upload of that glyph area (e.g. the 472-wide upload) or CLUT, not
-  the sprite. Tools: XS_GS_ARM_AT=<battleMain n> + PS2X_GS_CAPTURE=99999,1
-  captures a battle frame; scratchpad gscap_sprites.py lists sprites.
+- Shion HP display ("0080/0000" etc.): NOT a game rendering bug. Only the
+  heartbeat snapshot (xs_frame.bmp / XS_FRAME_KEEP frames) shows it: it
+  reads VRAM at an arbitrary moment, mid-way through redrawing the HUD. The
+  live end-of-frame VRAM in a battle GS capture (runs/hpcap2) shows
+  "0080/0080", and gs_replay of that frame is byte-identical to it. (The HUD
+  font at TEX0 0x3800 is uploaded as CT32 512x128 and read as T8; later
+  uploads in the same frame overwrite it, so a mid-frame snapshot can catch
+  digits drawn after... it is the snapshot, not the GS.) Don't trust
+  heartbeat frames for fine HUD detail; use a GS capture's end VRAM.
 - PS2X_GUEST_PRINTF=1 prints the game's own printf output (very useful:
   "** MDL read Size", "** Create (ID=..)", "** NBread: ...").
 - Tutorial battle replay now: enemy drawn, both characters act, results
