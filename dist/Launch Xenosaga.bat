@@ -1,6 +1,7 @@
 @echo off
 rem Xenosaga Episode I: Recompiled (work in progress)
 rem Runs the PC port against your own disc image. Edit DISC if your ISO moves.
+rem Display, sound and controls are set in settings.ini (made on first start).
 rem Note: paths here contain parentheses, so they are only used outside ( ) blocks.
 setlocal
 cd /d "%~dp0"
@@ -20,40 +21,37 @@ copy /y "%ELF_SOURCE%" "SLUS_204.69" >nul
 if errorlevel 1 goto elf_failed
 :elf_ok
 
-rem Builds arrive split in parts (file transfer limit); rejoin a new build once.
-if not exist "XenosagaRecomp.exe.part0" goto exe_ready
-echo Assembling XenosagaRecomp.exe...
-copy /b /y "XenosagaRecomp.exe.part0"+"XenosagaRecomp.exe.part1"+"XenosagaRecomp.exe.part2" "XenosagaRecomp.exe" >nul
-if errorlevel 1 goto assemble_failed
-del "XenosagaRecomp.exe.part0" "XenosagaRecomp.exe.part1" "XenosagaRecomp.exe.part2"
-:exe_ready
-
 rem Sound runs on the game's own sound driver and the emulated SPU2.
 rem Set XS_NO_SOUND=1 to skip the sound driver if a scene hangs on it.
 set "XS_NO_SOUND=0"
 set "XS_DISC_IMAGE=%DISC%"
-rem Debug: when VU1 is the bottleneck, record 300 VU1 calls to vu1_capture.bin.
-set "PS2X_VU_CAPTURE=1"
 rem VU1 code blocks without a native version yet are listed in vu1_blocks.vbl,
-rem so the next build can include them (tools/vu1gen.py).
+rem so the next build can include them (tools/vu1gen.py). Small and cheap.
 set "PS2X_VU1_BLOCKLOG=%~dp0vu1_blocks.vbl"
-rem Debug: log GS texture uploads (first 600) to xenosaga.log.
-set "PS2X_GS_TRXLOG=1"
-set "PS2X_GS_TRXDUMP=3a80,38b2,3a00"
+
+rem Debug recorders (off for normal play; they cost speed). Remove "rem" to use:
+rem   VU1 capture when VU1 is the bottleneck (vu1_capture.bin):
+rem set "PS2X_VU_CAPTURE=1"
+rem   GS texture upload log:
+rem set "PS2X_GS_TRXLOG=1"
+rem   The game's own debug messages:
+rem set "PS2X_GUEST_PRINTF=1"
 
 echo Starting Xenosaga Episode I: Recompiled...
 echo Log: "%~dp0xenosaga.log"
+echo Keys: F11 fullscreen, F3 fps, F4 filter, F5 picture shape, F12 screenshot
 "%~dp0XenosagaRecomp.exe" "%~dp0SLUS_204.69" > "%~dp0xenosaga.log" 2>&1
-echo Exited with code %errorlevel%. See xenosaga.log
+if errorlevel 1 goto crashed
+goto quit
+
+:crashed
+echo The game exited with code %errorlevel%. See xenosaga.log
 goto end
 
 :elf_failed
 echo Could not copy "%ELF_SOURCE%"
 goto end
 
-:assemble_failed
-echo Failed to assemble XenosagaRecomp.exe
-goto end
-
 :end
 pause
+:quit

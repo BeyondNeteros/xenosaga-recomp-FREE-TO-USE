@@ -7,18 +7,44 @@ built by statically recompiling the original game code with [PS2Recomp](https://
 
 ## Status
 
-Early: boots to the title screen and into the game, but 3D scenes don't render yet.
+Playable from the start through the Virtual Tutorial and into the first field
+areas, at a locked 30 fps in the tutorial.
 
 | Part | State |
 |---|---|
 | Main executable (`SLUS_204.69`) | Recompiles cleanly |
 | Overlays (`OV01/02/10/11/12.OVL`) | Recompile cleanly; swapped in at runtime |
 | Boot, disc access (dual-layer ISO) | Working |
-| Title screen, menus, text boxes | Rendering (title looks hazy) |
-| In-game FMVs | Playing (title attract movie not yet) |
-| Controls | Working |
-| 3D scenes | Not rendering (bad world-to-clip matrix); VU1 far too slow |
-| Sound | Skipped (sound driver RPC not working yet) |
+| Menus, text, FMVs, 3D scenes | Rendering |
+| Battles | Tutorial battle plays through; field battles being tested |
+| Sound and music | Working (game's own sound driver on an emulated SPU2) |
+| Speed | 30 fps in the tutorial; first field area ~20 fps until a battle |
+| Display | 4:3 / 16:9 (experimental), fullscreen, sharp scaling, screenshots |
+
+## Playing
+
+Start the game with `Launch Xenosaga.bat`. On first start it writes
+`settings.ini` next to the exe; open it with Notepad to change the options.
+
+| Key | Does |
+| --- | --- |
+| F11 or Alt+Enter | Borderless fullscreen on/off |
+| F3 | Frame-rate counter |
+| F4 | Scaling filter: sharp, smooth, pixel |
+| F5 | Picture shape: 4:3, 16:9 widescreen, stretch, native |
+| F12 | Screenshot (into the `screenshots` folder) |
+
+- **Picture:** shown at the original TV shape (4:3) by default, scaled with a
+  "sharp bilinear" filter (crisp, without uneven pixels). `16:9` widens the
+  3D view; menus and the HUD are stretched with it (experimental).
+- **Controls:** any controller and the keyboard work at the same time.
+  Sticks get a small deadzone so worn sticks don't drift; analog triggers
+  count as L2/R2. Keyboard: arrows/WASD move, X/Space = Cross, C/Esc/Backspace
+  = Circle, Z = Square, V = Triangle, Q/E = L1/R1, Shift = L2/R2, Enter =
+  Start, Tab = Select. Escape no longer quits the game.
+- **Sound:** `volume` in settings.ini; the game goes quiet while another
+  window is in front (`mute_when_unfocused`).
+- The window remembers its size; the mouse pointer hides after two seconds.
 
 ## How it works
 

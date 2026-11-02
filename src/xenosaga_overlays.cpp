@@ -28,6 +28,7 @@ void xs_register_ov11(PS2Runtime::RecompiledFunction *t);
 void xs_register_ov12(PS2Runtime::RecompiledFunction *t);
 void xs_configureDiscImage();
 void ps2x_armGsCapture(); // gs_frontend.cpp
+bool ps2x_hostWidescreen(); // ps2_runtime.cpp (settings.ini aspect = 16:9)
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -274,6 +275,40 @@ namespace
         }
     }
 
+    // Widescreen: xglCameraViewScreen (0x22B9B8) fills the camera's
+    // projection; +0x28 (camera +0x10 block, field 0x18) is the horizontal
+    // scale, rebuilt from scratch on every call. Narrowing it by 3/4 makes the
+    // 4:3 frame hold a 16:9 field of view (the presenter stretches it back),
+    // and the culling frustum built from it in xglCameraViewTravel widens too.
+    constexpr uint32_t kCameraViewScreenAddr = 0x0022B9B8u;
+    PS2Runtime::RecompiledFunction g_cameraViewScreenOriginal = nullptr;
+
+    void cameraViewScreen_widescreen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t camera = GPR_U32(ctx, 4);
+        g_cameraViewScreenOriginal(rdram, ctx, runtime);
+        if (!ps2x_hostWidescreen())
+            return;
+        static const float scale = [] {
+            const char *env = std::getenv("XS_WIDESCREEN_SCALE"); // for experiments
+            return env ? static_cast<float>(std::atof(env)) : 0.75f;
+        }();
+        float horizontal;
+        std::memcpy(&horizontal, rdram + ((camera + 0x28u) & kRdramMask), 4);
+        horizontal *= scale;
+        std::memcpy(rdram + ((camera + 0x28u) & kRdramMask), &horizontal, 4);
+    }
+
+    void installWidescreenHook()
+    {
+        const uint32_t slot = (kCameraViewScreenAddr - g_ps2RecompiledFunctionTableBase) >> 2;
+        if (g_cameraViewScreenOriginal || slot >= g_ps2RecompiledFunctionTableSlotCount ||
+            !g_ps2RecompiledFunctionTable[slot])
+            return;
+        g_cameraViewScreenOriginal = g_ps2RecompiledFunctionTable[slot];
+        g_ps2RecompiledFunctionTable[slot] = cameraViewScreen_widescreen;
+    }
+
     void xglCdLoadOverlay_hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
         const uint32_t id = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4])) & 0xFFu;
@@ -287,6 +322,7 @@ namespace
         if (!readOverlayFile(id, data, source) || !loadOverlayImage(rdram, data))
             std::cerr << "[xenosaga] failed to load overlay " << id << " (" << source << ")" << std::endl;
         activateOverlayFunctions(id);
+        installWidescreenHook();
         if (id == 1)
             if (const char *trace = std::getenv("XS_BATTLE_TRACE"); trace && trace[0] == '1')
                 installBattleTrace(std::make_index_sequence<sizeof(g_battleTrace) / sizeof(g_battleTrace[0])>{});

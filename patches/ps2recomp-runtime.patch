@@ -5750,12 +5750,14 @@ index 37b6a4d..264a4f6 100644
          // path above; kept correct for direct callers.
          const uint32_t off = address & 7u;
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..e55e157 100644
+index 8590f14..e717c2d 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
-@@ -1,6 +1,11 @@
+@@ -1,6 +1,13 @@
  #include "runtime/ps2_pad.h"
  #include "ps2_host_backend.h"
++#include <algorithm>
++#include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
  #include <cstring>
@@ -5765,7 +5767,7 @@ index 8590f14..e55e157 100644
  
  namespace
  {
-@@ -23,9 +28,291 @@ namespace
+@@ -23,9 +30,291 @@ namespace
      constexpr uint16_t PAD_L1 = 0x0400u;
      constexpr uint16_t PAD_R2 = 0x0200u;
      constexpr uint16_t PAD_L2 = 0x0100u;
@@ -6058,7 +6060,7 @@ index 8590f14..e55e157 100644
  {
      if (!data || size < 32)
          return false;
-@@ -37,6 +324,18 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -37,58 +326,92 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
      data[3] = 0xFF;
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
  
@@ -6075,9 +6077,144 @@ index 8590f14..e55e157 100644
 +    }
 +
      uint16_t btns = 0xFFFFu;
-     constexpr int kGamepad = 0;
-     const bool useGamepad = IsGamepadAvailable(kGamepad);
-@@ -121,5 +420,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+     auto clearBit = [&btns](uint16_t mask)
+     { btns &= ~mask; };
+ 
+-    if (useGamepad)
++    // Controller and keyboard both work at once (first connected controller).
++    int gamepad = -1;
++    for (int i = 0; i < 4 && gamepad < 0; ++i)
++        if (IsGamepadAvailable(i))
++            gamepad = i;
++
++    if (port == 0 && gamepad >= 0)
+     {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+-            clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+-            clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+-            clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+-            clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+-            clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+-            clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+-            clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+-            clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+-            clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
++        const int g = gamepad;
++        static constexpr struct
++        {
++            int button;
++            uint16_t mask;
++        } kButtons[] = {
++            {GAMEPAD_BUTTON_LEFT_FACE_UP, PAD_UP},
++            {GAMEPAD_BUTTON_LEFT_FACE_DOWN, PAD_DOWN},
++            {GAMEPAD_BUTTON_LEFT_FACE_LEFT, PAD_LEFT},
++            {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, PAD_RIGHT},
++            {GAMEPAD_BUTTON_RIGHT_FACE_DOWN, PAD_CROSS},
++            {GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, PAD_CIRCLE},
++            {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, PAD_SQUARE},
++            {GAMEPAD_BUTTON_RIGHT_FACE_UP, PAD_TRIANGLE},
++            {GAMEPAD_BUTTON_LEFT_TRIGGER_1, PAD_L1},
++            {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, PAD_R1},
++            {GAMEPAD_BUTTON_LEFT_TRIGGER_2, PAD_L2},
++            {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, PAD_R2},
++            {GAMEPAD_BUTTON_MIDDLE_RIGHT, PAD_START},
++            {GAMEPAD_BUTTON_MIDDLE_LEFT, PAD_SELECT},
++            {GAMEPAD_BUTTON_LEFT_THUMB, PAD_L3},
++            {GAMEPAD_BUTTON_RIGHT_THUMB, PAD_R3},
++        };
++        for (const auto &entry : kButtons)
++            if (IsGamepadButtonDown(g, entry.button))
++                clearBit(entry.mask);
++        // Analog triggers rest at -1; count a quarter pull as pressed.
++        if (GetGamepadAxisMovement(g, GAMEPAD_AXIS_LEFT_TRIGGER) > -0.5f)
+             clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
++        if (GetGamepadAxisMovement(g, GAMEPAD_AXIS_RIGHT_TRIGGER) > -0.5f)
+             clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+-            clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+-            clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+-            clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+-            clearBit(PAD_R3);
+-
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
++
++        // Sticks: radial deadzone (worn sticks drift), rescaled so the full
++        // range is still reached, then mapped to the DualShock 0-255 range.
++        const auto stick = [&](int axisX, int axisY, uint8_t &outX, uint8_t &outY)
++        {
++            constexpr float kDeadzone = 0.15f;
++            float x = GetGamepadAxisMovement(g, axisX);
++            float y = GetGamepadAxisMovement(g, axisY);
++            const float length = std::sqrt(x * x + y * y);
++            if (length < kDeadzone)
++            {
++                x = y = 0.0f;
++            }
++            else
++            {
++                const float scaled = std::min(1.0f, (length - kDeadzone) / (1.0f - kDeadzone));
++                x = x / length * scaled;
++                y = y / length * scaled;
++            }
++            const auto toByte = [](float v)
++            { return static_cast<uint8_t>(std::clamp(128.0f + v * 127.5f, 0.0f, 255.0f)); };
++            outX = toByte(x);
++            outY = toByte(y);
++        };
++        stick(GAMEPAD_AXIS_LEFT_X, GAMEPAD_AXIS_LEFT_Y, data[6], data[7]);
++        stick(GAMEPAD_AXIS_RIGHT_X, GAMEPAD_AXIS_RIGHT_Y, data[4], data[5]);
+     }
+-    else
++
++    if (port == 0)
+     {
++        const bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT); // Alt+Enter = fullscreen
+         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+             clearBit(PAD_UP);
+         if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+@@ -99,7 +422,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_RIGHT);
+         if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+             clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
++        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE) || IsKeyDown(KEY_BACKSPACE))
+             clearBit(PAD_CIRCLE);
+         if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+             clearBit(PAD_SQUARE);
+@@ -113,7 +436,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_L2);
+         if (IsKeyDown(KEY_RIGHT_SHIFT))
+             clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
++        if (IsKeyDown(KEY_ENTER) && !alt)
+             clearBit(PAD_START);
+         if (IsKeyDown(KEY_TAB))
+             clearBit(PAD_SELECT);
+@@ -121,5 +444,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
  
      data[2] = static_cast<uint8_t>(btns & 0xFF);
      data[3] = static_cast<uint8_t>(btns >> 8);
@@ -6094,7 +6231,7 @@ index 8590f14..e55e157 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..803b1f9 100644
+index 45cb9d2..91730ea 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -6105,10 +6242,23 @@ index 45cb9d2..803b1f9 100644
  #include "ps2_runtime.h"
  #include "ps2_log.h"
  #include "ps2_stubs.h"
-@@ -27,6 +31,106 @@
+@@ -13,6 +17,7 @@
+ #include "ps2_host_backend.h"
+ #include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
++#include "rlgl.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -26,6 +31,110 @@
+ #include <thread>
  #include <unordered_map>
  #include <sstream>
- 
++#include <cctype>
++#include <cmath>
++#include <ctime>
++#include <string>
++
 +namespace
 +{
 +    // PS2X_VU_CAPTURE=1: record VU1 calls (state + code + data memory) to
@@ -6208,11 +6358,390 @@ index 45cb9d2..803b1f9 100644
 +namespace
 +{
 +}
-+
+ 
  namespace ps2_stubs
  {
-     void resetSifState();
-@@ -373,6 +477,38 @@ namespace
+@@ -49,6 +158,379 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
+ static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
+ static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+ #endif
++
++// ---------------------------------------------------------------------------
++// Player settings (settings.ini next to the exe) and the host presenter:
++// aspect-correct scaling, sharp/smooth/pixel filtering, borderless fullscreen,
++// screenshots, an fps overlay and on-screen notices.
++namespace
++{
++    struct HostSettings
++    {
++        bool fullscreen = false;
++        std::string aspect = "4:3";   // 4:3, 16:9 (widescreen), stretch, native
++        std::string filter = "sharp"; // sharp, smooth, pixel
++        bool integerScale = false;
++        bool vsync = true;
++        int monitor = -1;             // -1 = the monitor the OS picks
++        bool showFps = false;
++        int volume = 100;             // 0-100
++        bool muteWhenUnfocused = true;
++        bool hideCursor = true;
++        int windowWidth = 0;          // 0 = pick from the monitor size
++        int windowHeight = 0;
++    };
++
++    HostSettings g_hostSettings;
++    std::string g_settingsPath;
++    std::string g_windowStatePath;
++
++    constexpr const char *kDefaultSettingsText =
++        "; Xenosaga Episode I: Recompiled - settings\n"
++        "; Edit with Notepad while the game is closed. Delete this file to reset.\n"
++        "\n"
++        "[display]\n"
++        "; Start in borderless fullscreen (toggle any time with F11 or Alt+Enter).\n"
++        "fullscreen = false\n"
++        "; Picture shape: 4:3 (original TV shape), 16:9 (widescreen: wider 3D view,\n"
++        "; experimental), stretch (fill the window), native (square PS2 pixels).\n"
++        "aspect = 4:3\n"
++        "; Scaling filter: sharp (crisp, no shimmer), smooth (soft), pixel (blocky).\n"
++        "; Cycle in game with F4.\n"
++        "filter = sharp\n"
++        "; Only scale by whole numbers (2x, 3x...) for perfectly even pixels.\n"
++        "integer_scale = false\n"
++        "; Sync to the monitor refresh (no tearing).\n"
++        "vsync = true\n"
++        "; Monitor to open on: -1 = default, 0 = primary, 1 = second...\n"
++        "monitor = -1\n"
++        "; Show the frame rate in the corner (toggle with F3).\n"
++        "show_fps = false\n"
++        "; Hide the mouse pointer over the game after two seconds.\n"
++        "hide_cursor = true\n"
++        "\n"
++        "[audio]\n"
++        "; Master volume, 0-100.\n"
++        "volume = 100\n"
++        "; Silence the game while another window is in front.\n"
++        "mute_when_unfocused = true\n"
++        "\n"
++        "; Keys: F11 / Alt+Enter fullscreen, F3 fps, F4 filter, F5 picture shape,\n"
++        "; F12 screenshot (saved to the screenshots folder).\n";
++
++    std::string trimCopy(const std::string &text)
++    {
++        const auto first = text.find_first_not_of(" \t\r\n");
++        if (first == std::string::npos)
++            return {};
++        const auto last = text.find_last_not_of(" \t\r\n");
++        return text.substr(first, last - first + 1);
++    }
++
++    bool parseBool(const std::string &value, bool fallback)
++    {
++        std::string v;
++        for (char c : value)
++            v.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
++        if (v == "1" || v == "true" || v == "yes" || v == "on")
++            return true;
++        if (v == "0" || v == "false" || v == "no" || v == "off")
++            return false;
++        return fallback;
++    }
++
++    void applySetting(HostSettings &s, const std::string &key, const std::string &value)
++    {
++        if (key == "fullscreen") s.fullscreen = parseBool(value, s.fullscreen);
++        else if (key == "aspect") s.aspect = value;
++        else if (key == "filter") s.filter = value;
++        else if (key == "integer_scale") s.integerScale = parseBool(value, s.integerScale);
++        else if (key == "vsync") s.vsync = parseBool(value, s.vsync);
++        else if (key == "monitor") s.monitor = std::atoi(value.c_str());
++        else if (key == "show_fps") s.showFps = parseBool(value, s.showFps);
++        else if (key == "hide_cursor") s.hideCursor = parseBool(value, s.hideCursor);
++        else if (key == "volume") s.volume = std::clamp(std::atoi(value.c_str()), 0, 100);
++        else if (key == "mute_when_unfocused") s.muteWhenUnfocused = parseBool(value, s.muteWhenUnfocused);
++        else if (key == "window_width") s.windowWidth = std::atoi(value.c_str());
++        else if (key == "window_height") s.windowHeight = std::atoi(value.c_str());
++    }
++
++    void readIniInto(HostSettings &s, const std::string &path)
++    {
++        std::ifstream in(path);
++        std::string line;
++        while (std::getline(in, line))
++        {
++            line = trimCopy(line);
++            if (line.empty() || line[0] == ';' || line[0] == '#' || line[0] == '[')
++                continue;
++            const auto eq = line.find('=');
++            if (eq == std::string::npos)
++                continue;
++            std::string value = trimCopy(line.substr(eq + 1));
++            if (const auto comment = value.find(';'); comment != std::string::npos)
++                value = trimCopy(value.substr(0, comment));
++            applySetting(s, trimCopy(line.substr(0, eq)), value);
++        }
++    }
++
++    void loadHostSettings()
++    {
++        const std::string dir = GetApplicationDirectory();
++        g_settingsPath = dir + "settings.ini";
++        g_windowStatePath = dir + "window_state.ini";
++        if (!FileExists(g_settingsPath.c_str()))
++        {
++            std::ofstream out(g_settingsPath);
++            out << kDefaultSettingsText;
++        }
++        readIniInto(g_hostSettings, g_settingsPath);
++        readIniInto(g_hostSettings, g_windowStatePath); // remembered window size
++        std::printf("[settings] %s: fullscreen=%d aspect=%s filter=%s integer=%d vsync=%d volume=%d\n",
++                    g_settingsPath.c_str(), g_hostSettings.fullscreen ? 1 : 0, g_hostSettings.aspect.c_str(),
++                    g_hostSettings.filter.c_str(), g_hostSettings.integerScale ? 1 : 0, g_hostSettings.vsync ? 1 : 0,
++                    g_hostSettings.volume);
++    }
++
++    void saveWindowState()
++    {
++        if (g_windowStatePath.empty() || IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
++            return;
++        std::ofstream out(g_windowStatePath);
++        out << "; Written by the game: the last window size.\n";
++        out << "window_width = " << GetScreenWidth() << "\n";
++        out << "window_height = " << GetScreenHeight() << "\n";
++    }
++
++    struct Presenter
++    {
++        RenderTexture2D prescale{};
++        int prescaleW = 0;
++        int prescaleH = 0;
++        std::string notice;
++        double noticeUntil = 0.0;
++        double lastMouseMove = 0.0;
++        Vector2 lastMouse{0.0f, 0.0f};
++        bool cursorHidden = false;
++        // Game frame rate: the game flips its display buffer once per frame.
++        uint32_t lastDisplayFbp = 0xFFFFFFFFu;
++        int flips = 0;
++        double fpsWindowStart = 0.0;
++        float gameFps = 0.0f;
++        bool wasFocused = true;
++    };
++    Presenter g_presenter;
++
++    void showNotice(const std::string &text)
++    {
++        g_presenter.notice = text;
++        g_presenter.noticeUntil = GetTime() + 2.0;
++    }
++
++    // Display aspect ratio of the picture for the current setting.
++    float targetAspect(float srcW, float srcH)
++    {
++        const std::string &a = g_hostSettings.aspect;
++        if (a == "16:9")
++            return 16.0f / 9.0f;
++        if (a == "native")
++            return srcW / srcH;
++        return 4.0f / 3.0f;
++    }
++
++    Rectangle computeDestination(float srcW, float srcH)
++    {
++        const float screenW = static_cast<float>(GetScreenWidth());
++        const float screenH = static_cast<float>(GetScreenHeight());
++        if (g_hostSettings.aspect == "stretch")
++            return Rectangle{0.0f, 0.0f, screenW, screenH};
++        const float aspect = targetAspect(srcW, srcH);
++        float dstH = std::min(screenH, screenW / aspect);
++        if (g_hostSettings.integerScale && dstH >= srcH)
++            dstH = std::floor(dstH / srcH) * srcH;
++        const float dstW = dstH * aspect;
++        return Rectangle{std::floor((screenW - dstW) * 0.5f), std::floor((screenH - dstH) * 0.5f), dstW, dstH};
++    }
++
++    bool useSharpFilter()
++    {
++        return g_hostSettings.filter != "smooth" && g_hostSettings.filter != "pixel";
++    }
++
++    // Sharp bilinear, step 1 (before BeginDrawing: texture mode in the middle
++    // of a frame loses raylib's screen scaling on high-DPI desktops): blow the
++    // picture up by whole numbers with nearest filtering. Step 2 then blends
++    // only the last fraction of a pixel, so it stays crisp like "pixel"
++    // without uneven, shimmering pixel widths.
++    void prepareGameFrame(Texture2D &frameTex, float srcW, float srcH)
++    {
++        if (!useSharpFilter())
++            return;
++        const Rectangle dst = computeDestination(srcW, srcH);
++        const float dpi = static_cast<float>(GetRenderWidth()) / std::max(1, GetScreenWidth());
++        const int kx = std::max(1, static_cast<int>(std::ceil(dst.width * dpi / srcW)));
++        const int ky = std::max(1, static_cast<int>(std::ceil(dst.height * dpi / srcH)));
++        const int w = static_cast<int>(srcW) * kx;
++        const int h = static_cast<int>(srcH) * ky;
++        Presenter &p = g_presenter;
++        if (w != p.prescaleW || h != p.prescaleH)
++        {
++            if (p.prescaleW != 0)
++                UnloadRenderTexture(p.prescale);
++            p.prescale = LoadRenderTexture(w, h);
++            SetTextureFilter(p.prescale.texture, TEXTURE_FILTER_BILINEAR);
++            p.prescaleW = w;
++            p.prescaleH = h;
++        }
++        SetTextureFilter(frameTex, TEXTURE_FILTER_POINT);
++        BeginTextureMode(p.prescale);
++        ClearBackground(BLACK);
++        DrawTexturePro(frameTex, Rectangle{0.0f, 0.0f, srcW, srcH},
++                       Rectangle{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)}, Vector2{0.0f, 0.0f}, 0.0f,
++                       WHITE);
++        EndTextureMode();
++    }
++
++    void drawGameFrame(Texture2D &frameTex, float srcW, float srcH)
++    {
++        const Rectangle dst = computeDestination(srcW, srcH);
++        if (!useSharpFilter())
++        {
++            SetTextureFilter(frameTex, g_hostSettings.filter == "smooth" ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
++            DrawTexturePro(frameTex, Rectangle{0.0f, 0.0f, srcW, srcH}, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            return;
++        }
++        // Render textures are stored upside down.
++        const Presenter &p = g_presenter;
++        DrawTexturePro(p.prescale.texture,
++                       Rectangle{0.0f, 0.0f, static_cast<float>(p.prescaleW), -static_cast<float>(p.prescaleH)}, dst,
++                       Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++    }
++
++    void saveScreenshot()
++    {
++        rlDrawRenderBatchActive(); // the frame is still queued in raylib's batch
++        // Not LoadImageFromScreen: on scaled (high-DPI) desktops it reads past
++        // the real framebuffer and the picture comes out shifted into a corner.
++        Image shot{};
++        shot.width = GetRenderWidth();
++        shot.height = GetRenderHeight();
++        shot.mipmaps = 1;
++        shot.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++        shot.data = rlReadScreenPixels(shot.width, shot.height);
++        ImageFormat(&shot, PIXELFORMAT_UNCOMPRESSED_R8G8B8); // no transparency in the PNG
++        const std::string dir = std::string(GetApplicationDirectory()) + "screenshots";
++        if (!DirectoryExists(dir.c_str()))
++            MakeDirectory(dir.c_str());
++        const std::time_t now = std::time(nullptr);
++        char stamp[32];
++        std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
++        static int sequence = 0;
++        const std::string path = dir + "/xenosaga_" + stamp + "_" + std::to_string(sequence++) + ".png";
++        // Encoding a PNG takes a moment; do it off the presentation thread.
++        std::thread([shot, path]() mutable
++                    {
++            ExportImage(shot, path.c_str());
++            UnloadImage(shot); })
++            .detach();
++        showNotice("Screenshot saved");
++    }
++
++    void handleHostHotkeys()
++    {
++        HostSettings &s = g_hostSettings;
++        const bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
++        if (IsKeyPressed(KEY_F11) || (alt && IsKeyPressed(KEY_ENTER)))
++        {
++            ToggleBorderlessWindowed();
++            showNotice(IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ? "Fullscreen" : "Windowed");
++        }
++        if (IsKeyPressed(KEY_F3))
++            s.showFps = !s.showFps;
++        if (IsKeyPressed(KEY_F4))
++        {
++            s.filter = s.filter == "sharp" ? "smooth" : (s.filter == "smooth" ? "pixel" : "sharp");
++            showNotice("Filter: " + s.filter);
++        }
++        if (IsKeyPressed(KEY_F5))
++        {
++            s.aspect = s.aspect == "4:3" ? "16:9" : (s.aspect == "16:9" ? "stretch" : (s.aspect == "stretch" ? "native" : "4:3"));
++            showNotice("Picture: " + s.aspect);
++        }
++        if (IsKeyPressed(KEY_F12))
++            saveScreenshot();
++    }
++
++    void updateHostWindowState()
++    {
++        Presenter &p = g_presenter;
++        const double now = GetTime();
++        // Mouse pointer: hide over the game when idle.
++        const Vector2 mouse = GetMousePosition();
++        if (mouse.x != p.lastMouse.x || mouse.y != p.lastMouse.y)
++        {
++            p.lastMouse = mouse;
++            p.lastMouseMove = now;
++        }
++        const bool wantHidden = g_hostSettings.hideCursor && IsWindowFocused() && now - p.lastMouseMove > 2.0;
++        if (wantHidden != p.cursorHidden)
++        {
++            if (wantHidden)
++                HideCursor();
++            else
++                ShowCursor();
++            p.cursorHidden = wantHidden;
++        }
++        // Volume, muted while another window is in front.
++        const bool focused = IsWindowFocused();
++        const float volume = (g_hostSettings.muteWhenUnfocused && !focused) ? 0.0f : g_hostSettings.volume / 100.0f;
++        SetMasterVolume(volume);
++        p.wasFocused = focused;
++    }
++
++    void countGameFrame(uint32_t displayFbp)
++    {
++        Presenter &p = g_presenter;
++        if (displayFbp != p.lastDisplayFbp)
++        {
++            p.lastDisplayFbp = displayFbp;
++            ++p.flips;
++        }
++        const double now = GetTime();
++        if (now - p.fpsWindowStart >= 0.5)
++        {
++            p.gameFps = static_cast<float>(p.flips / (now - p.fpsWindowStart));
++            p.flips = 0;
++            p.fpsWindowStart = now;
++        }
++    }
++
++    void drawHostOverlay()
++    {
++        Presenter &p = g_presenter;
++        const int size = std::max(20, GetScreenHeight() / 36);
++        if (g_hostSettings.showFps)
++        {
++            const char *text = TextFormat("%.0f FPS", p.gameFps);
++            DrawRectangle(8, 8, MeasureText(text, size) + 16, size + 10, Color{0, 0, 0, 160});
++            DrawText(text, 16, 13, size, p.gameFps >= 29.0f ? GREEN : (p.gameFps >= 20.0f ? YELLOW : RED));
++        }
++        if (GetTime() < p.noticeUntil && !p.notice.empty())
++        {
++            const int w = MeasureText(p.notice.c_str(), size);
++            const int x = (GetScreenWidth() - w) / 2;
++            const int y = GetScreenHeight() - size * 3;
++            DrawRectangle(x - 16, y - 8, w + 32, size + 16, Color{0, 0, 0, 180});
++            DrawText(p.notice.c_str(), x, y, size, RAYWHITE);
++        }
++    }
++}
++
++// Read by game code (port overrides) that widens the 3D view.
++bool ps2x_hostWidescreen()
++{
++    return g_hostSettings.aspect == "16:9";
++}
+ struct ElfHeader
+ {
+     uint32_t magic;
+@@ -373,6 +855,38 @@ namespace
      }
  }
  
@@ -6251,7 +6780,7 @@ index 45cb9d2..803b1f9 100644
  static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
  {
      static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-@@ -537,6 +673,7 @@ PS2Runtime::~PS2Runtime()
+@@ -537,6 +1051,7 @@ PS2Runtime::~PS2Runtime()
  #else
          if (IsAudioDeviceReady())
          {
@@ -6259,7 +6788,7 @@ index 45cb9d2..803b1f9 100644
              CloseAudioDevice();
              m_audioBackend.setAudioReady(false);
          }
-@@ -610,6 +747,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+@@ -610,6 +1125,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
      m_iopSubsystem->runEeCycles(eeCycles);
  }
  
@@ -6272,7 +6801,7 @@ index 45cb9d2..803b1f9 100644
  void PS2Runtime::resetIop()
  {
      m_iopSubsystem->reset();
-@@ -661,6 +804,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -661,6 +1182,8 @@ bool PS2Runtime::syncCoreSubsystems()
  
      if (m_boundRdram == rdram && m_boundGSVram == gsVram)
      {
@@ -6281,7 +6810,7 @@ index 45cb9d2..803b1f9 100644
          return true;
      }
  
-@@ -668,42 +813,103 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +1191,103 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -6404,27 +6933,57 @@ index 45cb9d2..803b1f9 100644
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -733,8 +939,19 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,12 +1315,47 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
-         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++        loadHostSettings();
++        unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
++        if (g_hostSettings.vsync)
++            windowFlags |= FLAG_VSYNC_HINT;
++        SetConfigFlags(windowFlags);
++        SetTraceLogLevel(LOG_WARNING);
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-+        // PS2X_WINDOW_MONITOR=n: open the window on monitor n (0 = primary).
++        // Escape is a pad button (cancel); raylib would otherwise quit on it.
++        SetExitKey(KEY_NULL);
++        // PS2X_WINDOW_MONITOR=n (test runs) overrides the settings file.
++        int monitor = g_hostSettings.monitor;
 +        if (const char *monitorEnv = std::getenv("PS2X_WINDOW_MONITOR"))
++            monitor = std::atoi(monitorEnv);
++        if (monitor < 0 || monitor >= GetMonitorCount())
++            monitor = GetCurrentMonitor();
 +        {
-+            const int monitor = std::atoi(monitorEnv);
-+            if (monitor >= 0 && monitor < GetMonitorCount())
-+            {
-+                const Vector2 origin = GetMonitorPosition(monitor);
-+                SetWindowPosition(static_cast<int>(origin.x) + 64, static_cast<int>(origin.y) + 64);
-+            }
++            // Window size: last size used, else 4:3 at 3/4 of the screen height.
++            const int monitorH = GetMonitorHeight(monitor);
++            int h = g_hostSettings.windowHeight > 200 ? g_hostSettings.windowHeight : monitorH * 3 / 4;
++            int w = g_hostSettings.windowWidth > 200 ? g_hostSettings.windowWidth
++                                                     : h * (g_hostSettings.aspect == "16:9" ? 16 : 4) /
++                                                           (g_hostSettings.aspect == "16:9" ? 9 : 3);
++            w = std::min(w, GetMonitorWidth(monitor));
++            h = std::min(h, monitorH);
++            SetWindowSize(w, h);
++            const Vector2 origin = GetMonitorPosition(monitor);
++            SetWindowPosition(static_cast<int>(origin.x) + (GetMonitorWidth(monitor) - w) / 2,
++                              static_cast<int>(origin.y) + (monitorH - h) / 2);
++            SetWindowMinSize(320, 240);
 +        }
++        if (g_hostSettings.fullscreen)
++            ToggleBorderlessWindowed();
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
 +        startSpu2AudioStream(m_iopSubsystem.get());
++        SetMasterVolume(g_hostSettings.volume / 100.0f);
  #endif
-         SetTargetFPS(60);
+-        SetTargetFPS(60);
++        // With vsync the presenter runs at the monitor's refresh; the game
++        // keeps its own pace on its own thread either way.
++        const int refresh = GetMonitorRefreshRate(GetCurrentMonitor());
++        SetTargetFPS(g_hostSettings.vsync && refresh > 0 ? refresh : 60);
          if (m_debugUiInitCallback)
-@@ -1134,6 +1351,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -1134,6 +1753,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -6432,7 +6991,7 @@ index 45cb9d2..803b1f9 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1358,6 +1576,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1358,6 +1978,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      // this charge bounds straight-line call chains that have no local loop.
      if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
      {
@@ -6440,7 +6999,7 @@ index 45cb9d2..803b1f9 100644
          return false;
      }
  
-@@ -1403,6 +1622,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,6 +2024,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -6455,7 +7014,7 @@ index 45cb9d2..803b1f9 100644
      if (ctx->pc == entryPc)
      {
          ctx->pc = fallthroughPc;
-@@ -1411,6 +1638,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1411,6 +2040,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  
@@ -6499,7 +7058,7 @@ index 45cb9d2..803b1f9 100644
  void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
  {
      if (exception == EXCEPTION_INTEGER_OVERFLOW)
-@@ -2211,7 +2475,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+@@ -2211,7 +2877,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
  
  bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
  {
@@ -6511,6 +7070,67 @@ index 45cb9d2..803b1f9 100644
  }
  
  [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
+@@ -2424,22 +3093,38 @@ void PS2Runtime::run()
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
+-        BeginDrawing();
+-        ClearBackground(BLACK);
++        countGameFrame(m_memory.gs().dispfb1 & 0x1FFu);
++        handleHostHotkeys();
++        updateHostWindowState();
++
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+-        const float screenWidth = static_cast<float>(GetScreenWidth());
+-        const float screenHeight = static_cast<float>(GetScreenHeight());
+-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+-        const float dstWidth = srcWidth * scale;
+-        const float dstHeight = srcHeight * scale;
+-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+-        const Rectangle dstRect{
+-            (screenWidth - dstWidth) * 0.5f,
+-            (screenHeight - dstHeight) * 0.5f,
+-            dstWidth,
+-            dstHeight};
+-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        prepareGameFrame(frameTex, srcWidth, srcHeight);
++
++        BeginDrawing();
++        ClearBackground(BLACK);
++        drawGameFrame(frameTex, srcWidth, srcHeight);
++        {
++            // PS2X_SCREENSHOT_AT=s1,s2,...: screenshots at those seconds (test runs).
++            static std::vector<double> shotTimes = []
++            {
++                std::vector<double> times;
++                if (const char *env = std::getenv("PS2X_SCREENSHOT_AT"))
++                {
++                    std::stringstream list(env);
++                    std::string item;
++                    while (std::getline(list, item, ','))
++                        times.push_back(std::atof(item.c_str()));
++                }
++                return times;
++            }();
++            if (!shotTimes.empty() && GetTime() >= shotTimes.front())
++            {
++                shotTimes.erase(shotTimes.begin());
++                saveScreenshot();
++            }
++        }
++        drawHostOverlay();
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+@@ -2465,6 +3150,7 @@ void PS2Runtime::run()
+         m_debugUiShutdownCallback(*this, m_debugUiUserData);
+         m_debugUiInitialized = false;
+     }
++    saveWindowState();
+     UnloadTexture(frameTex);
+     CloseWindow();
+ 
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 index f872edd..d31be32 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp

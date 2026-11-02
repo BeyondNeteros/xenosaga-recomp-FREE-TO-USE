@@ -109,6 +109,41 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Modern PC features (2026-11-02, runs/modern2-4, wide1)
+
+Host side, all in `ps2_runtime.cpp` (presenter) and `ps2_pad.cpp`:
+- `settings.ini` next to the exe (written with comments on first start):
+  fullscreen, aspect, filter, integer_scale, vsync, monitor, show_fps,
+  hide_cursor, volume, mute_when_unfocused. `window_state.ini` remembers the
+  window size (not written when the game is force-closed).
+- Picture shown at 4:3 (was square pixels: 512x448 looked 8:7). Filters:
+  sharp bilinear (integer nearest prescale into a render texture, then
+  bilinear), smooth, pixel. The prescale pass runs before BeginDrawing.
+- Hotkeys F11/Alt+Enter (borderless), F3 fps (counts DISPFB1 flips), F4
+  filter, F5 aspect, F12 screenshot (`screenshots/`, PNG written on a worker
+  thread). `PS2X_SCREENSHOT_AT=s1,s2` takes them unattended for test runs.
+  Screenshots read `GetRenderWidth()` pixels with rlReadScreenPixels:
+  raylib's LoadImageFromScreen multiplies by the DPI scale again and reads
+  past the framebuffer on Beyond's 125% monitor.
+- `SetExitKey(KEY_NULL)`: Escape (a Circle key) used to quit the game.
+- Pad: controller and keyboard merged (was keyboard ignored when a pad was
+  connected), first of 4 pad slots, radial deadzone 0.15, analog triggers as
+  L2/R2, input only on port 0 (port 1 used to mirror port 0).
+- Launcher: debug recorders (VU capture, GS TRX log) off by default.
+
+Widescreen (aspect = 16:9, experimental): `xenosaga_overlays.cpp` wraps
+`xglCameraViewScreen` (0x22B9B8) through the function table and multiplies
+camera+0x28 (horizontal projection scale, rebuilt every call) by 0.75
+(`XS_WIDESCREEN_SCALE` to experiment); the presenter stretches to 16:9.
+wide1 shows a wider battle view with normal-looking 3D proportions; 2D
+HUD/menus stretch. Not checked: field/cutscene cameras, culling at the
+screen edges.
+
+Ideas not done: 60 fps (Beyond's PCSX2 pnach `<PCSX2 folder>\patches\6D1276AB.pnach`
+has a full 60 fps set plus battle options; needs perf headroom first, GS is
+~70% busy at 30), HUD-correct widescreen, internal resolution upscaling
+(software GS: 4x the fill cost per 2x).
+
 ## Field battle freeze: IOP interrupts ignored CpuDisableIntr (2026-11-02, runs/field-freeze, irqfix1)
 
 Beyond's first field battle froze (fps 0). EE thread 7 spun in
