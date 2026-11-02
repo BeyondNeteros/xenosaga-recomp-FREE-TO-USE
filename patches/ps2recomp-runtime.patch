@@ -2216,10 +2216,10 @@ index 67c8184..dda50e7 100644
  #endif
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1_fastops.h b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
 new file mode 100644
-index 0000000..a089c8d
+index 0000000..be362c5
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
-@@ -0,0 +1,761 @@
+@@ -0,0 +1,774 @@
 +#ifndef PS2_VU1_FASTOPS_H
 +#define PS2_VU1_FASTOPS_H
 +
@@ -2749,6 +2749,19 @@ index 0000000..a089c8d
 +            storeVf(static_cast<uint32_t>(static_cast<uint16_t>(vu.m_state.vi[viT])) * 16u, vfS);
 +            if constexpr (viT != 0)
 +                vu.m_state.vi[viT] = static_cast<int16_t>(vu.m_state.vi[viT] + 1);
++        }
++        else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x3Cu) // MTIR (fsf in bits 22:21)
++        {
++            constexpr uint32_t comp = (L >> 21) & 0x3u;
++            uint32_t bits;
++            std::memcpy(&bits, &vu.m_state.vf[vfS][comp], 4);
++            if constexpr (viT != 0)
++                vu.m_state.vi[viT] = static_cast<int32_t>(static_cast<int16_t>(bits & 0xFFFFu));
++        }
++        else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x3Du) // MFIR
++        {
++            const int32_t value = static_cast<int32_t>(static_cast<int16_t>(vu.m_state.vi[viS] & 0xFFFF));
++            storeLanes(vu.m_state.vf[vfT], _mm_castsi128_ps(_mm_set1_epi32(value)), kReverse4[d]);
 +        }
 +        else if constexpr (opHi == 0x20u || opHi == 0x21u || opHi == 0x24u || opHi == 0x25u ||
 +                           opHi == 0x28u || opHi == 0x29u || (opHi >= 0x2Cu && opHi <= 0x2Fu))
@@ -3550,7 +3563,7 @@ index 5e9a446..c9e168d 100644
 +    bool queueEeRpcFromIop(PS2Runtime *runtime, ps2x::iop::EeRpcCall call);
  }
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index f0ad507..c3ea1de 100644
+index f0ad507..6ec46a4 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -8,8 +8,11 @@
@@ -4058,7 +4071,7 @@ index f0ad507..c3ea1de 100644
 +        t_clut = nullptr;
 +        return;
 +    }
-+    if (!m_pending.empty() && (QueueConflicts(batch) || m_writes.size() > 16u || m_reads.size() > 32u))
++    if (!m_pending.empty() && (QueueConflicts(batch) || m_writes.size() > 48u || m_reads.size() > 96u))
 +        DrainUnlocked();
 +    if (m_clutDirty)
 +    {

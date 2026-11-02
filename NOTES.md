@@ -109,6 +109,16 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Bigger GS batches, native MTIR/MFIR (2026-11-02, runs/opt30a)
+
+- GS: a batch drains after 48 distinct write ranges / 96 read ranges (was
+  16/32; most drains were this limit). gs_replay 8 threads 25.0 -> 22.1 ms
+  per frame, VRAM identical.
+- VU1: MTIR and MFIR inlined in lowerC. 118/118 captures identical; ~5%
+  faster (gsopt2 capture 6.2 -> 5.8 ns per VU cycle, no PGO).
+- Game (PGO retrained): 27.4-29.8 fps, ~29.0 average and steadier; GS 69%,
+  vif1 ~91% (the VU1 worker is the only limit). Memory flat ~261 MB.
+
 ## Memory runaway fixed; 28-30 fps (2026-11-02, runs/vu1opt3)
 
 - Beyond saw freezes/crashes during a PGO training run: the process was at
