@@ -135,6 +135,13 @@ Traced with XS_BATTLE_TRACE on the deterministic tutorial-battle replay
   "Drone M" target, battle tutorial text, Knuckle/Firecracker menu and GTW;
   30 fps, memory flat ~270 MB. To check with real play: field battles,
   Shion's HP display ("0000/0080" in later frames), post-battle field.
+- Beyond's play test (runs/play3, inputs runs/play3-inputs.txt): tutorial
+  battle starts, Shion can act, but the Drone M model is never drawn and
+  the battle stalls after Shion's turn (KOS-MOS never gets a turn); Shion's
+  HP display alternates 0080/0000 and 0000/0080. The enemy file is read
+  (sceCdRead lsn 0x7dab3, 15 sectors -> 0x610950, extract no-op) and
+  feso_001.bin (motions) loads: next, follow unitLoad / the enemy model
+  setup and what the turn system waits for.
 - OV01 layout facts: unit table 0xA57240 (3 party + 5 enemy slots),
   batdat.bin -> 0x426F40 (data\yamamotoatdat.bin, 29 sectors), think
   data 0x436F40 (16 KB, copied from the map archive by dataThinkDataSet in
