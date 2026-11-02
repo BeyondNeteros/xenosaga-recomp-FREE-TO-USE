@@ -183,6 +183,9 @@ namespace
         {0x002185A8u, "xglArxExtract", false, nullptr, ~0u},
         {0x00A1D348u, "thinkSysInit", false, nullptr, ~0u},
         {0x00A1D380u, "thinkTopSet", false, nullptr, ~0u},
+        {0x00A2D8B8u, "sndSeTrans", true, nullptr, ~0u},
+        {0x00A2DCA0u, "sndBankGet", true, nullptr, ~0u},
+        {0x00A2D388u, "sndSeRegChk", true, nullptr, ~0u},
     };
 
     template <size_t I>
@@ -191,12 +194,17 @@ namespace
         TracedFunction &f = g_battleTrace[I];
         static uint32_t calls = 0;
         const bool log = !f.logReturn && ++calls <= 400u;
+        if (f.logReturn) ++calls;
         if (log)
             std::printf("[battle] %s a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x\n", f.name, GPR_U32(ctx, 4), GPR_U32(ctx, 5),
                         GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
         if (I == 0)
             ps2x_armGsCapture();
-        if (I == 1 && calls == 30u) // battleMain, ~1 s into the battle: dump EE RAM
+        static const uint32_t dumpAt = [] {
+            const char *env = std::getenv("XS_BATTLE_DUMP_AT");
+            return env ? static_cast<uint32_t>(std::atoi(env)) : 30u;
+        }();
+        if (I == 1 && calls == dumpAt) // battleMain call N (XS_BATTLE_DUMP_AT, default 30): dump EE RAM
         {
             const std::filesystem::path out = PS2Runtime::getIoPaths().elfDirectory / "xs_ram_battle.bin";
             std::ofstream file(out, std::ios::binary);

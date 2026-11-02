@@ -109,6 +109,27 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Battles play through (2026-11-02, runs/rep6)
+
+- Enemy model missing + turn stall: the battle copies the field's enemy
+  model (3 parts, 547904 bytes, dataEnemyMdlChk) with xglMemCopy16b
+  (backwards, lq/sq loop whose head is the function's first instruction).
+  A checkpoint inside that loop returned with ctx->pc == the function
+  entry, and dispatchGuestBranch treated "pc == entry" as an HLE-style
+  return, so the caller continued with the copy cut short: only the end
+  (JNT skeleton) arrived, the lex model and XTX textures were garbage, the
+  enemy was invisible and its action motion (Mot=5) never finished.
+  Fix: PS2Runtime::m_checkpointYielded (set when generated code or
+  dispatchGuestBranch stops at a checkpoint, cleared by the scheduler before
+  it resumes a thread); dispatchGuestBranch leaves ctx->pc alone when set.
+  This affected any function whose loop starts at its first instruction.
+- PS2X_GUEST_PRINTF=1 prints the game's own printf output (very useful:
+  "** MDL read Size", "** Create (ID=..)", "** NBread: ...").
+- Tutorial battle replay now: enemy drawn, both characters act, results
+  screen (Clear Time 0:30, EXP +2). Still odd: Shion's HP shows 0000/0080,
+  0000/0000 or 0080/0080 depending on the frame; "SetTrans err" (enemy SE
+  bank busy) still printed while the enemy acts.
+
 ## Battle root causes found (2026-11-02, runs/btut*, bfix*)
 
 Traced with XS_BATTLE_TRACE on the deterministic tutorial-battle replay

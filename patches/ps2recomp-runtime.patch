@@ -1669,7 +1669,7 @@ index 92ef0d5..d24ec97 100644
      else()
          message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..316d5fa 100644
+index 4b9242c..3c96b6f 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -237,6 +237,13 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
@@ -1727,7 +1727,21 @@ index 4b9242c..316d5fa 100644
  
      void requestStop();
      bool isStopRequested() const;
-@@ -445,6 +458,7 @@ public:
+@@ -394,6 +407,13 @@ public:
+     const EeScheduler &eeScheduler() const;
+     void postEeEvent(EeEvent event);
+     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
++    // Set when generated code stops at a checkpoint (eeCheckpointDue() true)
++    // and unwinds to the scheduler: dispatchGuestBranch must then leave
++    // ctx->pc alone even if it equals the callee's entry (a loop whose head
++    // is the function's first instruction). Cleared by the scheduler before
++    // it resumes a thread.
++    bool m_checkpointYielded = false;
++    void clearCheckpointYield() noexcept { m_checkpointYielded = false; }
+     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
+ 
+     struct EeExitHandlerRegistration
+@@ -445,6 +465,7 @@ public:
      inline VU1Interpreter &vu0() { return m_vu0; }
      inline const VU1Interpreter &vu0() const { return m_vu0; }
      inline VU1Interpreter &vu1() { return m_vu1; }
@@ -3013,7 +3027,7 @@ index 0000000..be362c5
 +
 +#endif
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..54ce4b4 100644
+index c5e31c4..0e98785 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,6 @@
@@ -3059,7 +3073,7 @@ index c5e31c4..54ce4b4 100644
  EeScheduler::EeScheduler(PS2Runtime &runtime)
      : m_runtime(runtime)
  {
-@@ -292,6 +324,13 @@ void EeScheduler::run()
+@@ -292,18 +324,28 @@ void EeScheduler::run()
              continue;
          }
  
@@ -3073,7 +3087,8 @@ index c5e31c4..54ce4b4 100644
          try
          {
              m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
-@@ -299,11 +338,13 @@ void EeScheduler::run()
+             m_guestExecuting.store(true, std::memory_order_release);
++            m_runtime.clearCheckpointYield();
              function(m_rdram, &context, &m_runtime);
              m_guestExecuting.store(false, std::memory_order_release);
              m_insideInterrupt = false;
@@ -3087,7 +3102,7 @@ index c5e31c4..54ce4b4 100644
          }
          catch (...)
          {
-@@ -1800,6 +1841,7 @@ void EeScheduler::processDueDeadlines()
+@@ -1800,6 +1842,7 @@ void EeScheduler::processDueDeadlines()
  
              if (now < pacingDeadline)
              {
@@ -3095,7 +3110,7 @@ index c5e31c4..54ce4b4 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
                                                m_stopRequested.load(std::memory_order_acquire); });
-@@ -1867,6 +1909,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1867,6 +1910,8 @@ void EeScheduler::processEvent(const EeEvent &event)
          requestStop();
          break;
      case EeEventType::VBlankStart:
@@ -3104,7 +3119,7 @@ index c5e31c4..54ce4b4 100644
          ++m_vsyncTick;
          m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
          if ((m_vsyncTick & 1u) != 0u)
-@@ -2005,6 +2049,7 @@ void EeScheduler::waitForEvent()
+@@ -2005,6 +2050,7 @@ void EeScheduler::waitForEvent()
      const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
      if (m_deadlines.empty() && !hasTimerDeadline)
      {
@@ -3112,7 +3127,7 @@ index c5e31c4..54ce4b4 100644
          m_eventCv.wait(lock, [this]()
                         { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
          return;
-@@ -2036,9 +2081,12 @@ void EeScheduler::waitForEvent()
+@@ -2036,9 +2082,12 @@ void EeScheduler::waitForEvent()
          }
      }
  
@@ -3219,6 +3234,26 @@ index b1bb6d8..b07caf1 100644
      };
  
      struct GsDispEnvMem
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index d467c4b..ac967f8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -534,6 +534,15 @@ namespace ps2_stubs
+             {
+                 rendered.resize(2048);
+             }
++            // PS2X_GUEST_PRINTF=1: show the game's own printf output (debugging).
++            static const bool guestPrintf = std::getenv("PS2X_GUEST_PRINTF") != nullptr;
++            if (guestPrintf)
++            {
++                std::fputs("[printf] ", stdout);
++                std::fwrite(rendered.data(), 1, rendered.size(), stdout);
++                if (rendered.empty() || rendered.back() != '\n')
++                    std::fputc('\n', stdout);
++            }
+             PS2_IF_AGRESSIVE_LOGS({
+                 const std::string logLine = sanitizeForLog(rendered);
+                 uint32_t count = 0;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 index dc975ed..172211c 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
@@ -6034,7 +6069,7 @@ index 8590f14..e55e157 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..3b017e1 100644
+index 45cb9d2..803b1f9 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -6372,7 +6407,30 @@ index 45cb9d2..3b017e1 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1411,6 +1629,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1358,6 +1576,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        m_checkpointYielded = true;
+         return false;
+     }
+ 
+@@ -1403,6 +1622,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
++    // The callee paused at a checkpoint: ctx->pc is where it resumes, even
++    // when that is its own entry (loop at the first instruction, e.g.
++    // xglMemCopy16b) - treating that as "returned" cut copies short.
++    if (m_checkpointYielded)
++    {
++        return false;
++    }
++
+     if (ctx->pc == entryPc)
+     {
+         ctx->pc = fallthroughPc;
+@@ -1411,6 +1638,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  
@@ -6416,6 +6474,18 @@ index 45cb9d2..3b017e1 100644
  void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
  {
      if (exception == EXCEPTION_INTEGER_OVERFLOW)
+@@ -2211,7 +2475,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
+-    return m_eeScheduler->checkpointDue(cycles);
++    const bool due = m_eeScheduler->checkpointDue(cycles);
++    if (due)
++        m_checkpointYielded = true;
++    return due;
+ }
+ 
+ [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 index f872edd..d31be32 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
