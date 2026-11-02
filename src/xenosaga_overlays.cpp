@@ -186,6 +186,9 @@ namespace
         {0x00A2D8B8u, "sndSeTrans", true, nullptr, ~0u},
         {0x00A2DCA0u, "sndBankGet", true, nullptr, ~0u},
         {0x00A2D388u, "sndSeRegChk", true, nullptr, ~0u},
+        {0x00A2A118u, "menuNumPut", false, nullptr, ~0u},
+        {0x00A29CD0u, "menuPlStatPut", false, nullptr, ~0u},
+        {0x00A2BBE8u, "menuStatSpriteRGB", false, nullptr, ~0u},
     };
 
     template <size_t I>
@@ -193,12 +196,19 @@ namespace
     {
         TracedFunction &f = g_battleTrace[I];
         static uint32_t calls = 0;
-        const bool log = !f.logReturn && ++calls <= 400u;
+        const bool log = !f.logReturn && ++calls <= ((f.addr == 0x00A2A118u || f.addr == 0x00A29CD0u || f.addr == 0x00A2BBE8u) ? 20000u : 400u);
         if (f.logReturn) ++calls;
         if (log)
-            std::printf("[battle] %s a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x\n", f.name, GPR_U32(ctx, 4), GPR_U32(ctx, 5),
-                        GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
-        if (I == 0)
+            std::printf("[battle] %s a0=%08x a1=%08x a2=%08x a3=%08x t0=%08x t1=%08x t2=%08x ra=%08x\n", f.name, GPR_U32(ctx, 4),
+                        GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 8), GPR_U32(ctx, 9), GPR_U32(ctx, 10),
+                        GPR_U32(ctx, 31));
+        static const uint32_t armAt = [] {
+            const char *env = std::getenv("XS_GS_ARM_AT"); // battleMain call that arms the GS capture
+            return env ? static_cast<uint32_t>(std::atoi(env)) : 0u;
+        }();
+        if (I == 0 && armAt == 0u)
+            ps2x_armGsCapture();
+        if (I == 1 && armAt != 0u && calls == armAt)
             ps2x_armGsCapture();
         static const uint32_t dumpAt = [] {
             const char *env = std::getenv("XS_BATTLE_DUMP_AT");
