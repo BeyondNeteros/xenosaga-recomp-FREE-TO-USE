@@ -1153,10 +1153,16 @@ index 01b48df..c4bde7f 100644
  
      private:
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-index cf4fdc6..72c93b3 100644
+index cf4fdc6..57e05aa 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
 +++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-@@ -20,6 +20,9 @@ namespace ps2x::iop::detail
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <cstdio>
+ #include "iop_rpc.h"
+ 
+ #include "../core/iop_cpu.h"
+@@ -20,6 +22,9 @@ namespace ps2x::iop::detail
  
      void IopRpcBridge::reset()
      {
@@ -1166,7 +1172,19 @@ index cf4fdc6..72c93b3 100644
          m_servers.clear();
          m_nextDmaId = 1u;
          m_sifInitialized = false;
-@@ -148,10 +151,72 @@ namespace ps2x::iop::detail
+@@ -83,6 +88,11 @@ namespace ps2x::iop::detail
+                     return true;
+                 }
+                 pending[pendingCount++] = {source, destination, size};
++                // PS2X_SIFDMA_LOG=1: every IOP->EE transfer (debugging).
++                static const bool sifLog = std::getenv("PS2X_SIFDMA_LOG") != nullptr;
++                if (sifLog)
++                    std::fprintf(stderr, "[sifdma] iop 0x%06x -> ee 0x%08x size %u ra=0x%x\n", source, destination, size,
++                                 cpu.gpr[31]);
+                 largestTransfer = std::max(largestTransfer, size);
+             }
+ 
+@@ -148,10 +158,72 @@ namespace ps2x::iop::detail
          case 10:
          case 11:
          case 14: // InitRpc
@@ -1241,7 +1259,7 @@ index cf4fdc6..72c93b3 100644
          case 12: // sceSifSendCmd
          case 13: // isceSifSendCmd
          {
-@@ -230,9 +295,12 @@ namespace ps2x::iop::detail
+@@ -230,9 +302,12 @@ namespace ps2x::iop::detail
              setV0(server.serverData);
              return true;
          }
@@ -1256,7 +1274,7 @@ index cf4fdc6..72c93b3 100644
          case 19: // SetRpcQueue
              setV0(cpu.gpr[4]);
              return true;
-@@ -341,6 +409,31 @@ namespace ps2x::iop::detail
+@@ -341,6 +416,31 @@ namespace ps2x::iop::detail
          }
      }
  
@@ -3232,8 +3250,30 @@ index dc975ed..172211c 100644
      }
  
      void sceSifSetCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Runtime.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Runtime.h
+index 6204325..838b6e8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Runtime.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Runtime.h
+@@ -90,7 +90,7 @@ static uint32_t rpcAllocPacketAddr(uint8_t *rdram)
+ 
+     uint32_t slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
+     uint32_t addr = kRpcPacketPoolBase + (slot * kRpcPacketSize);
+-    rpcZeroRdram(rdram, addr, kRpcPacketSize);
++    (void)rdram; // placeholder address only: the game owns this RAM
+     return addr;
+ }
+ 
+@@ -101,7 +101,7 @@ static uint32_t rpcAllocServerAddr(uint8_t *rdram)
+ 
+     uint32_t slot = g_rpc_server_index++ % kRpcServerPoolCount;
+     uint32_t addr = kRpcServerPoolBase + (slot * kRpcServerStride);
+-    rpcZeroRdram(rdram, addr, kRpcServerStride);
++    (void)rdram; // placeholder address only: the game owns this RAM
+     return addr;
+ }
+ 
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
-index d6b7549..e1c8574 100644
+index d6b7549..973e8d4 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
 @@ -2,6 +2,7 @@
@@ -3254,8 +3294,24 @@ index d6b7549..e1c8574 100644
  inline std::unordered_map<uint32_t, RpcClientState> g_rpc_clients;
  inline SifRpcDebugEvent g_sif_rpc_debug_history[kSifRpcDebugHistoryCount]{};
  inline uint64_t g_sif_rpc_debug_next_seq = 0;
+@@ -251,6 +255,15 @@ static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcServerStride = 0x80;
+ static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
+ 
++// The packet/server "pools" are only placeholder addresses handed to the
++// game (it checks cd->server != 0 to know a bind succeeded). That memory is
++// ordinary game RAM (Xenosaga keeps live data there), so the runtime must
++// never read or write guest memory at these addresses.
++inline bool rpcIsPlaceholderServer(uint32_t address)
++{
++    return address >= kRpcServerPoolBase && address < kRpcServerPoolBase + kRpcServerPoolBytes;
++}
++
+ static constexpr uint32_t kTlsPoolBase = 0x01F20000;
+ static constexpr uint32_t kTlsPoolBytes = 0x00010000;
+ static constexpr uint32_t kTlsBlockSize = 0x100;
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
-index 07fcd29..38d195b 100644
+index 07fcd29..06cfe15 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 @@ -1,6 +1,11 @@
@@ -3284,7 +3340,45 @@ index 07fcd29..38d195b 100644
              event.seq = ++g_sif_rpc_debug_next_seq;
              g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
          }
-@@ -702,20 +714,236 @@ namespace ps2_syscalls
+@@ -304,12 +316,8 @@ namespace ps2_syscalls
+             serverPtr = rpcAllocServerAddr(rdram);
+             if (serverPtr)
+             {
+-                t_SifRpcServerData *dummy = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
+-                if (dummy)
+-                {
+-                    std::memset(dummy, 0, sizeof(*dummy));
+-                    dummy->sid = static_cast<int>(rpcId);
+-                }
++                // Placeholder only (see rpcIsPlaceholderServer): no descriptor
++                // is written to guest RAM.
+                 std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                 g_rpc_servers[rpcId] = {rpcId, serverPtr};
+             }
+@@ -317,7 +325,9 @@ namespace ps2_syscalls
+ 
+         if (serverPtr)
+         {
+-            t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
++            t_SifRpcServerData *sd = rpcIsPlaceholderServer(serverPtr)
++                                         ? nullptr
++                                         : reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
+             client->server = serverPtr;
+             client->buf = sd ? sd->buf : 0;
+             client->cbuf = sd ? sd->cbuf : 0;
+@@ -502,7 +512,10 @@ namespace ps2_syscalls
+         }
+ 
+         const uint32_t serverPtr = client->server;
+-        auto *server = serverPtr
++        // A placeholder (IOP-side server) has no descriptor in guest RAM:
++        // reading one there picked up game data, and copying the send buffer
++        // to its "buf" overwrote 64 KB of Xenosaga's battle data.
++        auto *server = (serverPtr && !rpcIsPlaceholderServer(serverPtr))
+                            ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
+                            : nullptr;
+         if (server)
+@@ -702,20 +715,238 @@ namespace ps2_syscalls
          finishCall(nullptr, *ctx);
      }
  
@@ -3308,7 +3402,7 @@ index 07fcd29..38d195b 100644
 +        if (rpcLog)
 +            std::fprintf(stderr, "[rpc] IOP bind to EE sid=0x%x registered=%d\n", sid, (int)g_ee_registered_sids.count(sid));
 +        const auto it = g_rpc_servers.find(sid);
-+        if (it == g_rpc_servers.end() || it->second.sd_ptr == 0u)
++        if (it == g_rpc_servers.end() || it->second.sd_ptr == 0u || rpcIsPlaceholderServer(it->second.sd_ptr))
 +            return false;
 +        return g_ee_registered_sids.count(sid) != 0u;
 +    }
@@ -3325,6 +3419,8 @@ index 07fcd29..38d195b 100644
 +            if (it == g_rpc_servers.end() || g_ee_registered_sids.count(call.sid) == 0u)
 +                return false;
 +            const uint32_t sdPtr = it->second.sd_ptr;
++            if (rpcIsPlaceholderServer(sdPtr))
++                return false;
 +            const t_SifRpcServerData *sd = reinterpret_cast<const t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
 +            if (!sd)
 +                return false;
@@ -3529,7 +3625,7 @@ index 07fcd29..38d195b 100644
  
          t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
          if (!sd)
-@@ -786,6 +1014,7 @@ namespace ps2_syscalls
+@@ -786,6 +1017,7 @@ namespace ps2_syscalls
              }
  
              g_rpc_servers[sid] = {sid, sdPtr};

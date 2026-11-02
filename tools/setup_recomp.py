@@ -67,6 +67,19 @@ def unstub(config: Path, elf: bytes):
     config.write_text(text)
 
 
+def drop_smc_patches(config: Path):
+    """ps2_analyzer replaces every store it thinks may write into code with a
+    nop ("Potential self-modifying code"). In Xenosaga these are all false
+    positives: overlays keep their data right next to their code, so ordinary
+    stores look like code writes. Losing them broke battles (thinkInit never
+    stored the AI data pointer, so no enemies were created). Keep the code."""
+    lines = config.read_text().splitlines(keepends=True)
+    kept = [l for l in lines if "# Potential self-modifying code" not in l]
+    if len(kept) != len(lines):
+        config.write_text("".join(kept))
+        print(f"kept {len(lines) - len(kept)} stores ps2_analyzer wanted to nop ({config.parent.name})")
+
+
 def find_tool(bin_dir: Path, name: str) -> str:
     for cand in (bin_dir / name, bin_dir / (name + ".exe")):
         if cand.exists():
@@ -104,6 +117,7 @@ def main():
     elf = out / "SLUS_204.69"
     shutil.copy2(find_file(src, "SLUS_204.69"), elf)
     run([analyzer, elf.name, "config.toml"], out)
+    drop_smc_patches(out / "config.toml")
     unstub(out / "config.toml", elf.read_bytes())
     run([recomp, "config.toml"], out)
 
@@ -116,6 +130,7 @@ def main():
         struct.pack_into("<I", data, 24, 0x00A00000)  # e_entry
         (d / f"{ov}.elf").write_bytes(data)
         run([analyzer, f"{ov}.elf", "config.toml"], d)
+        drop_smc_patches(d / "config.toml")
         run([recomp, "config.toml"], d)
     print("done; now run tools/assemble.py")
 

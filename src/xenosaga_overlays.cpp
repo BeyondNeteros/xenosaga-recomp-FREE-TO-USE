@@ -165,6 +165,24 @@ namespace
         {0x00A17148u, "calcStatGet", true, nullptr, ~0u},
         {0x00A01000u, "unitLiveNumGet2", true, nullptr, ~0u},
         {0x00A00D98u, "unitTblGet", true, nullptr, ~0u},
+        {0x00A1A6F8u, "dataFileLoad", true, nullptr, ~0u},
+        {0x00A1D0F8u, "dataThinkLoad", false, nullptr, ~0u},
+        {0x00A1D5D0u, "thinkInit", false, nullptr, ~0u},
+        {0x00A1CEA0u, "dataBatDatLoad", true, nullptr, ~0u},
+        {0x00A1CFB8u, "dataThinkDataSet", true, nullptr, ~0u},
+        {0x00A1D0A8u, "dataThinkFileLoad", true, nullptr, ~0u},
+        {0x00A1CED8u, "thinkMapGet", true, nullptr, ~0u},
+        {0x00A24C68u, "grVramCopy", false, nullptr, ~0u},
+        {0x00A25A80u, "grPacketSend", false, nullptr, ~0u},
+        {0x00A25EA0u, "grGsRegSet", false, nullptr, ~0u},
+        {0x0021DEB8u, "xglCdReadFilePart", true, nullptr, ~0u},
+        {0x0021CF98u, "queue_next", true, nullptr, ~0u},
+        {0x0020DC98u, "sceCdRead", true, nullptr, ~0u},
+        {0x0020D448u, "sceCdSync", true, nullptr, ~0u},
+        {0x0021CF18u, "extract", false, nullptr, ~0u},
+        {0x002185A8u, "xglArxExtract", false, nullptr, ~0u},
+        {0x00A1D348u, "thinkSysInit", false, nullptr, ~0u},
+        {0x00A1D380u, "thinkTopSet", false, nullptr, ~0u},
     };
 
     template <size_t I>
@@ -178,8 +196,42 @@ namespace
                         GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
         if (I == 0)
             ps2x_armGsCapture();
+        if (I == 1 && calls == 30u) // battleMain, ~1 s into the battle: dump EE RAM
+        {
+            const std::filesystem::path out = PS2Runtime::getIoPaths().elfDirectory / "xs_ram_battle.bin";
+            std::ofstream file(out, std::ios::binary);
+            file.write(reinterpret_cast<const char *>(rdram), 32 * 1024 * 1024);
+            std::printf("[battle] RAM dumped to %s\n", out.string().c_str());
+        }
         const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6);
+        if (f.addr == 0x0021DEB8u) // xglCdReadFilePart(name, dest, ...)
+            std::printf("[battle] xglCdReadFilePart \"%.80s\" -> %08x busy=%d\n",
+                        reinterpret_cast<const char *>(rdram + (a0 & kRdramMask)), a1,
+                        static_cast<int>(static_cast<int8_t>(rdram[(0x0093CC00u + 0x30u) & kRdramMask])));
+        if (f.addr == 0x00A1A6F8u) // dataFileLoad(name, dest): log the file name
+        {
+            const char *name = reinterpret_cast<const char *>(rdram + (a0 & kRdramMask));
+            std::printf("[battle] dataFileLoad \"%.80s\" -> %08x\n", name, a1);
+        }
         f.original(rdram, ctx, runtime);
+        {
+            // Think data area (0x436F40): show its first bytes after each traced call.
+            static uint64_t lastThink = 0;
+            uint64_t think;
+            std::memcpy(&think, rdram + 0x436F40u, 8);
+            // Also watch the think pointers (top 0xA59BE0, base 0xA59BE8).
+            uint32_t top, base;
+            std::memcpy(&top, rdram + 0xA59BE0u, 4);
+            std::memcpy(&base, rdram + 0xA59BE8u, 4);
+            static uint32_t lastTop = 1, lastBase = 1;
+            if (top != lastTop || base != lastBase)
+                std::printf("[battle] think top=%08x base=%08x (after %s)\n", top, base, f.name);
+            lastTop = top;
+            lastBase = base;
+            if (think != lastThink)
+                std::printf("[battle] think area now %016llx (after %s)\n", static_cast<unsigned long long>(think), f.name);
+            lastThink = think;
+        }
         if (f.logReturn)
         {
             const uint32_t v0 = GPR_U32(ctx, 2);

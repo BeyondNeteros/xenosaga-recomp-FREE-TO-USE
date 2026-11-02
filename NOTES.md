@@ -109,6 +109,33 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Battle root causes found (2026-11-02, runs/btut*, bfix*)
+
+Traced with XS_BATTLE_TRACE on the deterministic tutorial-battle replay
+(runs/bplay2-inputs.txt) and RAM dumps at battleMain #30 (xs_ram_battle.bin):
+
+1. **Recompiler patched out 66 stores.** ps2_analyzer replaces stores it
+   thinks write code with nops ("Potential self-modifying code"); all false
+   positives (overlay data sits next to overlay code). Among them
+   `sw v0,(s0)` at 0xA1D5FC in thinkInit, which stores pThinkTop
+   (0xA59BE8): without it thinkMonsTblGet reads the monster table from
+   address 0, no enemies are created (unit slots 3-7 empty), battleEndChk
+   sees no live enemies and the battle ends at once as a win with 0 EXP.
+   setup_recomp.py now drops those patches (main 6, ov01 42, ov02 3, ov10 7,
+   ov11 6, ov12 2); code regenerated.
+2. **Runtime RPC placeholders lived in game RAM.** IOP-side servers get a
+   placeholder sd address from a pool at 0x1F10000 (packets 0x1F00000, TLS
+   0x1F20000) - ordinary Xenosaga RAM. sceSifCallRpc wrote server fields
+   there and copied the send buffer to the garbage "buf" it read back: every
+   65568-byte sound-bank chunk (rpc 33) landed at ~0x42AF20, over batdat.bin
+   and the think data at 0x436F40. Placeholders are now never read/written
+   (rpcIsPlaceholderServer); the pools no longer zero guest RAM. TLS pool
+   still writes guest RAM (not yet checked).
+- OV01 layout facts: unit table 0xA57240 (3 party + 5 enemy slots),
+  batdat.bin -> 0x426F40 (data\yamamotoatdat.bin, 29 sectors), think
+  data 0x436F40 (16 KB, copied from the map archive by dataThinkDataSet in
+  MapReset; think%03d.bin only via dataThinkFileLoad).
+
 ## Battles: first look (2026-11-02, runs/rec1, battle-fast, battle-safe2)
 
 - Beyond recorded a new-game run into the first battle after the tutorial
