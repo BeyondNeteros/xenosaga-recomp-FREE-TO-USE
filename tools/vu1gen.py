@@ -43,6 +43,44 @@ def read_logs(paths):
     return blocks
 
 
+# Upper ops with a fast FMAC path (vu1fast::kFastOps): they always write MAC
+# and status when dest != 0, fast or not.
+FMAC_OPS = set(range(0x00, 0x10)) | set(range(0x18, 0x1C)) | {0x1C, 0x1E} | set(range(0x20, 0x2B)) | {0x2C, 0x2D}
+
+
+def writes_mac(upper):
+    op = upper & 0x3F
+    if op >= 0x3C:
+        op = (upper & 3) | ((upper >> 4) & 0x7C)  # ACC forms
+        if op in (0x2F, 0x30):
+            return False  # NOP
+    return op in FMAC_OPS and ((upper >> 21) & 0xF) != 0
+
+
+def reads_flags(lower, upper):
+    # FCEQ..FMOR (lower opcodes 0x10-0x1C); not when the lower word is an I-bit immediate.
+    return not (upper & 0x80000000) and 0x10 <= ((lower >> 25) & 0x7F) <= 0x1C
+
+
+def dead_flag_pairs(pairs):
+    """Plain pairs whose FMAC flag entry nobody can observe: the block reads no
+    flags, and a later MAC/status write at least 4 pairs before the block's
+    end (so at least 4 cycles earlier) replaces it before the block ends.
+    Its sticky bits are folded into the next live entry instead."""
+    if any(reads_flags(lo, up) for lo, up, _ in pairs):
+        return set()
+    n = len(pairs)
+    dead = set()
+    later_writer = False
+    for i in range(n - 1, -1, -1):
+        lower, upper, plain = pairs[i]
+        if later_writer and plain and not plain & 8 and plain & 2 and writes_mac(upper):
+            dead.add(i)
+        if i <= n - 5 and writes_mac(upper):
+            later_writer = True
+    return dead
+
+
 def emit_block(key, start, pairs):
     lines = [
         f"// start pair {start} (pc 0x{start * 8:04x}), {len(pairs)} pairs",
@@ -52,6 +90,7 @@ def emit_block(key, start, pairs):
         "    const uint64_t e = F::cycle(vu);",
         "    bool ended = false;",
     ]
+    dead = dead_flag_pairs(pairs)
     for i, (lower, upper, plain) in enumerate(pairs):
         if i > 0:
             lines.append(f"    F::step(vu, e + b.offsets[{i}]);")
@@ -66,7 +105,7 @@ def emit_block(key, start, pairs):
             continue
         parts = []
         if plain & 2:
-            parts.append(f"F::upperC<0x{upper:08x}u>(vu);")
+            parts.append(f"F::upperC<0x{upper:08x}u{', true' if i in dead else ''}>(vu);")
         if plain & 4:
             parts.append(f"F::lowerC<0x{lower:08x}u, 0x{upper:08x}u>(vu, d, ds, gs, m);")
         parts.append("F::plainEnd(vu);")

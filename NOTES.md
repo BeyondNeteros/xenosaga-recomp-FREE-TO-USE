@@ -109,6 +109,24 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## VU1 bookkeeping trimmed (2026-11-01, runs/vu1opt1)
+
+- Profile (vu1_replay, runs/fbsnap1 capture): native block bodies ~48%, the
+  rest per-block/per-call bookkeeping: staticEntryOk 9%, finishStaticBlock
+  8%, commitFlagsUpTo 7%, run 4%, std::fesetround 2.4%.
+- `run()` sets MXCSR.RC and the x87 control word directly (setting only
+  MXCSR changed 43 captures: some library maths still uses x87). The GS
+  backend and the GS capture use MXCSR too.
+- `m_readyMax` bounds every VF/VI/ACC readiness value; live-ins are sorted by
+  offset and the entry check stops at the first one past the bound.
+- Final VF readiness is stored per register with one AVX2 masked store.
+- Dead flag entries: vu1gen marks FMAC ops whose MAC/status entry is
+  replaced (a later writer >= 4 pairs before the block end, no flag reads in
+  the block); they skip the ring and fold their sticky Z/S bits into the next
+  entry (`m_deadSticky`). Only 155/741 ops qualify (many blocks read flags).
+- 108/108 captures identical; 11.9 -> 9.15 ns per VU cycle; game (without the
+  dead-flag part yet) 18.7 -> 21.2 fps.
+
 ## VU1 on its own thread (2026-11-01, runs/async1v)
 
 - Measured first (runs/gap1, gap2): the game kicks one VIF1 chain per frame
