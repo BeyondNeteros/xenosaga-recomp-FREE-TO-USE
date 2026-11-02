@@ -109,6 +109,25 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## VU1 on its own thread (2026-11-01, runs/async1v)
+
+- Measured first (runs/gap1, gap2): the game kicks one VIF1 chain per frame
+  (~51 ms of VIF1/VU1 work), then runs ~11 ms of EE code before it next
+  touches DMA/GIF/GS/VU1 state (a GIF_STAT read; VU0 memory accesses in
+  between don't count).
+- PS2Memory now hands VIF1 chains >= 16 KB (chain data is already copied at
+  kick time) to a worker thread, which also drains the GIF arbiter. The EE
+  syncs (`syncVif1`) before any non-RAM access except timers, VU0 memory and
+  SIF registers, before GS priv register access, at the start of
+  processPendingTransfers and in syncCoreSubsystems (GS library stubs). The
+  channel completes (CHCR, QWC, D_STAT, DMAC cause) on the EE at that sync or
+  at the next vblank poll (`pollAsyncVif1`), where DMAC handlers run. VU1
+  D/T stop bits from the worker are applied to the EE context at completion.
+  `PS2X_VIF1_ASYNC=0` turns it off. Heartbeat `vifwait` = EE waiting for it.
+- Game 16.6 -> 18.7 fps, steady (the late 9-13 fps dips are gone), picture
+  identical. Worker ~94% busy, EE waits ~74%: VIF1/VU1 alone sets the frame
+  rate now; 30 fps needs it ~1.5x faster (~50 -> ~33 ms per frame).
+
 ## Feedback sprites drawn in parallel (2026-11-01, runs/fbsnap1)
 
 - gs_replay stats showed the ordered (single-thread) path was more than half

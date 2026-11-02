@@ -384,7 +384,7 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                 lastVsync = vsync;
             }
             {
-                static const char *names[] = {"vu1", "gs", "vif1", "gssync", "eeidle"};
+                static const char *names[] = {"vu1", "gs", "vif1", "gssync", "eeidle", "vifwait"};
                 std::printf("  host time over last %ds:", seconds);
                 for (uint32_t c = 0; c < ps2_profile::Count; ++c)
                 {
