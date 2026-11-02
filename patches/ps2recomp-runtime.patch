@@ -1517,7 +1517,7 @@ index 509fd07..33ff0f5 100644
  
      std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..c6f50f4 100644
+index 589d768..232e442 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -253,7 +253,7 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
@@ -1578,7 +1578,7 @@ index 589d768..c6f50f4 100644
      install(DIRECTORY "${FFMPEG_BIN_DIR}/"
          DESTINATION bin
          FILES_MATCHING
-@@ -608,3 +634,52 @@ endif()
+@@ -608,3 +634,58 @@ endif()
  install(DIRECTORY include/
      DESTINATION include
  )
@@ -1620,7 +1620,13 @@ index 589d768..c6f50f4 100644
 +        list(APPEND PS2X_PGO_SOURCES src/runner/xenosaga_vu1_blocks.cpp)
 +    endif()
 +    if(PS2X_PGO_GENERATE)
-+        set_property(SOURCE ${PS2X_PGO_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "-fprofile-generate;-fprofile-update=atomic")
++        # Single (non-atomic) counters: a little noise across threads, which
++        # -fprofile-correction absorbs, instead of slowing the game down.
++        set_property(SOURCE ${PS2X_PGO_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "-fprofile-generate")
++        # Only the port's heartbeat file needs to know (it dumps the profile).
++        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_debug.cpp")
++            set_property(SOURCE src/runner/xenosaga_debug.cpp APPEND PROPERTY COMPILE_DEFINITIONS PS2X_PGO_GENERATE=1)
++        endif()
 +        foreach(PS2X_PGO_TARGET ps2EntryRunner vu1_replay gs_replay vu0_test)
 +            if(TARGET ${PS2X_PGO_TARGET})
 +                target_link_options(${PS2X_PGO_TARGET} PRIVATE "-fprofile-generate")

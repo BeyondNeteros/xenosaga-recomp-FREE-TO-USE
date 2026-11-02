@@ -5,6 +5,9 @@
 // symbol tables in the user's own SLUS_204.69 and OVnn.OVL files.
 
 #include "ps2_runtime.h"
+#ifdef PS2X_PGO_GENERATE
+extern "C" void __gcov_dump(void);
+#endif
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_profile.h"
 #include "runtime/ps2_memory.h"
@@ -377,6 +380,20 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                       << (snap.eeCycle == lastCycle ? " (stalled)" : "")
                       << " running=" << snap.runningThreadId << std::endl;
             lastCycle = snap.eeCycle;
+#ifdef PS2X_PGO_GENERATE
+            {
+                // PGO training build (port/tools/pgo.sh game): write the
+                // profile once, XS_PGO_DUMP seconds in (the run is killed).
+                static bool dumped = false;
+                const char *at = std::getenv("XS_PGO_DUMP");
+                if (!dumped && at && beat * seconds >= std::atoi(at))
+                {
+                    __gcov_dump();
+                    dumped = true;
+                    std::cout << "[xenosaga] PGO profile written" << std::endl;
+                }
+            }
+#endif
             {
                 const uint64_t vsync = runtime.memory().gs().vsyncTick.load();
                 std::printf("  fps: game %.1f, vsync %.1f\n", flips.exchange(0) / double(seconds),
