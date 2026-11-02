@@ -11,6 +11,7 @@
 #include "ps2_stubs.h"
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +30,8 @@ void xs_register_ov12(PS2Runtime::RecompiledFunction *t);
 void xs_configureDiscImage();
 void ps2x_armGsCapture(); // gs_frontend.cpp
 bool ps2x_hostWidescreen(); // ps2_runtime.cpp (settings.ini aspect = 16:9)
+bool ps2x_hostSettingBool(const char *key, bool fallback); // ps2_runtime.cpp (settings.ini)
+void ps2x_setHostBadge(const char *text);                  // ps2_runtime.cpp (top-left label)
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void xs_sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -309,6 +312,222 @@ namespace
         g_ps2RecompiledFunctionTable[slot] = cameraViewScreen_widescreen;
     }
 
+    // ---------------------------------------------------------------------
+    // Gameplay options (settings.ini [gameplay]), ported from Beyond's PCSX2
+    // patch set (6D1276AB.pnach) as wrappers around the game's functions
+    // instead of code patches. A wrapper that calls the original checks
+    // runtime->m_checkpointYielded afterwards: the original was paused part
+    // way (another guest thread runs) and will finish on its own later, so
+    // the wrapper must not run its "after" logic then.
+    constexpr uint32_t kGameMode = 0x0033868Cu;        // u16, 5 = battle
+    constexpr uint32_t kBattleSignature = 0x00A09A90u; // 0x26027568 when the battle module is loaded
+    constexpr uint32_t kBattleState = 0x00A5756Cu;     // 1 = choosing commands
+    constexpr uint32_t kBattleCounter = 0x00A5A1E8u;   // battle frame counter
+    constexpr uint32_t kBattleHandler = 0x00A57B68u;   // current battle action handler
+    constexpr uint32_t kTurnInputState = 0x00A57578u;  // 0/1 attack screen, 4 action running, else menus
+    constexpr uint32_t kPadButtons = 0x00490DB8u;      // u16 held buttons (0x800 = Start)
+    constexpr uint32_t kFaceRemap = 0x00490DE8u;       // one byte per face button (Circle 5, Cross 6)
+
+    uint32_t readU32(const uint8_t *rdram, uint32_t addr)
+    {
+        uint32_t v;
+        std::memcpy(&v, rdram + (addr & kRdramMask), 4);
+        return v;
+    }
+
+    uint16_t readU16(const uint8_t *rdram, uint32_t addr)
+    {
+        uint16_t v;
+        std::memcpy(&v, rdram + (addr & kRdramMask), 2);
+        return v;
+    }
+
+    bool inBattle(const uint8_t *rdram)
+    {
+        return readU16(rdram, kGameMode) == 5u && readU32(rdram, kBattleSignature) == 0x26027568u;
+    }
+
+    struct GameOptions
+    {
+        bool fastForward = ps2x_hostSettingBool("battle_fast_forward", true);
+        bool hideFlash = ps2x_hostSettingBool("hide_battle_flash", false);
+        bool fasterCombos = ps2x_hostSettingBool("faster_combos", false);
+        bool swapConfirm = ps2x_hostSettingBool("swap_confirm_cancel", false);
+    };
+    const GameOptions &gameOptions()
+    {
+        static const GameOptions options; // read on first use, after settings.ini is loaded
+        return options;
+    }
+
+    PS2Runtime::RecompiledFunction g_renderSyncMoveOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_createEffectOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_isFinishEffectOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_battleExecOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_dataPadReadOriginal = nullptr;
+
+    // Battle fast-forward: Start in battle toggles it; while on (and not in
+    // the command menu) the frame limiter xglRenderSyncMove (0x22CC08) takes
+    // its one-vsync path (mode byte gp-0x37B4 = 1), so the game's full 30fps
+    // step runs as often as the port can manage, up to every 60Hz frame.
+    // Nothing is skipped. Also the once-per-frame place for the button swap.
+    void renderSyncMove_options(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const GameOptions &opt = gameOptions();
+        const bool battle = inBattle(rdram);
+
+        if (opt.swapConfirm) // field and menus: Circle confirms, Cross cancels
+        {
+            rdram[(kFaceRemap + 5u) & kRdramMask] = battle ? 0x20u : 0x40u;
+            rdram[(kFaceRemap + 6u) & kRdramMask] = battle ? 0x40u : 0x20u;
+        }
+
+        static bool fastForward = false;
+        static bool startWasDown = false;
+        if (!battle || !opt.fastForward)
+        {
+            fastForward = false;
+            startWasDown = false;
+        }
+        else
+        {
+            const bool startDown = (readU16(rdram, kPadButtons) & 0x0800u) != 0u;
+            if (startDown && !startWasDown)
+                fastForward = !fastForward;
+            startWasDown = startDown;
+        }
+        ps2x_setHostBadge(fastForward ? ">> x2" : nullptr);
+
+        const uint32_t state = readU32(rdram, kBattleState);
+        static uint32_t lastState = ~0u;
+        if (battle && state != lastState) // which states are what (results screen...)
+            std::printf("[options] battle state %u (fast-forward %d)\n", state, fastForward ? 1 : 0);
+        lastState = battle ? state : ~0u;
+
+        // The limiter reads the mode byte (gp-0x37B4; 0 = 30fps, 1 = 60fps,
+        // only the debug menu changes it) at its top. Set it for every frame
+        // rather than saving and restoring around the call: the call can be
+        // suspended inside its vsync wait and re-entered, and a restore could
+        // then leave the game stuck at 60.
+        uint8_t &mode = rdram[(GPR_U32(ctx, 28) - 0x37B4u) & kRdramMask];
+        static int baseMode = -1;
+        static bool modeForced = false;
+        if (baseMode < 0 || !modeForced)
+            baseMode = mode; // the game's own value while we're not forcing it
+
+        // At most one fast frame per 1/60 s of real time: after a slow
+        // stretch the emulated vsync briefly runs fast to catch up, which
+        // would otherwise play attacks at 3-4x.
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point lastFast{};
+        const Clock::time_point now = Clock::now();
+        const bool fast = fastForward && state != 1u && now - lastFast >= std::chrono::microseconds(16000);
+        if (fast)
+            lastFast = now;
+        mode = fast ? 1u : static_cast<uint8_t>(baseMode);
+        modeForced = fast;
+        g_renderSyncMoveOriginal(rdram, ctx, runtime);
+    }
+
+    // Hide battle flash: effect 17 is the full-screen flash. ID 0 creates nothing.
+    void createEffect_options(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gameOptions().hideFlash && GPR_U32(ctx, 4) == 17u)
+            SET_GPR_U32(ctx, 4, 0u);
+        g_createEffectOriginal(rdram, ctx, runtime);
+    }
+
+    // Faster combos, part 1: after each attack the battle (call at 0xA0CB9C
+    // in scenarioBatExecPhase50) waits until all effects have faded
+    // (sefIsFinishEffect != 0). Treat 4 consecutive ticks of waiting as done.
+    void isFinishEffect_options(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        g_isFinishEffectOriginal(rdram, ctx, runtime);
+        if (runtime->m_checkpointYielded || ra != 0x00A0CBA4u || !gameOptions().fasterCombos)
+            return;
+        static uint32_t ticks = 0;
+        static uint32_t lastCall = 0;
+        if (GPR_U32(ctx, 2) != 0u)
+        {
+            ticks = 0;
+            return;
+        }
+        const uint32_t now = readU32(rdram, kBattleCounter);
+        ticks = (now - lastCall < 5u) ? ticks + 1u : 1u; // calls in a row = one wait
+        lastCall = now;
+        if (ticks >= 4u)
+            SET_GPR_U32(ctx, 2, 1u);
+    }
+
+    // Faster combos, part 2: battleExec (0xA09A80, called once per battle tick
+    // from 0xA078D0) moves the battle state one step per tick. Between one
+    // action and the next (state 2 or 8 under handler 0xA0BEB8, moving to 8 or
+    // 1) run the following steps in the same tick, up to 6 in all.
+    void battleExec_options(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kReturn = 0x00A078D8u;
+        if (GPR_U32(ctx, 31) != kReturn || !gameOptions().fasterCombos)
+        {
+            g_battleExecOriginal(rdram, ctx, runtime);
+            return;
+        }
+        for (int steps = 6;;)
+        {
+            const uint32_t before = readU32(rdram, kBattleState);
+            g_battleExecOriginal(rdram, ctx, runtime);
+            if (runtime->m_checkpointYielded || --steps <= 0)
+                return;
+            const uint32_t after = readU32(rdram, kBattleState);
+            if (after == before || (before != 2u && before != 8u) ||
+                readU32(rdram, kBattleHandler) != 0x00A0BEB8u || (after != 8u && after != 1u))
+                return;
+            SET_GPR_U32(ctx, 31, kReturn);
+        }
+    }
+
+    // Swap confirm/cancel, battle menus: the battle reads buttons through
+    // dataPadRead (0xA1D2D0). Swap Circle (0x20) and Cross (0x40) only in the
+    // command menu, lists and target pickers (turn states 2-15 except 4).
+    void dataPadRead_options(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dataPadReadOriginal(rdram, ctx, runtime);
+        if (runtime->m_checkpointYielded || !gameOptions().swapConfirm)
+            return;
+        const uint32_t state = readU32(rdram, kTurnInputState);
+        if (state - 2u >= 14u || state == 4u)
+            return;
+        const uint32_t v = GPR_U32(ctx, 2);
+        const uint32_t swapped = (v & ~0x60u) | ((v & 0x20u) << 1) | ((v & 0x40u) >> 1);
+        SET_GPR_U32(ctx, 2, swapped);
+    }
+
+    // Puts a wrapper in the function table slot for addr; `original` keeps
+    // what was there (an overlay's slot is refilled whenever it loads).
+    void wrapSlot(uint32_t addr, PS2Runtime::RecompiledFunction wrapper, PS2Runtime::RecompiledFunction &original)
+    {
+        const uint32_t slot = (addr - g_ps2RecompiledFunctionTableBase) >> 2;
+        if (slot >= g_ps2RecompiledFunctionTableSlotCount)
+            return;
+        PS2Runtime::RecompiledFunction current = g_ps2RecompiledFunctionTable[slot];
+        if (!current || current == wrapper)
+            return;
+        original = current;
+        g_ps2RecompiledFunctionTable[slot] = wrapper;
+    }
+
+    void installGameOptionHooks(uint32_t overlay)
+    {
+        wrapSlot(0x0022CC08u, renderSyncMove_options, g_renderSyncMoveOriginal); // xglRenderSyncMove
+        wrapSlot(0x002E7830u, createEffect_options, g_createEffectOriginal);     // sefCreateEffectCf2
+        wrapSlot(0x002E7A18u, isFinishEffect_options, g_isFinishEffectOriginal); // sefIsFinishEffect
+        if (overlay == 1) // battle/field module
+        {
+            wrapSlot(0x00A09A80u, battleExec_options, g_battleExecOriginal);   // battleExec
+            wrapSlot(0x00A1D2D0u, dataPadRead_options, g_dataPadReadOriginal); // dataPadRead
+        }
+    }
+
     void xglCdLoadOverlay_hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
         const uint32_t id = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4])) & 0xFFu;
@@ -323,6 +542,7 @@ namespace
             std::cerr << "[xenosaga] failed to load overlay " << id << " (" << source << ")" << std::endl;
         activateOverlayFunctions(id);
         installWidescreenHook();
+        installGameOptionHooks(id);
         if (id == 1)
             if (const char *trace = std::getenv("XS_BATTLE_TRACE"); trace && trace[0] == '1')
                 installBattleTrace(std::make_index_sequence<sizeof(g_battleTrace) / sizeof(g_battleTrace[0])>{});

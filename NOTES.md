@@ -109,6 +109,31 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Gameplay options from Beyond's PCSX2 patch (2026-11-02, runs/opts1-4)
+
+settings.ini `[gameplay]`, implemented in `xenosaga_overlays.cpp` as
+function-table wrappers (no code patches):
+- `battle_fast_forward` (default on): Start in battle (mode 0x33868C == 5,
+  battle module signature 0xA09A90 == 0x26027568) toggles it; badge ">> x2"
+  via `ps2x_setHostBadge`. While on and battle state 0xA5756C != 1, the
+  frame limiter `xglRenderSyncMove` (0x22CC08) gets its 60fps mode byte
+  (gp-0x37B4 = 0x4DC3BC, 1 = one vsync per frame). The byte is set every
+  frame (base value captured while not forcing), never saved/restored: the
+  call is suspended in its vsync wait and re-entered, and a restore left the
+  game stuck at 60 (opts1-3). Fast frames are capped at one per 16 ms real
+  time: the emulated vsync runs fast after a slow stretch to catch up (seen
+  at 109 Hz). opts4: actions 35-45 fps (port-bound), back to 30 after.
+- `hide_battle_flash`: `sefCreateEffectCf2` (0x2E7830) with id 17 -> id 0.
+- `faster_combos`: `sefIsFinishEffect` (0x2E7A18) called from 0xA0CB9C
+  (ra 0xA0CBA4) returns done after 4 consecutive waiting ticks (counter
+  0xA5A1E8); `battleExec` (0xA09A80, ra 0xA078D8) runs up to 6 steps per tick
+  between actions (state 2/8 under handler 0xA0BEB8 moving to 8/1).
+- `swap_confirm_cancel` (untested): face remap bytes 0x490DED/EE swapped
+  outside battle; `dataPadRead` (0xA1D2D0) result swaps 0x20/0x40 in turn
+  states 2-15 except 4 (0xA57578).
+Wrappers that run logic after the original check `runtime->m_checkpointYielded`.
+Not ported: the pnach's 60 FPS sections (need perf headroom first).
+
 ## Modern PC features (2026-11-02, runs/modern2-4, wide1)
 
 Host side, all in `ps2_runtime.cpp` (presenter) and `ps2_pad.cpp`:

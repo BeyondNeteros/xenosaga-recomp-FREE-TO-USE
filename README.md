@@ -45,6 +45,9 @@ Start the game with `Launch Xenosaga.bat`. On first start it writes
 - **Sound:** `volume` in settings.ini; the game goes quiet while another
   window is in front (`mute_when_unfocused`).
 - The window remembers its size; the mouse pointer hides after two seconds.
+- **Gameplay options** (`[gameplay]` in settings.ini): battle fast-forward
+  (press Start in a battle; on by default), hide the battle screen flash,
+  faster combos, and swap confirm/cancel (Circle confirms).
 
 ## How it works
 
