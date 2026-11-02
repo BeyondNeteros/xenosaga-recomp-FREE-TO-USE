@@ -109,6 +109,19 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Profile-guided optimisation (2026-11-01, runs/pgo1)
+
+- `bash port/tools/pgo.sh`: instrumented vu1_replay in PS2Recomp/build-pgo
+  (CMake `PS2X_PGO_GENERATE`), trained on every runs/*/vu1_capture.bin, the
+  .gcda files copied next to the objects in build-runtime, rebuilt with
+  `PS2X_PGO_USE=ON` (VU1 core/upper/lower, VIF1, memory, GS files and the
+  native blocks only). ~2.5 min.
+- 110/110 captures identical; 9.15 -> 8.2 ns per VU cycle; game ~20.7 ->
+  22.2 fps, picture correct.
+- Rerun pgo.sh after changing VU1/GS code or regenerating native blocks
+  (stale profiles are ignored per function, so a forgotten rerun only loses
+  speed). -fprofile-dir cannot be used: the project path has spaces.
+
 ## VU1 bookkeeping trimmed (2026-11-01, runs/vu1opt1)
 
 - Profile (vu1_replay, runs/fbsnap1 capture): native block bodies ~48%, the
