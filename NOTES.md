@@ -109,6 +109,21 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Native branches, wider dead flags, bigger flag ring (2026-11-01, runs/br1)
+
+- lowerC inlines B/BAL/JR/JALR/IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ (VI read
+  through the branch backup, as readBranchVi); block-end pairs use
+  `finishPairC<U, L>` (E/D/T bits and "lower is a branch" are constants).
+- Dead flag rule widened: op i is dead if the next MAC/status writer j is
+  >= 4 pairs before the block end and no flag read sits in pairs i+1..j+3
+  (472/741 ops now, was 155). Flag ring 8 -> 32 entries.
+- PGO profiles go stale when code changes and can then fail the build
+  ("profile data is not flow-consistent"): build-runtime now also passes
+  -fprofile-correction; for iterating, configure with -DPS2X_PGO_USE=OFF and
+  run pgo.sh at the end.
+- 111/111 captures identical; 8.2 -> 7.0 ns per VU cycle (PGO on both);
+  game 22.2 -> 23.6 fps. GS thread now ~73% busy, gssync ~10%.
+
 ## Profile-guided optimisation (2026-11-01, runs/pgo1)
 
 - `bash port/tools/pgo.sh`: instrumented vu1_replay in PS2Recomp/build-pgo

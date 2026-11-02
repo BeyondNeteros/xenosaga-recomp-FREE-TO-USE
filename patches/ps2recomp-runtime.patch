@@ -1517,7 +1517,7 @@ index 509fd07..33ff0f5 100644
  
      std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..3282b20 100644
+index 589d768..c6f50f4 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -253,7 +253,7 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
@@ -1628,7 +1628,7 @@ index 589d768..3282b20 100644
 +        endforeach()
 +    else()
 +        set_property(SOURCE ${PS2X_PGO_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
-+                     "-fprofile-use;-fprofile-partial-training;-Wno-missing-profile;-Wno-coverage-mismatch")
++                     "-fprofile-use;-fprofile-partial-training;-fprofile-correction;-Wno-missing-profile;-Wno-coverage-mismatch")
 +    endif()
 +endif()
 diff --git a/ps2xRuntime/cmake/ReleaseMode.cmake b/ps2xRuntime/cmake/ReleaseMode.cmake
@@ -1997,7 +1997,7 @@ index 0000000..5dc4984
 +    };
 +}
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
-index 67c8184..1f8af98 100644
+index 67c8184..dda50e7 100644
 --- a/ps2xRuntime/include/runtime/ps2_vu1.h
 +++ b/ps2xRuntime/include/runtime/ps2_vu1.h
 @@ -2,7 +2,10 @@
@@ -2070,6 +2070,15 @@ index 67c8184..1f8af98 100644
      enum Pipeline : uint8_t
      {
          PipelineNone = 0,
+@@ -193,7 +247,7 @@ private:
+ 
+     static constexpr uint32_t kFmacLatency = 4u;
+     static constexpr uint32_t kAccForwardLatency = 1u;
+-    static constexpr uint32_t kMaxFlagEntries = 8u;
++    static constexpr uint32_t kMaxFlagEntries = 32u;
+     static constexpr uint32_t kMaxPendingStores = 8u;
+     static constexpr uint32_t kMaxPendingVfWrites = 16u;
+     static constexpr uint32_t kMaxPendingViWrites = 8u;
 @@ -209,17 +263,53 @@ private:
      uint64_t m_cachedCodeGeneration = 0;
      bool m_decodedCodeCacheValid = false;
@@ -2197,10 +2206,10 @@ index 67c8184..1f8af98 100644
  #endif
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1_fastops.h b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
 new file mode 100644
-index 0000000..7a180a8
+index 0000000..e9422ff
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,716 @@
 +#ifndef PS2_VU1_FASTOPS_H
 +#define PS2_VU1_FASTOPS_H
 +
@@ -2719,8 +2728,111 @@ index 0000000..7a180a8
 +            if constexpr (viT != 0)
 +                vu.m_state.vi[viT] = static_cast<int16_t>(vu.m_state.vi[viT] + 1);
 +        }
++        else if constexpr (opHi == 0x20u || opHi == 0x21u || opHi == 0x24u || opHi == 0x25u ||
++                           opHi == 0x28u || opHi == 0x29u || (opHi >= 0x2Cu && opHi <= 0x2Fu))
++        {
++            // Branches (same code as execLower; native blocks are VU1, 16 KB
++            // of microcode). Conditions read VI through the branch backup.
++            constexpr uint32_t pcMask = 0x3FFFu;
++            const auto branchVi = [&](uint8_t reg) -> int16_t
++            {
++                if (reg == 0u)
++                    return 0;
++                if (vu.m_viBranchBackupValid && vu.m_viBranchBackupReg == reg)
++                    return static_cast<int16_t>(vu.m_viBranchBackupValue);
++                return static_cast<int16_t>(vu.m_state.vi[reg]);
++            };
++            bool taken = true;
++            uint32_t target;
++            if constexpr (opHi == 0x24u || opHi == 0x25u) // JR / JALR
++                target = (static_cast<uint32_t>(static_cast<uint16_t>(branchVi(viS))) * 8u) & pcMask;
++            else
++            {
++                target = (vu.m_state.pc + 8u + static_cast<uint32_t>(static_cast<int32_t>(imm11) * 8)) & pcMask;
++                if constexpr (opHi == 0x28u)
++                    taken = branchVi(viS) == branchVi(viT);
++                else if constexpr (opHi == 0x29u)
++                    taken = branchVi(viS) != branchVi(viT);
++                else if constexpr (opHi == 0x2Cu)
++                    taken = branchVi(viS) < 0;
++                else if constexpr (opHi == 0x2Du)
++                    taken = branchVi(viS) > 0;
++                else if constexpr (opHi == 0x2Eu)
++                    taken = branchVi(viS) <= 0;
++                else if constexpr (opHi == 0x2Fu)
++                    taken = branchVi(viS) >= 0;
++            }
++            if constexpr ((opHi == 0x21u || opHi == 0x25u) && viT != 0) // BAL / JALR link
++                vu.m_state.vi[viT] = static_cast<int32_t>((vu.m_state.pc + 16u) / 8u);
++            if (taken)
++            {
++                vu.m_state.branchPending = true;
++                vu.m_state.branchTarget = target;
++                vu.m_state.branchDelay = 1;
++            }
++        }
 +        else
 +            vu.execLower(L, data, dataSize, gs, memory, U);
++    }
++
++    // finishPair with the pair's words as constants (E/D/T bits and whether
++    // the lower op is a branch fold away). Same logic as
++    // VU1Interpreter::finishPair.
++    template <uint32_t U, uint32_t L>
++    static PS2X_VU1_INLINE bool finishPairC(Vu &vu, uint32_t codeSize)
++    {
++        constexpr bool eBit = (U & 0x40000000u) != 0u;
++        constexpr bool dBit = (U & 0x10000000u) != 0u;
++        constexpr bool tBit = (U & 0x08000000u) != 0u;
++        constexpr uint32_t opHi = (L >> 25) & 0x7Fu;
++        constexpr bool lowerBranch = (U & 0x80000000u) == 0u && opHi >= 0x20u && opHi <= 0x2Fu;
++        bool ended = false;
++        vu.m_state.vf[0][0] = 0.0f;
++        vu.m_state.vf[0][1] = 0.0f;
++        vu.m_state.vf[0][2] = 0.0f;
++        vu.m_state.vf[0][3] = 1.0f;
++        vu.m_state.vi[0] = 0;
++        uint32_t nextPc = vu.m_state.pc + 8u;
++        if (nextPc >= codeSize)
++            nextPc = 0u;
++        vu.m_state.pc = nextPc;
++        if (vu.m_state.branchPending)
++        {
++            if (vu.m_state.branchDelay == 0u)
++            {
++                vu.m_state.pc = vu.m_state.branchTarget & 0x3FFFu;
++                vu.m_state.branchPending = false;
++            }
++            else
++                --vu.m_state.branchDelay;
++        }
++        const bool dHalt = dBit && vu.m_state.dBitEnabled;
++        const bool tHalt = tBit && vu.m_state.tBitEnabled;
++        const bool haltBit = dHalt || tHalt;
++        const bool haltBranch = haltBit && lowerBranch;
++        if (vu.m_state.haltAfterDelaySlot)
++        {
++            vu.m_state.stoppedByD = vu.m_pendingHaltD;
++            vu.m_state.stoppedByT = vu.m_pendingHaltT;
++            ended = true;
++        }
++        else if (vu.m_state.ebit)
++            ended = true;
++        else if (haltBit && !haltBranch)
++        {
++            vu.m_state.stoppedByD = dHalt;
++            vu.m_state.stoppedByT = tHalt;
++            ended = true;
++        }
++        else if constexpr (eBit)
++            vu.m_state.ebit = true;
++        else if (haltBranch)
++        {
++            vu.m_state.haltAfterDelaySlot = true;
++            vu.m_pendingHaltD = dHalt;
++            vu.m_pendingHaltT = tHalt;
++        }
++        return ended;
 +    }
 +
 +    // End of a "plain" pair (see StaticBlock::plain).

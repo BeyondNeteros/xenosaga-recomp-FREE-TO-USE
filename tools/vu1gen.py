@@ -63,21 +63,25 @@ def reads_flags(lower, upper):
 
 
 def dead_flag_pairs(pairs):
-    """Plain pairs whose FMAC flag entry nobody can observe: the block reads no
-    flags, and a later MAC/status write at least 4 pairs before the block's
-    end (so at least 4 cycles earlier) replaces it before the block ends.
-    Its sticky bits are folded into the next live entry instead."""
-    if any(reads_flags(lo, up) for lo, up, _ in pairs):
-        return set()
+    """Plain pairs whose FMAC flag entry nobody can observe. For op i take the
+    next MAC/status writer j: if j is at least 4 pairs before the block's end
+    (its entry commits before the block ends) and no flag read sits in pairs
+    i+1 .. j+3 (a read in pair k sees entries ready by its cycle, and pair
+    k >= j+4 is at least 4 cycles after j), i's MAC/status is replaced before
+    anything can read it. Its sticky bits are folded into the next entry."""
     n = len(pairs)
+    reads = [reads_flags(lo, up) for lo, up, _ in pairs]
+    writers = [writes_mac(up) for _, up, _ in pairs]
     dead = set()
-    later_writer = False
-    for i in range(n - 1, -1, -1):
-        lower, upper, plain = pairs[i]
-        if later_writer and plain and not plain & 8 and plain & 2 and writes_mac(upper):
-            dead.add(i)
-        if i <= n - 5 and writes_mac(upper):
-            later_writer = True
+    for i, (lower, upper, plain) in enumerate(pairs):
+        if not (plain and not plain & 8 and plain & 2 and writers[i]):
+            continue
+        j = next((k for k in range(i + 1, n) if writers[k]), None)
+        if j is None or j > n - 5:
+            continue
+        if any(reads[k] for k in range(i + 1, min(n, j + 4))):
+            continue
+        dead.add(i)
     return dead
 
 
@@ -99,7 +103,7 @@ def emit_block(key, start, pairs):
             # shadow or branch-VI handling (8): full pair logic, constant words.
             lines.append(f"    F::pair<0x{upper:08x}u, 0x{lower:08x}u>(vu, F::decoded(vu, s + {i}u), d, ds, gs, m);")
             if plain == 0:
-                lines.append(f"    ended = F::finishPair(vu, F::decoded(vu, s + {i}u), cs);")
+                lines.append(f"    ended = F::finishPairC<0x{upper:08x}u, 0x{lower:08x}u>(vu, cs);")
             else:
                 lines.append("    F::plainEndKeepBackup(vu);")
             continue
