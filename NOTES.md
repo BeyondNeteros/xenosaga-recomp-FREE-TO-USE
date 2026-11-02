@@ -109,6 +109,19 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## PGO trained on the game (2026-11-01, runs/pgogame1)
+
+- In-game profile (runs/prof2, XS_PROFILE) showed the hottest VU1 blocks in
+  the game are not the ones in the short captures, so the capture-trained
+  profile missed them. `bash port/tools/pgo.sh game` builds the PGO sources
+  instrumented in build-runtime (non-atomic counters), plays the tutorial
+  script, the heartbeat calls __gcov_dump() at XS_PGO_DUMP=160 s (heartbeat
+  time starts after boot), then rebuilds with PS2X_PGO_USE and installs.
+- 113/113 captures identical; game 23.6 -> 26.8 fps, picture correct. Now
+  the GS thread is nearly as busy as the VU1 worker (gs 79%, vif1 92%).
+- Note: run_game.sh force-closes any running XenosagaRecomp.exe at start
+  and end; tell Beyond before unattended runs.
+
 ## Native branches, wider dead flags, bigger flag ring (2026-11-01, runs/br1)
 
 - lowerC inlines B/BAL/JR/JALR/IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ (VI read
