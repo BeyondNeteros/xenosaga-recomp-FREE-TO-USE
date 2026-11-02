@@ -1,4 +1,9 @@
 
+## Known broken, parked until 30 fps (reported 2026-11-01)
+
+- Battles: the game skips them entirely (not investigated yet).
+- Music: parts of songs missing (see "Sound playing" for what the SPU2 lacks).
+
 ## Garbage 3D textures: fixed (2026-11-01, runs/fix1)
 
 Scenes rendered with noise on every 3D surface. Cause: PS2Recomp replaces
