@@ -109,6 +109,17 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## GS sync narrowed (2026-11-01, runs/sync1)
+
+The main thread spent 33% waiting for the async GS: every CSR write synced
+the GS queue, and xglRenderDispEnvMove writes CSR = 0x10 (EDWINT ack) every
+frame. Now CSR writes only sync when they clear SIGNAL/FINISH (bits 0-1), and
+only CSR/SIGLBLID reads sync. Game 12 -> 15.4 fps, picture correct.
+New diagnostics: heartbeat `gssync` (time waiting for the GS, any thread incl.
+the presentation latch) and `eeidle` (scheduler waiting on host time);
+`PS2X_GS_SYNC_LOG=<n>` prints the EE pc/ra of each sync; XS_PROFILE now also
+writes per-thread samples ("texe" lines).
+
 ## Sound playing (2026-11-01, runs/spu8)
 
 ps2xIOP now has an SPU2 (`src/emulator/core/iop_spu2.*`): register file for

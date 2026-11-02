@@ -89,6 +89,7 @@ namespace
         std::map<DWORD, HANDLE> threads;
         std::map<uint64_t, unsigned> pcs;
         std::map<DWORD, unsigned> perThread;
+        std::map<std::pair<DWORD, uint64_t>, unsigned> threadPcs;
         timeBeginPeriod(1);
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         for (unsigned tick = 0; std::chrono::steady_clock::now() < end; ++tick)
@@ -114,6 +115,7 @@ namespace
                 if (GetThreadContext(t.second, &ctx))
                 {
                     ++pcs[ctx.Rip];
+                    ++threadPcs[{t.first, ctx.Rip}];
                     ++perThread[t.first];
                 }
                 ResumeThread(t.second);
@@ -146,6 +148,14 @@ namespace
                 std::fprintf(f, "module %u %s\n", kv.second, kv.first.c_str());
             for (const auto &kv : exeOffsets)
                 std::fprintf(f, "exe %llx %u\n", static_cast<unsigned long long>(kv.first), kv.second);
+            // Per thread, exe samples only: "texe <thread> <offset> <count>".
+            for (const auto &kv : threadPcs)
+            {
+                const uint64_t pc = kv.first.second;
+                if (exeOffsets.count(pc - exeBase) != 0u)
+                    std::fprintf(f, "texe %lu %llx %u\n", static_cast<unsigned long>(kv.first.first),
+                                 static_cast<unsigned long long>(pc - exeBase), kv.second);
+            }
             std::fclose(f);
         }
         for (const auto &t : threads)
@@ -374,7 +384,7 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                 lastVsync = vsync;
             }
             {
-                static const char *names[] = {"vu1", "gs", "vif1"};
+                static const char *names[] = {"vu1", "gs", "vif1", "gssync", "eeidle"};
                 std::printf("  host time over last %ds:", seconds);
                 for (uint32_t c = 0; c < ps2_profile::Count; ++c)
                 {
