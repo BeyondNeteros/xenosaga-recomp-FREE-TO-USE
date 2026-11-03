@@ -28,6 +28,12 @@ set "XS_DISC_IMAGE=%DISC%"
 rem VU1 code blocks without a native version yet are listed in vu1_blocks.vbl,
 rem so the next build can include them (tools/vu1gen.py). Small and cheap.
 set "PS2X_VU1_BLOCKLOG=%~dp0vu1_blocks.vbl"
+rem Every session's controller input is saved (inputs-last.txt; the one
+rem before is inputs-prev.txt) so a problem can be replayed exactly.
+rem The log of the session before is kept as xenosaga-prev.log.
+if exist "%~dp0inputs-last.txt" move /y "%~dp0inputs-last.txt" "%~dp0inputs-prev.txt" >nul
+if exist "%~dp0xenosaga.log" move /y "%~dp0xenosaga.log" "%~dp0xenosaga-prev.log" >nul
+set "PS2X_INPUT_RECORD=%~dp0inputs-last.txt"
 
 rem Debug recorders (off for normal play; they cost speed). Remove "rem" to use:
 rem   VU1 capture when VU1 is the bottleneck (vu1_capture.bin):

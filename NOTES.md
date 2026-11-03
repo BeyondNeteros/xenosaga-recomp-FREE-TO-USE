@@ -109,6 +109,18 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Every session is recorded (2026-11-02)
+
+Both launchers set PS2X_INPUT_RECORD=inputs-last.txt (previous session moved
+to inputs-prev.txt, previous log to xenosaga-prev.log). Replay a reported
+problem with `run_game.sh <name> <s> --input "<game>/inputs-last.txt"`.
+The old rec1 recording no longer reaches the field (recorded on a build
+with broken battles; it now desyncs into a tutorial fight), and there is no
+save on mc0, so the slow first field area (GS 99% until a battle) still has
+no unattended repro. Next session of Beyond's that goes there provides one.
+VU1 native blocks regenerated with Beyond's field/battle block log
+(runs/vu1blocks/game-1102.vbl): 326 blocks, vu1_check all ok.
+
 ## Shareable builder and launcher (2026-11-02, launcher-test, runs/fresh1-2)
 
 `Xenosaga Launcher.bat` -> `launcher/launcher.ps1` (WinForms, no extra

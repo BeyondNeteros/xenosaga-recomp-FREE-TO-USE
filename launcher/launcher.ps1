@@ -323,6 +323,13 @@ $btnPlay.Add_Click({
     $psi.EnvironmentVariables['XS_DISC_IMAGE'] = $State.iso
     $psi.EnvironmentVariables['XS_NO_SOUND'] = '0'
     $psi.EnvironmentVariables['PS2X_VU1_BLOCKLOG'] = (Join-Path $GameDir 'vu1_blocks.vbl')
+    # Keep this session's controller input and the previous session's log, so a
+    # problem can be replayed exactly.
+    foreach ($pair in @(@('inputs-last.txt', 'inputs-prev.txt'), @('xenosaga.log', 'xenosaga-prev.log'))) {
+        $from = Join-Path $GameDir $pair[0]
+        if (Test-Path $from) { Move-Item -Force $from (Join-Path $GameDir $pair[1]) }
+    }
+    $psi.EnvironmentVariables['PS2X_INPUT_RECORD'] = (Join-Path $GameDir 'inputs-last.txt')
     $script:game = [System.Diagnostics.Process]::Start($psi)
     $form.Hide()
 })
