@@ -34,6 +34,9 @@ rem The log of the session before is kept as xenosaga-prev.log.
 if exist "%~dp0inputs-last.txt" move /y "%~dp0inputs-last.txt" "%~dp0inputs-prev.txt" >nul
 if exist "%~dp0xenosaga.log" move /y "%~dp0xenosaga.log" "%~dp0xenosaga-prev.log" >nul
 set "PS2X_INPUT_RECORD=%~dp0inputs-last.txt"
+rem Sound driver watch (a few log lines every 5 s): shows what a frozen battle
+rem waits on. Remove once the battle freeze is fixed.
+set "PS2X_IOP_WATCH=58da0:190,58f24:10,5fa08:10"
 
 rem Debug recorders (off for normal play; they cost speed). Remove "rem" to use:
 rem   VU1 capture when VU1 is the bottleneck (vu1_capture.bin):

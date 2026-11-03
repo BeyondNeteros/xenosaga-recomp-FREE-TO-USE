@@ -109,6 +109,39 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## First field area: window at 1-2 fps fixed, scenery 24% faster (2026-11-02, runs/ffcap1, ffrep1-5)
+
+Beyond's session to the first field area (runs/field-freeze/inputs-last.txt
++ session2.log) replays unattended: the field is at ~140-190 s. GS capture
+there: runs/ffcap1/gs_capture.bin (12 frames, 45.4 ms/frame vs 5.9 in battle).
+- Why the window was at 1-2 fps while the game made ~20: the presenter
+  (`latchHostPresentationFrame`) called `sync()`, waiting for the whole GS
+  backlog (up to 64 MB, over half a second in the field). Now with the async
+  GS it queues an `AsyncQueue::Present` command carrying the request; the GS
+  worker carries it out when it gets there (draws, stores the frame) and
+  the window shows the latest stored frame without waiting. One present per
+  new game frame (dispfb1 change), at most 4 queued. kMaxPendingBytes 64 MB
+  -> 8 MB (about two heavy frames) keeps the picture and input current.
+  The fps overlay (F3) counts new frames handed to the window
+  (`ps2x_presentedFrameCount`); `[present] window showed N new frames/s`
+  is logged every 5 s. ffrep5: field game 20-23 fps, window ~20.
+- Why it was heavy: ~4000 big ground triangles per frame, mostly off
+  screen (14 Mpix raw vs 0.22 Mpix on screen). `DrawTriangle` tested every
+  pixel of the scissor-clipped bounding box; it now solves each row's span
+  from the edge equations (+1 px slack, exact test unchanged). Same VRAM
+  hash on every capture. Field capture 45.4 -> 34.5 ms/frame (PGO on).
+- Still slow: single-thread profile = texture sampling ~48%, WritePixel 17%;
+  8 threads only ~3x: ~180 feedback triangles/frame (texture = frame
+  buffer) are drawn ordered on one thread with a drain each (~15%), plus the
+  main thread draws band 0 and does uploads. Ideas: snapshot groups of
+  feedback triangles, SIMD span loop, dedicated band workers.
+- Battle freeze not fixed (session2.log, 0x2409F0 again; my IOP interrupt
+  change didn't cure it). The replay doesn't freeze: it's a race.
+  `PS2X_IOP_WATCH=58da0:190,58f24:10,5fa08:10` (on in Launch Xenosaga.bat)
+  dumps SSD's DMA manager (0x58DA0: +0 flags, +0x180 current buffer),
+  next-wave state (0x58F24) and RSSD's client queue every 5 s with the IOP
+  interrupt state, for the next freeze. (SSD loads at 0x48500, RSSD 0x5C900.)
+
 ## Every session is recorded (2026-11-02)
 
 Both launchers set PS2X_INPUT_RECORD=inputs-last.txt (previous session moved

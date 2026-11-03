@@ -1021,19 +1021,37 @@ index da3be3b..6c9af35 100644
          const auto enabled = m_enabled.find(irq);
          if (enabled == m_enabled.end() || !enabled->second)
              return false;
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.h b/ps2xIOP/src/emulator/imports/iop_intrman.h
+index 48fdb14..07173d2 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.h
+@@ -17,6 +17,11 @@ namespace ps2x::iop::detail
+         void reset();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
++        [[nodiscard]] bool isEnabled(int irq) const
++        {
++            const auto it = m_enabled.find(irq);
++            return it != m_enabled.end() && it->second;
++        }
+ 
+     private:
+         struct Handler
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..7d89f4b 100644
+index e5f63a9..d794017 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -17,6 +17,7 @@
+@@ -17,6 +17,9 @@
  #include "imports/iop_vblank.h"
  #include "iop_emulator_const.h"
  
++#include <cstdlib>
++#include <vector>
 +#include <cstdio>
  #include <algorithm>
  #include <cctype>
  #include <map>
-@@ -402,10 +403,22 @@ namespace ps2x::iop::detail
+@@ -402,10 +405,22 @@ namespace ps2x::iop::detail
              CpuState *previous = activeCpu;
              activeCpu = &cpu;
              const uint64_t start = totalInstructions;
@@ -1058,7 +1076,7 @@ index e5f63a9..7d89f4b 100644
                  if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                      servicePendingDmaInterrupts();
                  if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
-@@ -483,6 +496,21 @@ namespace ps2x::iop::detail
+@@ -483,6 +498,21 @@ namespace ps2x::iop::detail
          // Not that good to use exception handling for control flow but will do for now
          void servicePendingDmaInterrupts()
          {
@@ -1080,7 +1098,60 @@ index e5f63a9..7d89f4b 100644
              if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
                  return;
  
-@@ -588,6 +616,34 @@ namespace ps2x::iop::detail
+@@ -553,10 +583,52 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
++        // PS2X_IOP_WATCH=addr:len,addr:len (hex): every ~5 s of IOP time, dump
++        // those IOP memory ranges plus the interrupt state (sound-driver hangs).
++        void watchDump()
++        {
++            static const std::vector<std::pair<uint32_t, uint32_t>> ranges = []
++            {
++                std::vector<std::pair<uint32_t, uint32_t>> out;
++                const char *env = std::getenv("PS2X_IOP_WATCH");
++                for (const char *p = env; p && *p;)
++                {
++                    char *end = nullptr;
++                    const uint32_t addr = static_cast<uint32_t>(std::strtoul(p, &end, 16));
++                    uint32_t len = 16u;
++                    if (end && *end == ':')
++                        len = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
++                    out.emplace_back(addr, len);
++                    p = (end && *end == ',') ? end + 1 : nullptr;
++                }
++                return out;
++            }();
++            static uint64_t nextDump = 0;
++            if (ranges.empty() || totalCycles < nextDump)
++                return;
++            nextDump = totalCycles + 184'000'000u;
++            std::fprintf(stderr, "[iop-watch] cycle=%llu intctl=%u mask=%08x stat=%08x en36=%d en40=%d en9=%d pending:",
++                         static_cast<unsigned long long>(totalCycles), memory.interruptControl(), memory.interruptMask(),
++                         memory.interruptStatus(), intrman.isEnabled(36) ? 1 : 0, intrman.isEnabled(40) ? 1 : 0,
++                         intrman.isEnabled(9) ? 1 : 0);
++            for (const auto &[irq, due] : pendingDmaInterrupts)
++                std::fprintf(stderr, " %d@%+lld", irq, static_cast<long long>(due - totalCycles));
++            std::fprintf(stderr, "\n");
++            for (const auto &[addr, len] : ranges)
++            {
++                std::fprintf(stderr, "[iop-watch] %06x:", addr);
++                for (uint32_t off = 0; off < len; off += 4u)
++                    std::fprintf(stderr, "%s%08x", (off % 32u) == 0u && off ? "\n[iop-watch]        " : " ",
++                                 memory.read32(addr + off));
++                std::fprintf(stderr, "\n");
++            }
++        }
++
+         void runCycles(uint64_t cycles) noexcept
+         {
+             try
+             {
++                watchDump();
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
+@@ -588,6 +660,34 @@ namespace ps2x::iop::detail
              }
          }
  
@@ -1115,7 +1186,7 @@ index e5f63a9..7d89f4b 100644
          ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
          {
              ModuleLoadResult result{true, -1, -1};
-@@ -632,6 +688,13 @@ namespace ps2x::iop::detail
+@@ -632,6 +732,13 @@ namespace ps2x::iop::detail
              result.startResult = static_cast<int32_t>(startResult);
              modules[module.id] = std::move(module);
  
@@ -1129,7 +1200,7 @@ index e5f63a9..7d89f4b 100644
              std::ostringstream out;
              out << "[IOP] loaded IRX id=" << result.moduleId
                  << " entry=0x" << std::hex << modules[result.moduleId].entry
-@@ -822,6 +885,33 @@ namespace ps2x::iop::detail
+@@ -822,6 +929,33 @@ namespace ps2x::iop::detail
          return static_cast<uint32_t>(m_impl->kernel.threadCount());
      }
  
@@ -3719,11 +3790,14 @@ index 5e9a446..c9e168d 100644
 +    bool queueEeRpcFromIop(PS2Runtime *runtime, ps2x::iop::EeRpcCall call);
  }
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index f0ad507..4ca16da 100644
+index f0ad507..a3943d1 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-@@ -8,8 +8,11 @@
+@@ -6,10 +6,14 @@
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_memory.h"
  #include "ps2_log.h"
++#include <chrono>
  #include <atomic>
  #include <algorithm>
 +#include <cfenv>
@@ -3734,7 +3808,7 @@ index f0ad507..4ca16da 100644
  #include <cstring>
  #include <fstream>
  #include <iostream>
-@@ -292,11 +295,49 @@ namespace
+@@ -292,11 +296,49 @@ namespace
          return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
      }
  
@@ -3785,7 +3859,7 @@ index f0ad507..4ca16da 100644
      }
  }
  
-@@ -442,6 +483,32 @@ namespace
+@@ -442,6 +484,32 @@ namespace
      }
  }
  
@@ -3818,7 +3892,7 @@ index f0ad507..4ca16da 100644
  GSCpuBackend::GSCpuBackend()
  {
      using namespace GSMem;
-@@ -510,9 +577,391 @@ GSCpuBackend::GSCpuBackend()
+@@ -510,9 +578,391 @@ GSCpuBackend::GSCpuBackend()
              break;
          }
      }
@@ -4210,7 +4284,7 @@ index f0ad507..4ca16da 100644
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
      if (vram && vramSize < GSMem::MEMORY_SIZE)
-@@ -532,6 +981,7 @@ void GSCpuBackend::Reset()
+@@ -532,6 +982,7 @@ void GSCpuBackend::Reset()
  
  void GSCpuBackend::ResetUnlocked()
  {
@@ -4218,7 +4292,7 @@ index f0ad507..4ca16da 100644
      m_clut.fill(0u);
      m_clutCbp.fill(0u);
      m_texturePageCache.Invalidate();
-@@ -548,7 +998,55 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -548,7 +999,55 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
@@ -4275,7 +4349,7 @@ index f0ad507..4ca16da 100644
  }
  
  void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
-@@ -585,7 +1083,21 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -585,7 +1084,21 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
          return;
      }
  
@@ -4297,7 +4371,7 @@ index f0ad507..4ca16da 100644
  }
  
  void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
-@@ -638,7 +1150,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+@@ -638,7 +1151,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
  
  void GSCpuBackend::Flush()
  {
@@ -4307,7 +4381,7 @@ index f0ad507..4ca16da 100644
  }
  
  void GSCpuBackend::TextureFlush()
-@@ -655,6 +1168,7 @@ void GSCpuBackend::Sync(GSSyncReason)
+@@ -655,6 +1169,7 @@ void GSCpuBackend::Sync(GSSyncReason)
  uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4315,7 +4389,7 @@ index f0ad507..4ca16da 100644
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
  
-@@ -670,12 +1184,13 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+@@ -670,12 +1185,13 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
      if (!m_vram)
          return 0u;
  
@@ -4330,7 +4404,7 @@ index f0ad507..4ca16da 100644
      WriteVramUnlocked(psm, base, bw, x, y, value);
  }
  
-@@ -689,6 +1204,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+@@ -689,6 +1205,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
  void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4338,7 +4412,7 @@ index f0ad507..4ca16da 100644
      if (!m_vram || m_vramSize == 0u)
      {
          out.clear();
-@@ -848,6 +1364,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -848,6 +1365,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
  {
@@ -4347,7 +4421,7 @@ index f0ad507..4ca16da 100644
      const auto &ctx = state.context;
      if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
          return;
-@@ -1033,21 +1551,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -1033,21 +1552,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
          clutIndex = block + (sourceIndex & 0x0Fu);
      }
  
@@ -4373,7 +4447,7 @@ index f0ad507..4ca16da 100644
      default:
          break;
      }
-@@ -1083,80 +1602,53 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1083,80 +1603,53 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          texVf = t * invQ * static_cast<float>(texH);
      }
  
@@ -4497,7 +4571,7 @@ index f0ad507..4ca16da 100644
  }
  
  void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
-@@ -1236,6 +1728,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1236,6 +1729,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
  
          for (int y = drawY0; y <= drawY1; ++y)
          {
@@ -4506,16 +4580,58 @@ index f0ad507..4ca16da 100644
              float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
              float texVf = v0f + (v1f - v0f) * ty;
  
-@@ -1313,6 +1807,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1311,10 +1806,49 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
  
++    // Each barycentric weight is linear in px on a row: w = a * px + c. Solve
++    // w >= -epsilon for the three edges to get the row's span, so a long thin
++    // triangle crossing the screen doesn't test its whole bounding box (the
++    // field scenery's ground triangles: ~45 ms per frame before). The span is
++    // widened by a pixel and the exact per-pixel test below still decides, so
++    // the pixels drawn are unchanged.
++    const float scale = winding * invAbsDenom;
++    const float a0 = (fy1 - fy2) * scale;
++    const float a1 = (fy2 - fy0) * scale;
++    const float a2 = -(a0 + a1);
      for (int y = minY; y <= maxY; ++y)
      {
 +        if (!ownsRow(y))
 +            continue;
          float py = static_cast<float>(y) + 0.5f;
-         for (int x = minX; x <= maxX; ++x)
+-        for (int x = minX; x <= maxX; ++x)
++        int spanX0 = minX, spanX1 = maxX;
++        {
++            const float c0 = ((fx2 - fx1) * (py - fy2)) * scale - a0 * fx2;
++            const float c1 = ((fx0 - fx2) * (py - fy2)) * scale - a1 * fx2;
++            const float c2 = 1.0f - c0 - c1;
++            float lo = -1.0e30f, hi = 1.0e30f;
++            bool empty = false;
++            const float as[3] = {a0, a1, a2};
++            const float cs[3] = {c0, c1, c2};
++            for (int e = 0; e < 3; ++e)
++            {
++                const float bound = (-kEdgeEpsilon - cs[e]);
++                if (as[e] > 1.0e-12f)
++                    lo = std::max(lo, bound / as[e]);
++                else if (as[e] < -1.0e-12f)
++                    hi = std::min(hi, bound / as[e]);
++                else if (cs[e] < -kEdgeEpsilon - 1.0e-3f)
++                    empty = true;
++            }
++            if (empty || lo > hi + 2.0f)
++                continue;
++            // px = x + 0.5; one pixel of slack each side for rounding.
++            if (lo > -1.0e29f)
++                spanX0 = std::max(minX, static_cast<int>(std::floor(lo - 0.5f)) - 1);
++            if (hi < 1.0e29f)
++                spanX1 = std::min(maxX, static_cast<int>(std::ceil(hi - 0.5f)) + 1);
++        }
++        for (int x = spanX0; x <= spanX1; ++x)
          {
-@@ -1463,6 +1959,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+             float px = static_cast<float>(x) + 0.5f;
+ 
+@@ -1463,6 +1997,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4523,7 +4639,7 @@ index f0ad507..4ca16da 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1480,6 +1977,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1480,6 +2015,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4531,7 +4647,7 @@ index f0ad507..4ca16da 100644
      if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
          return;
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-@@ -1509,6 +2007,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1509,6 +2045,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
          m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
      };
  
@@ -4540,7 +4656,7 @@ index f0ad507..4ca16da 100644
      while (offset < sizeBytes && m_transferState.direction == 0u)
      {
          switch (dpsm)
-@@ -1588,6 +2088,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1588,6 +2126,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  {
      if (!m_vram)
          return;
@@ -4548,7 +4664,7 @@ index f0ad507..4ca16da 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1697,6 +2198,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1697,6 +2236,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4556,7 +4672,7 @@ index f0ad507..4ca16da 100644
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
      const size_t count = std::min<size_t>(maxBytes, m_localToHostBuffer.size() - m_localToHostReadPos);
-@@ -1709,6 +2211,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1709,6 +2249,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -4565,7 +4681,7 @@ index f0ad507..4ca16da 100644
          return false;
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..fad8db8 100644
+index 9281d5f..9964996 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,14 +1,211 @@
@@ -4780,10 +4896,17 @@ index 9281d5f..fad8db8 100644
  
  namespace
  {
-@@ -105,12 +302,166 @@ namespace
+@@ -105,12 +302,204 @@ namespace
  }
  
  
++namespace
++{
++    // Set while the GS worker carries out a queued present (see Present).
++    thread_local const GSPresentationRequest *t_presentRequest = nullptr;
++    std::atomic<uint64_t> g_presentedFrames{0}; // new game frames handed to the window
++}
++
 +struct GS::AsyncQueue
 +{
 +    enum Type : uint8_t
@@ -4794,6 +4917,7 @@ index 9281d5f..fad8db8 100644
 +        WriteRegister,
 +        ClearContext,
 +        ClearActive,
++        Present, // present presentRequest once everything before it is drawn
 +    };
 +    struct Command
 +    {
@@ -4813,9 +4937,16 @@ index 9281d5f..fad8db8 100644
 +    // Bytes queued but not processed yet. Producers (EE, VIF1/VU1 worker)
 +    // wait above kMaxPendingBytes so a GS that falls behind cannot grow the
 +    // queue without bound (it reached ~15 GB in a slow instrumented build).
-+    static constexpr size_t kMaxPendingBytes = 64u * 1024u * 1024u;
++    // Kept to about two frames of a heavy scene (~4 MB of GS commands each):
++    // the game can't run further ahead of what is shown, so the picture
++    // stays current (a 64 MB backlog was over half a second behind).
++    static constexpr size_t kMaxPendingBytes = 8u * 1024u * 1024u;
 +    size_t pendingBytes = 0;
 +    bool stop = false;
++    // Frames the host presenter asked for, oldest first (one per new game
++    // frame, a few at most).
++    std::deque<GSPresentationRequest> presentRequests;
++    uint64_t lastQueuedDispfb1 = ~0ull;
 +
 +    static size_t commandBytes(const Command &cmd) { return cmd.data.size() + sizeof(Command); }
 +
@@ -4823,7 +4954,9 @@ index 9281d5f..fad8db8 100644
 +    {
 +        {
 +            std::unique_lock<std::mutex> lock(mutex);
-+            done.wait(lock, [&] { return stop || pendingBytes <= kMaxPendingBytes; });
++            // Presents are tiny and come from the window's thread: never block it.
++            if (cmd.type != Present)
++                done.wait(lock, [&] { return stop || pendingBytes <= kMaxPendingBytes; });
 +            pendingBytes += commandBytes(cmd);
 +            queue.push_back(std::move(cmd));
 +            ++submitted;
@@ -4904,6 +5037,27 @@ index 9281d5f..fad8db8 100644
 +                case AsyncQueue::ClearActive:
 +                    clearActiveFramebuffer(static_cast<uint32_t>(cmd.args[0]));
 +                    break;
++                case AsyncQueue::Present:
++                {
++                    GSPresentationRequest request;
++                    {
++                        std::lock_guard<std::mutex> lock(q->mutex);
++                        if (q->presentRequests.empty())
++                            break;
++                        request = q->presentRequests.front();
++                        q->presentRequests.pop_front();
++                    }
++                    t_presentRequest = &request;
++                    latchHostPresentationFrame(); // on this thread: draws and stores the frame
++                    t_presentRequest = nullptr;
++                    {
++                        static uint64_t lastDispfb1 = ~0ull;
++                        if (request.dispfb1 != lastDispfb1) // a new game frame reached the window
++                            g_presentedFrames.fetch_add(1, std::memory_order_relaxed);
++                        lastDispfb1 = request.dispfb1;
++                    }
++                    break;
++                }
 +                }
 +            }
 +            bool idle;
@@ -4947,7 +5101,7 @@ index 9281d5f..fad8db8 100644
  void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  {
      m_localMemoryStorage = vram;
-@@ -124,6 +475,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+@@ -124,6 +513,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  
  void GS::reset()
  {
@@ -4955,15 +5109,77 @@ index 9281d5f..fad8db8 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      std::memset(m_ctx, 0, sizeof(m_ctx));
      m_prim = {};
-@@ -526,6 +878,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+@@ -524,20 +914,62 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+     return request;
+ }
  
++// New game frames handed to the window so far (the fps overlay counts these).
++uint64_t ps2x_presentedFrameCount()
++{
++    return g_presentedFrames.load(std::memory_order_relaxed);
++}
++
  void GS::latchHostPresentationFrame()
  {
-+    sync(); // show everything the game submitted before this vsync
      GSPresentationRequest request{};
++    if (t_presentRequest)
++    {
++        request = *t_presentRequest; // the worker, at the point the presenter asked
++    }
++    else
      {
-         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-@@ -640,13 +993,56 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+-        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-        if (!m_backend || !m_privRegs)
+         {
+-            std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+-            m_hostPresentationFrame.clear();
+-            m_hasHostPresentationFrame = false;
+-            m_hostPresentationWidth = m_hostPresentationHeight = 0u;
++            std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++            if (!m_backend || !m_privRegs)
++            {
++                std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
++                m_hostPresentationFrame.clear();
++                m_hasHostPresentationFrame = false;
++                m_hostPresentationWidth = m_hostPresentationHeight = 0u;
++                return;
++            }
++            request = buildPresentationRequestUnlocked();
++        }
++        if (deferToWorker())
++        {
++            // Async GS: don't wait for the GS to catch up (behind on a heavy
++            // scene, that held the window to 1-2 frames a second). Queue a
++            // present behind everything submitted so far; the worker stores
++            // that frame when it gets there, and the window keeps showing the
++            // last stored one meanwhile.
++            bool queue = false;
++            {
++                std::lock_guard<std::mutex> lock(m_async->mutex);
++                // Only when the game has shown a new frame since the last one
++                // queued (or nothing is queued, e.g. a static screen).
++                AsyncQueue &q = *m_async;
++                if (request.dispfb1 != q.lastQueuedDispfb1 || q.presentRequests.empty())
++                {
++                    if (q.presentRequests.size() >= 4u)
++                        q.presentRequests.back() = request; // far behind: refresh the newest
++                    else
++                    {
++                        q.presentRequests.push_back(request);
++                        queue = true;
++                    }
++                    q.lastQueuedDispfb1 = request.dispfb1;
++                }
++            }
++            if (queue)
++                m_async->push({AsyncQueue::Present, {}, {}});
+             return;
+         }
+-        request = buildPresentationRequestUnlocked();
+     }
+ 
+     PresentationFrame frame{};
+@@ -640,13 +1072,56 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -5020,7 +5236,7 @@ index 9281d5f..fad8db8 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
          if (packetIndex < 48u)
-@@ -730,7 +1126,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -730,7 +1205,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
              // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
              uint32_t imageBytes = nloop * 16;
              if (offset + imageBytes > sizeBytes)
@@ -5030,7 +5246,7 @@ index 9281d5f..fad8db8 100644
              processImageData(data + offset, imageBytes);
              offset += imageBytes;
          }
-@@ -739,6 +1137,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -739,6 +1216,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  
  bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -5046,7 +5262,7 @@ index 9281d5f..fad8db8 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16u || !m_backend)
          return false;
-@@ -773,6 +1180,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -773,6 +1259,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
      if (!processed)
          return false;
  
@@ -5054,7 +5270,7 @@ index 9281d5f..fad8db8 100644
      ++m_nativePackedGIFPacketCount;
      return true;
  }
-@@ -784,7 +1192,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+@@ -784,7 +1271,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                             const uint8_t *data,
                             uint32_t sizeBytes)
  {
@@ -5078,7 +5294,7 @@ index 9281d5f..fad8db8 100644
      uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
  }
  
-@@ -1062,12 +1486,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,12 +1565,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -5105,7 +5321,7 @@ index 9281d5f..fad8db8 100644
      const bool interestingReg =
          regAddr == GS_REG_PRIM ||
          regAddr == GS_REG_RGBAQ ||
-@@ -1384,6 +1822,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1384,6 +1901,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      case GS_REG_TRXDIR:
      {
          m_trxdir = static_cast<uint32_t>(value & 0x3);
@@ -5152,7 +5368,7 @@ index 9281d5f..fad8db8 100644
  
          if (m_backend)
          {
-@@ -1578,6 +2056,86 @@ void GS::vertexKick(bool drawing)
+@@ -1578,6 +2135,86 @@ void GS::vertexKick(bool drawing)
          GSPrimitiveBatch batch = buildDrawBatch(needed);
          updatePreferredDisplaySourceForDraw(batch);
          m_backend->Submit(batch);
@@ -5239,7 +5455,7 @@ index 9281d5f..fad8db8 100644
          recordDrawDebugEventUnlocked(needed);
      }
  
-@@ -1608,27 +2166,82 @@ void GS::vertexKick(bool drawing)
+@@ -1608,27 +2245,82 @@ void GS::vertexKick(bool drawing)
      }
  }
  
@@ -5322,7 +5538,7 @@ index 9281d5f..fad8db8 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1664,12 +2277,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+@@ -1664,12 +2356,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
  
  uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
@@ -5337,7 +5553,7 @@ index 9281d5f..fad8db8 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (m_backend)
          m_backend->WriteVram(psm, base, bw, x, y, value);
-@@ -1734,3 +2349,8 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+@@ -1734,3 +2428,8 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
          m_hasPreferredDisplaySource = true;
      }
  }
@@ -6231,7 +6447,7 @@ index 8590f14..e717c2d 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..5949d40 100644
+index 45cb9d2..835bef8 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -6361,10 +6577,12 @@ index 45cb9d2..5949d40 100644
  
  namespace ps2_stubs
  {
-@@ -49,6 +158,413 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
+@@ -49,6 +158,424 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
  static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
  static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
  #endif
++
++uint64_t ps2x_presentedFrameCount(); // gs_frontend.cpp
 +
 +// ---------------------------------------------------------------------------
 +// Player settings (settings.ini next to the exe) and the host presenter:
@@ -6534,8 +6752,7 @@ index 45cb9d2..5949d40 100644
 +        double lastMouseMove = 0.0;
 +        Vector2 lastMouse{0.0f, 0.0f};
 +        bool cursorHidden = false;
-+        // Game frame rate: the game flips its display buffer once per frame.
-+        uint32_t lastDisplayFbp = 0xFFFFFFFFu;
++        // Frames shown per second (new game frames reaching the window).
 +        int flips = 0;
 +        double fpsWindowStart = 0.0;
 +        float gameFps = 0.0f;
@@ -6710,15 +6927,25 @@ index 45cb9d2..5949d40 100644
 +        p.wasFocused = focused;
 +    }
 +
-+    void countGameFrame(uint32_t displayFbp)
++    // Frames the window actually shows: new game frames the GS handed over,
++    // which is what the player sees.
++    void countGameFrame()
 +    {
 +        Presenter &p = g_presenter;
-+        if (displayFbp != p.lastDisplayFbp)
-+        {
-+            p.lastDisplayFbp = displayFbp;
-+            ++p.flips;
-+        }
++        static int logFrames = 0;
++        static uint64_t lastCount = 0;
++        const uint64_t count = ps2x_presentedFrameCount();
++        p.flips += static_cast<int>(count - lastCount);
++        logFrames += static_cast<int>(count - lastCount);
++        lastCount = count;
 +        const double now = GetTime();
++        static double logStart = now;
++        if (now - logStart >= 5.0)
++        {
++            std::printf("[present] window showed %.1f new frames/s\n", logFrames / (now - logStart));
++            logStart = now;
++            logFrames = 0;
++        }
 +        if (now - p.fpsWindowStart >= 0.5)
 +        {
 +            p.gameFps = static_cast<float>(p.flips / (now - p.fpsWindowStart));
@@ -6775,7 +7002,7 @@ index 45cb9d2..5949d40 100644
  struct ElfHeader
  {
      uint32_t magic;
-@@ -373,6 +889,38 @@ namespace
+@@ -373,6 +900,38 @@ namespace
      }
  }
  
@@ -6814,7 +7041,7 @@ index 45cb9d2..5949d40 100644
  static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
  {
      static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-@@ -537,6 +1085,7 @@ PS2Runtime::~PS2Runtime()
+@@ -537,6 +1096,7 @@ PS2Runtime::~PS2Runtime()
  #else
          if (IsAudioDeviceReady())
          {
@@ -6822,7 +7049,7 @@ index 45cb9d2..5949d40 100644
              CloseAudioDevice();
              m_audioBackend.setAudioReady(false);
          }
-@@ -610,6 +1159,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+@@ -610,6 +1170,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
      m_iopSubsystem->runEeCycles(eeCycles);
  }
  
@@ -6835,7 +7062,7 @@ index 45cb9d2..5949d40 100644
  void PS2Runtime::resetIop()
  {
      m_iopSubsystem->reset();
-@@ -661,6 +1216,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -661,6 +1227,8 @@ bool PS2Runtime::syncCoreSubsystems()
  
      if (m_boundRdram == rdram && m_boundGSVram == gsVram)
      {
@@ -6844,7 +7071,7 @@ index 45cb9d2..5949d40 100644
          return true;
      }
  
-@@ -668,42 +1225,103 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +1236,103 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -6967,7 +7194,7 @@ index 45cb9d2..5949d40 100644
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,12 +1349,47 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,12 +1360,47 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -7017,7 +7244,7 @@ index 45cb9d2..5949d40 100644
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -1134,6 +1787,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1134,6 +1798,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -7025,7 +7252,7 @@ index 45cb9d2..5949d40 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1358,6 +2012,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1358,6 +2023,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      // this charge bounds straight-line call chains that have no local loop.
      if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
      {
@@ -7033,7 +7260,7 @@ index 45cb9d2..5949d40 100644
          return false;
      }
  
-@@ -1403,6 +2058,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,6 +2069,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -7048,7 +7275,7 @@ index 45cb9d2..5949d40 100644
      if (ctx->pc == entryPc)
      {
          ctx->pc = fallthroughPc;
-@@ -1411,6 +2074,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1411,6 +2085,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  
@@ -7092,7 +7319,7 @@ index 45cb9d2..5949d40 100644
  void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
  {
      if (exception == EXCEPTION_INTEGER_OVERFLOW)
-@@ -2211,7 +2911,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+@@ -2211,7 +2922,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
  
  bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
  {
@@ -7104,13 +7331,13 @@ index 45cb9d2..5949d40 100644
  }
  
  [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
-@@ -2424,22 +3127,38 @@ void PS2Runtime::run()
+@@ -2424,22 +3138,38 @@ void PS2Runtime::run()
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
  
 -        BeginDrawing();
 -        ClearBackground(BLACK);
-+        countGameFrame(m_memory.gs().dispfb1 & 0x1FFu);
++        countGameFrame();
 +        handleHostHotkeys();
 +        updateHostWindowState();
 +
@@ -7157,7 +7384,7 @@ index 45cb9d2..5949d40 100644
          if (m_debugUiInitialized && m_debugUiDrawCallback)
          {
              m_debugUiDrawCallback(*this, m_debugUiUserData);
-@@ -2465,6 +3184,7 @@ void PS2Runtime::run()
+@@ -2465,6 +3195,7 @@ void PS2Runtime::run()
          m_debugUiShutdownCallback(*this, m_debugUiUserData);
          m_debugUiInitialized = false;
      }
