@@ -2681,10 +2681,10 @@ index 4c3f641..f4e741b 100644
      uint64_t m_nativePackedGIFPacketCount = 0;
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gl_backend.h b/ps2xRuntime/include/runtime/gs/gs_gl_backend.h
 new file mode 100644
-index 0000000..fa3a764
+index 0000000..8874577
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gl_backend.h
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,13 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_backend.h"
@@ -2693,8 +2693,11 @@ index 0000000..fa3a764
 +
 +// The GPU GS backend, or nullptr when this PC can't run it (no OpenGL 4.5 with
 +// ARB_fragment_shader_interlock): callers then keep the CPU backend.
-+// scale (1-4) is the internal resolution multiplier.
-+std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int scale = 1);
++// scale (1-4) is the internal resolution multiplier; widescreen draws 4/3
++// more pixels across (the picture is shown 16:9).
++std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int scale = 1, bool widescreen = false);
++// Change the resolution while playing (applied at the GS thread's next draw).
++void ps2x_glSetResolution(int scale, bool widescreen);
 diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
 index 1cb1540..1c0c0f5 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
@@ -6606,10 +6609,10 @@ index 9281d5f..4710e2b 100644
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
 new file mode 100644
-index 0000000..9e60092
+index 0000000..c72b24b
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
-@@ -0,0 +1,1587 @@
+@@ -0,0 +1,1643 @@
 +// GPU GS backend (OpenGL 4.5 + ARB_fragment_shader_interlock, Windows).
 +//
 +// The GPU rasterizes; everything the GS does per pixel (texture lookup, alpha
@@ -6636,6 +6639,7 @@ index 0000000..9e60092
 +
 +#include <algorithm>
 +#include <array>
++#include <atomic>
 +#include <cmath>
 +#include <cstddef>
 +#include <cstdio>
@@ -6696,11 +6700,21 @@ index 0000000..9e60092
 +    XS_GL_FUNCS(X)
 +#undef X
 +
-+    // GS coordinates are 0..2047; targets are drawn at kScale times that
++    // GS coordinates are 0..2047; targets are drawn at kScaleX x kScaleY times
++    // that. Widescreen draws 4/3 more pixels across (the picture is shown 4/3
++    // wider), so its pixels stay as fine as the height's.
 +    // (internal resolution upscaling). Local memory keeps native pixels.
 +    constexpr int kRtWidth = 2048;
 +    constexpr int kRtHeight = 2048;
-+    int kScale = 1;
++    int kScaleX = 1, kScaleY = 1;
++    // Resolution asked for by the presenter (settings menu), applied by the
++    // GS thread at its next draw or present: packed upscale | widescreen << 8.
++    std::atomic<int> g_requestedResolution{-1};
++    void scalesFor(int upscale, bool widescreen, int &sx, int &sy)
++    {
++        sy = std::clamp(upscale, 1, 4);
++        sx = widescreen ? (sy * 4 + 1) / 3 : sy; // 1, 3, 4, 5
++    }
 +    constexpr uint32_t kPages = 512u;
 +    constexpr uint32_t kPageBytes = 8192u;
 +    constexpr GLsizeiptr kVertexRingBytes = 64 * 1024 * 1024;
@@ -6750,7 +6764,7 @@ index 0000000..9e60092
 +    ivec4 s7; // date, datm, pabe, sprite
 +    ivec4 s8; // fge, fogR, fogG, fogB
 +    uvec4 s9; // fbmsk, zmask
-+    ivec4 s10; // texture scale (a render target drawn at the upscale factor, else 1)
++    ivec4 s10; // texture scale x, y (a render target drawn upscaled, else 1)
 +};
 +noperspective in vec3 vStq;
 +noperspective in vec4 vColor;
@@ -6778,20 +6792,20 @@ index 0000000..9e60092
 +// works on the native texel, the sub-pixel inside it is kept.
 +uvec4 texelScaled(int U, int V)
 +{
-+    int S = s10.x;
-+    int nu = U >= 0 ? U / S : -((S - 1 - U) / S);
-+    int nv = V >= 0 ? V / S : -((S - 1 - V) / S);
-+    int u = wrapCoord(nu, s1.z, s1.x, s2.x, s2.y) * S + (U - nu * S);
-+    int v = wrapCoord(nv, s1.w, s1.y, s2.z, s2.w) * S + (V - nv * S);
++    int SX = s10.x, SY = s10.y;
++    int nu = U >= 0 ? U / SX : -((SX - 1 - U) / SX);
++    int nv = V >= 0 ? V / SY : -((SY - 1 - V) / SY);
++    int u = wrapCoord(nu, s1.z, s1.x, s2.x, s2.y) * SX + (U - nu * SX);
++    int v = wrapCoord(nv, s1.w, s1.y, s2.z, s2.w) * SY + (V - nv * SY);
 +    uint raw = texelFetch(uTex, ivec2(u, v), 0).r;
 +    return uvec4(raw & 255u, (raw >> 8) & 255u, (raw >> 16) & 255u, raw >> 24);
 +}
 +ivec4 sampleScaled(float fu, float fv)
 +{
-+    float S = float(s10.x);
++    float SX = float(s10.x), SY = float(s10.y);
 +    if (s0.w == 0)
-+        return ivec4(texelScaled(int(floor(fu * S)), int(floor(fv * S))));
-+    float su = fu * S - 0.5, sv = fv * S - 0.5;
++        return ivec4(texelScaled(int(floor(fu * SX)), int(floor(fv * SY))));
++    float su = fu * SX - 0.5, sv = fv * SY - 0.5;
 +    int u0 = int(floor(su)), v0 = int(floor(sv));
 +    float fx = su - float(u0), fy = sv - float(v0);
 +    vec4 c00 = vec4(texelScaled(u0, v0)), c10 = vec4(texelScaled(u0 + 1, v0));
@@ -6816,7 +6830,7 @@ index 0000000..9e60092
 +        fu = vStq.x / q * float(s1.z);
 +        fv = vStq.y / q * float(s1.w);
 +    }
-+    if (s10.x > 1)
++    if (s10.x > 1 || s10.y > 1)
 +        return sampleScaled(fu, fv);
 +    if (s0.w == 0)
 +        return ivec4(texel(int(fu), int(fv)));
@@ -7080,6 +7094,7 @@ index 0000000..9e60092
 +        {
 +            // Only the buffers on screen: reading the one being drawn stalls
 +            // the GPU for nothing.
++            applyRequestedResolution();
 +            flushDraws();
 +            const uint32_t fbp1 = static_cast<uint32_t>(request.dispfb1 & 0x1FFu);
 +            const uint32_t fbp2 = static_cast<uint32_t>(request.dispfb2 & 0x1FFu);
@@ -7088,7 +7103,7 @@ index 0000000..9e60092
 +                    syncToMemory(t);
 +        }
 +        PresentationFrame frame = m_cpu.Present(request);
-+        if (kScale > 1 && frame)
++        if ((kScaleX > 1 || kScaleY > 1) && frame)
 +        {
 +            if (onGlThread())
 +                readHiresFrame(request, frame);
@@ -7117,7 +7132,7 @@ index 0000000..9e60092
 +        bool gpuDirty = false; // GPU has pixels local memory lacks
 +        int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0; // the dirty rectangle (exclusive end)
 +        bool stale = false;    // local memory has pixels the GPU lacks
-+        int allocW = 0, allocH = 0; // texture size in native pixels (x kScale on the GPU)
++        int allocW = 0, allocH = 0; // texture size in native pixels (x kScaleX/Y on the GPU)
 +    };
 +    struct Texture
 +    {
@@ -7154,6 +7169,8 @@ index 0000000..9e60092
 +    void blit(GLuint src, int sx0, int sy0, int sx1, int sy1, GLuint dst, int dx0, int dy0, int dx1, int dy1);
 +    void ensureStaging();
 +    void readHiresFrame(const GSPresentationRequest &request, PresentationFrame &frame);
++    void applyScaleState();
++    void applyRequestedResolution();
 +    // First few reasons the upscaled picture wasn't available (log only).
 +    void hiresSkip(const char *why)
 +    {
@@ -7254,14 +7271,15 @@ index 0000000..9e60092
 +            interlock = true;
 +    std::fprintf(stderr, "[gs-gl] %s, OpenGL %s, interlock %s\n", reinterpret_cast<const char *>(glGetString(GL_RENDERER)),
 +                 reinterpret_cast<const char *>(glGetString(GL_VERSION)), interlock ? "yes" : "NO");
-+    std::fprintf(stderr, "[gs-gl] internal resolution %dx\n", kScale);
++    std::fprintf(stderr, "[gs-gl] internal resolution %dx%d\n", kScaleX, kScaleY);
 +    if (!interlock || !compileProgram())
 +        return false;
 +
 +    p_glCreateVertexArrays(1, &m_vao);
 +    p_glCreateFramebuffers(1, &m_fbo);
-+    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_WIDTH, kRtWidth * kScale);
-+    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_HEIGHT, kRtHeight * kScale);
++    // Room for the largest scale, so the resolution can change while playing.
++    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_WIDTH, kRtWidth * 5);
++    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_HEIGHT, kRtHeight * 4);
 +    p_glCreateFramebuffers(1, &m_readFbo);
 +    p_glCreateFramebuffers(1, &m_drawFbo);
 +
@@ -7361,9 +7379,7 @@ index 0000000..9e60092
 +        p_glUseProgram(m_program);
 +        p_glBindVertexArray(m_vao);
 +        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fbo);
-+        glViewport(0, 0, kRtWidth * kScale, kRtHeight * kScale);
-+        glPointSize(static_cast<float>(kScale));
-+        glLineWidth(static_cast<float>(kScale));
++        applyScaleState();
 +        glEnable(GL_SCISSOR_TEST);
 +        glDisable(GL_DEPTH_TEST);
 +        glDisable(GL_CULL_FACE);
@@ -7372,6 +7388,36 @@ index 0000000..9e60092
 +        p_glBindTextureUnit(1, m_clutTex);
 +    }
 +    return std::this_thread::get_id() == m_glThread;
++}
++
++void GSGlBackend::applyScaleState()
++{
++    glViewport(0, 0, kRtWidth * kScaleX, kRtHeight * kScaleY);
++    glPointSize(static_cast<float>(std::max(kScaleX, kScaleY)));
++}
++
++// A new resolution from the settings menu: everything drawn so far goes to
++// local memory, the targets are dropped and come back at the new size.
++void GSGlBackend::applyRequestedResolution()
++{
++    const int request = g_requestedResolution.exchange(-1);
++    if (request < 0)
++        return;
++    int sx, sy;
++    scalesFor(request & 0xFF, (request & 0x100) != 0, sx, sy);
++    if (sx == kScaleX && sy == kScaleY)
++        return;
++    flushDraws();
++    syncAllToMemory();
++    dropAllTargets();
++    if (m_snapshotTex)
++        glDeleteTextures(1, &m_snapshotTex);
++    m_snapshotTex = 0;
++    m_snapW = m_snapH = 0;
++    kScaleX = sx;
++    kScaleY = sy;
++    applyScaleState();
++    std::fprintf(stderr, "[gs-gl] internal resolution now %dx%d\n", kScaleX, kScaleY);
 +}
 +
 +// --- render targets --------------------------------------------------------
@@ -7391,7 +7437,7 @@ index 0000000..9e60092
 +{
 +    GLuint tex = 0;
 +    p_glCreateTextures(GL_TEXTURE_2D, 1, &tex);
-+    p_glTextureStorage2D(tex, 1, GL_R32UI, w * kScale, h * kScale);
++    p_glTextureStorage2D(tex, 1, GL_R32UI, w * kScaleX, h * kScaleY);
 +    p_glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 +    p_glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 +    return tex;
@@ -7410,7 +7456,7 @@ index 0000000..9e60092
 +    {
 +        p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 +        p_glCopyImageSubData(t.tex, GL_TEXTURE_2D, 0, 0, 0, 0, tex, GL_TEXTURE_2D, 0, 0, 0, 0,
-+                             t.allocW * kScale, t.allocH * kScale, 1);
++                             t.allocW * kScaleX, t.allocH * kScaleY, 1);
 +        glDeleteTextures(1, &t.tex);
 +    }
 +    t.tex = tex;
@@ -7482,14 +7528,14 @@ index 0000000..9e60092
 +    for (int y = y0; y < y1; ++y)
 +        for (uint32_t x = 0; x < width; ++x)
 +            *out++ = GSMem::ReadTexture(m_pageCache, m_vram, t.psm, block, t.fbw, x, static_cast<uint32_t>(y));
-+    if (kScale == 1)
++    if (kScaleX == 1 && kScaleY == 1)
 +    {
 +        p_glTextureSubImage2D(t.tex, 0, 0, y0, width, y1 - y0, GL_RED_INTEGER, GL_UNSIGNED_INT, m_decode.data());
 +        return;
 +    }
 +    ensureStaging();
 +    p_glTextureSubImage2D(m_stagingTex, 0, 0, y0, width, y1 - y0, GL_RED_INTEGER, GL_UNSIGNED_INT, m_decode.data());
-+    blit(m_stagingTex, 0, y0, width, y1, t.tex, 0, y0 * kScale, width * kScale, y1 * kScale);
++    blit(m_stagingTex, 0, y0, width, y1, t.tex, 0, y0 * kScaleY, width * kScaleX, y1 * kScaleY);
 +}
 +
 +void GSGlBackend::ensureRows(Target &t, int rows)
@@ -7543,11 +7589,11 @@ index 0000000..9e60092
 +    p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
 +    m_readback.resize(static_cast<size_t>(w) * h);
 +    GLuint source = t.tex;
-+    if (kScale > 1)
++    if (kScaleX > 1 || kScaleY > 1)
 +    {
 +        // Down to native pixels first (one sample per pixel, near its centre).
 +        ensureStaging();
-+        blit(t.tex, t.dx0 * kScale, t.dy0 * kScale, t.dx1 * kScale, t.dy1 * kScale, m_stagingTex, t.dx0, t.dy0, t.dx1, t.dy1);
++        blit(t.tex, t.dx0 * kScaleX, t.dy0 * kScaleY, t.dx1 * kScaleX, t.dy1 * kScaleY, m_stagingTex, t.dx0, t.dy0, t.dx1, t.dy1);
 +        source = m_stagingTex;
 +    }
 +    p_glGetTextureSubImage(source, 0, t.dx0, t.dy0, 0, w, h, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
@@ -7807,7 +7853,8 @@ index 0000000..9e60092
 +            Target &source = it->second;
 +            ensureRows(source, source.rows);
 +            block.s0[0] = 1;
-+            block.s10[0] = kScale;
++            block.s10[0] = kScaleX;
++            block.s10[1] = kScaleY;
 +            if (&source == &frame)
 +            {
 +                feedback = true;
@@ -7889,6 +7936,7 @@ index 0000000..9e60092
 +{
 +    if (!claimGlThread() || !m_vram || batch.vertexCount == 0u)
 +        return;
++    applyRequestedResolution();
 +    const GSDrawState &state = batch.state;
 +    const GSContext &ctx = state.context;
 +    const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
@@ -7911,11 +7959,12 @@ index 0000000..9e60092
 +    }
 +    key.frameTex = frame.tex;
 +    key.depthTex = depth.tex;
-+    key.scissor[0] = ctx.scissor.x0 * kScale;
-+    key.scissor[1] = ctx.scissor.y0 * kScale;
-+    key.scissor[2] = (ctx.scissor.x1 - ctx.scissor.x0 + 1) * kScale;
-+    key.scissor[3] = (ctx.scissor.y1 - ctx.scissor.y0 + 1) * kScale;
++    key.scissor[0] = ctx.scissor.x0 * kScaleX;
++    key.scissor[1] = ctx.scissor.y0 * kScaleY;
++    key.scissor[2] = (ctx.scissor.x1 - ctx.scissor.x0 + 1) * kScaleX;
++    key.scissor[3] = (ctx.scissor.y1 - ctx.scissor.y0 + 1) * kScaleY;
 +    b.s10[0] = 1;
++    b.s10[1] = 1;
 +
 +    const auto &tex = ctx.tex0;
 +    const uint64_t clamp = ctx.clamp;
@@ -8040,7 +8089,7 @@ index 0000000..9e60092
 +            out[i] = vertex(batch.vertices[i], batch.vertices[i].x - ofx + 0.5f, batch.vertices[i].y - ofy + 0.5f);
 +        count = 2;
 +        key.mode = GL_LINES;
-+        if (kScale > 1)
++        if (kScaleX > 1 || kScaleY > 1)
 +        {
 +            // Upscaled: a line one PS2 pixel thick, as a thin quad (core
 +            // profile has no wide lines). Offset across its major axis.
@@ -8093,7 +8142,7 @@ index 0000000..9e60092
 +            // Samples its own target: from a copy of the pixels before this draw.
 +            flushDraws();
 +            p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-+            const int sw = frame.allocW * kScale, sh = frame.allocH * kScale;
++            const int sw = frame.allocW * kScaleX, sh = frame.allocH * kScaleY;
 +            if (sw > m_snapW || sh > m_snapH)
 +            {
 +                if (m_snapshotTex)
@@ -8107,7 +8156,7 @@ index 0000000..9e60092
 +                key.tex = m_snapshotTex;
 +            }
 +            p_glCopyImageSubData(frame.tex, GL_TEXTURE_2D, 0, 0, 0, 0, m_snapshotTex, GL_TEXTURE_2D, 0, 0, 0, 0,
-+                                 sw, std::min(std::max(frame.rows, 1), frame.allocH) * kScale, 1);
++                                 sw, std::min(std::max(frame.rows, 1), frame.allocH) * kScaleY, 1);
 +        }
 +    }
 +
@@ -8159,10 +8208,10 @@ index 0000000..9e60092
 +    if (dbx + w > t.allocW || dby + h > kRtHeight)
 +        return hiresSkip("outside the target");
 +    ensureRows(t, dby + h);
-+    const int sw = w * kScale, sh = h * kScale;
++    const int sw = w * kScaleX, sh = h * kScaleY;
 +    frame.hiresPixels.resize(static_cast<size_t>(sw) * sh * 4u);
 +    p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
-+    p_glGetTextureSubImage(t.tex, 0, dbx * kScale, dby * kScale, 0, sw, sh, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
++    p_glGetTextureSubImage(t.tex, 0, dbx * kScaleX, dby * kScaleY, 0, sw, sh, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
 +                           static_cast<GLsizei>(frame.hiresPixels.size()), frame.hiresPixels.data());
 +    uint32_t *px = reinterpret_cast<uint32_t *>(frame.hiresPixels.data());
 +    for (size_t i = 0, n = static_cast<size_t>(sw) * sh; i < n; ++i)
@@ -8171,9 +8220,14 @@ index 0000000..9e60092
 +    frame.hiresHeight = static_cast<uint32_t>(sh);
 +}
 +
-+std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int scale)
++void ps2x_glSetResolution(int upscale, bool widescreen)
 +{
-+    kScale = std::clamp(scale, 1, 4);
++    g_requestedResolution.store(std::clamp(upscale, 1, 4) | (widescreen ? 0x100 : 0));
++}
++
++std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int scale, bool widescreen)
++{
++    scalesFor(scale, widescreen, kScaleX, kScaleY);
 +    // create() switches OpenGL contexts on this thread, which is the window's:
 +    // put the window's back, or everything it draws goes nowhere.
 +    const HDC windowDc = wglGetCurrentDC();
@@ -8191,7 +8245,12 @@ index 0000000..9e60092
 +
 +#else // not Windows
 +
-+std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int)
++std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int, bool)
++{
++    return nullptr;
++}
++
++void ps2x_glSetResolution(int, bool)
 +{
 +    return nullptr;
 +}
@@ -9548,7 +9607,7 @@ index 37b6a4d..6d77103 100644
      {
          uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..e717c2d 100644
+index 8590f14..36de95f 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
 @@ -1,6 +1,13 @@
@@ -9565,7 +9624,7 @@ index 8590f14..e717c2d 100644
  
  namespace
  {
-@@ -23,9 +30,291 @@ namespace
+@@ -23,9 +30,293 @@ namespace
      constexpr uint16_t PAD_L1 = 0x0400u;
      constexpr uint16_t PAD_R2 = 0x0200u;
      constexpr uint16_t PAD_L2 = 0x0100u;
@@ -9854,11 +9913,13 @@ index 8590f14..e717c2d 100644
  }
  
 -bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++bool ps2x_hostInputBlocked(); // ps2_runtime.cpp (settings menu)
++
 +bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
  {
      if (!data || size < 32)
          return false;
-@@ -37,58 +326,92 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -37,58 +328,96 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
      data[3] = 0xFF;
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
  
@@ -9873,6 +9934,10 @@ index 8590f14..e717c2d 100644
 +        data[7] = replayed.ly;
 +        return true;
 +    }
++
++    // The settings menu has the controller: the game sees nothing pressed.
++    if (port == 0 && ps2x_hostInputBlocked())
++        return true;
 +
      uint16_t btns = 0xFFFFu;
 -    constexpr int kGamepad = 0;
@@ -9994,7 +10059,7 @@ index 8590f14..e717c2d 100644
          if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
              clearBit(PAD_UP);
          if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-@@ -99,7 +422,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -99,7 +428,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
              clearBit(PAD_RIGHT);
          if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
              clearBit(PAD_CROSS);
@@ -10003,7 +10068,7 @@ index 8590f14..e717c2d 100644
              clearBit(PAD_CIRCLE);
          if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
              clearBit(PAD_SQUARE);
-@@ -113,7 +436,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -113,7 +442,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
              clearBit(PAD_L2);
          if (IsKeyDown(KEY_RIGHT_SHIFT))
              clearBit(PAD_R2);
@@ -10012,7 +10077,7 @@ index 8590f14..e717c2d 100644
              clearBit(PAD_START);
          if (IsKeyDown(KEY_TAB))
              clearBit(PAD_SELECT);
-@@ -121,5 +444,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -121,5 +450,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
  
      data[2] = static_cast<uint8_t>(btns & 0xFF);
      data[3] = static_cast<uint8_t>(btns >> 8);
@@ -10029,7 +10094,7 @@ index 8590f14..e717c2d 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..ed21320 100644
+index 45cb9d2..297d283 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -10167,7 +10232,7 @@ index 45cb9d2..ed21320 100644
  
  namespace ps2_stubs
  {
-@@ -49,6 +159,436 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
+@@ -49,6 +159,762 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
  static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
  static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
  #endif
@@ -10199,6 +10264,8 @@ index 45cb9d2..ed21320 100644
 +    };
 +
 +    HostSettings g_hostSettings;
++    std::atomic<bool> g_widescreen{false};   // aspect == 16:9, read by game code
++    std::atomic<bool> g_inputBlocked{false}; // settings menu has the controller
 +    std::unordered_map<std::string, std::string> g_rawSettings; // every key, for game code
 +    std::atomic<const char *> g_hostBadge{nullptr};             // e.g. ">> x2", set by game code
 +    std::string g_settingsPath;
@@ -10252,7 +10319,8 @@ index 45cb9d2..ed21320 100644
 +        "; (Japanese layout). Battle attacks keep their normal buttons.\n"
 +        "swap_confirm_cancel = false\n"
 +        "\n"
-+        "; Keys: F11 / Alt+Enter fullscreen, F3 fps, F4 filter, F5 picture shape,\n"
++        "; Keys: F1 (or click both sticks) graphics menu, F11 / Alt+Enter fullscreen,\n"
++        "; F3 fps, F4 filter, F5 picture shape,\n"
 +        "; F12 screenshot (saved to the screenshots folder).\n";
 +
 +    std::string trimCopy(const std::string &text)
@@ -10326,6 +10394,10 @@ index 45cb9d2..ed21320 100644
 +        }
 +        readIniInto(g_hostSettings, g_settingsPath);
 +        readIniInto(g_hostSettings, g_windowStatePath); // remembered window size
++        // PS2X_ASPECT=16:9 etc. (test runs) overrides the settings file.
++        if (const char *aspect = std::getenv("PS2X_ASPECT"))
++            g_hostSettings.aspect = aspect;
++        g_widescreen.store(g_hostSettings.aspect == "16:9");
 +        std::printf("[settings] %s: fullscreen=%d aspect=%s filter=%s integer=%d vsync=%d volume=%d\n",
 +                    g_settingsPath.c_str(), g_hostSettings.fullscreen ? 1 : 0, g_hostSettings.aspect.c_str(),
 +                    g_hostSettings.filter.c_str(), g_hostSettings.integerScale ? 1 : 0, g_hostSettings.vsync ? 1 : 0,
@@ -10477,6 +10549,61 @@ index 45cb9d2..ed21320 100644
 +        showNotice("Screenshot saved");
 +    }
 +
++    // Change one key in settings.ini, keeping its comments and layout; a key
++    // the file doesn't have yet goes at the end of its section.
++    void saveSettingValue(const std::string &key, const std::string &value)
++    {
++        if (g_settingsPath.empty())
++            return;
++        std::vector<std::string> lines;
++        {
++            std::ifstream in(g_settingsPath);
++            std::string line;
++            while (std::getline(in, line))
++                lines.push_back(line);
++        }
++        bool done = false;
++        for (std::string &line : lines)
++        {
++            const std::string t = trimCopy(line);
++            if (t.empty() || t[0] == ';' || t[0] == '#' || t[0] == '[')
++                continue;
++            const auto eq = t.find('=');
++            if (eq != std::string::npos && trimCopy(t.substr(0, eq)) == key)
++            {
++                line = key + " = " + value;
++                done = true;
++                break;
++            }
++        }
++        if (!done)
++        {
++            const std::string section = (key == "volume" || key == "mute_when_unfocused") ? "[audio]" : "[display]";
++            size_t at = lines.size();
++            for (size_t i = 0; i < lines.size(); ++i)
++                if (trimCopy(lines[i]) == section)
++                {
++                    at = i + 1;
++                    while (at < lines.size() && !trimCopy(lines[at]).empty() && trimCopy(lines[at])[0] != '[')
++                        ++at;
++                    break;
++                }
++            lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(at), key + " = " + value);
++        }
++        std::ofstream out(g_settingsPath, std::ios::trunc);
++        for (const std::string &line : lines)
++            out << line << "\n";
++        g_rawSettings[key] = value;
++    }
++
++    void setAspect(const std::string &aspect)
++    {
++        g_hostSettings.aspect = aspect;
++        g_widescreen.store(aspect == "16:9");
++        // Widescreen also draws more pixels across (GPU renderer).
++        ps2x_glSetResolution(g_hostSettings.upscale, aspect == "16:9");
++    }
++
 +    void handleHostHotkeys()
 +    {
 +        HostSettings &s = g_hostSettings;
@@ -10495,7 +10622,7 @@ index 45cb9d2..ed21320 100644
 +        }
 +        if (IsKeyPressed(KEY_F5))
 +        {
-+            s.aspect = s.aspect == "4:3" ? "16:9" : (s.aspect == "16:9" ? "stretch" : (s.aspect == "stretch" ? "native" : "4:3"));
++            setAspect(s.aspect == "4:3" ? "16:9" : (s.aspect == "16:9" ? "stretch" : (s.aspect == "stretch" ? "native" : "4:3")));
 +            showNotice("Picture: " + s.aspect);
 +        }
 +        if (IsKeyPressed(KEY_F12))
@@ -10583,6 +10710,263 @@ index 45cb9d2..ed21320 100644
 +    }
 +}
 +
++// --- settings menu (F1, or click both sticks) --------------------------------
++namespace
++{
++    struct MenuItem
++    {
++        const char *label;
++        const char *key;        // settings.ini key
++        std::vector<std::string> values;
++        std::vector<std::string> names; // shown instead of values
++        const char *note;       // shown under the list for the selected item
++    };
++
++    struct SettingsMenu
++    {
++        bool open = false;
++        int selected = 0;
++        bool waitRelease = false; // closed, but a button that closed it is still down
++        double repeatAt = 0.0;
++        int repeatDir = 0;
++    };
++    SettingsMenu g_menu;
++
++    const std::vector<MenuItem> &menuItems()
++    {
++        static const std::vector<MenuItem> items = {
++            {"Resolution", "upscale", {"1", "2", "3", "4"},
++             {"Original (512x448)", "2x (1024x896)", "3x (1536x1344)", "4x (2048x1792)"},
++             "How sharp the game is drawn. Higher needs a faster graphics card."},
++            {"Picture shape", "aspect", {"4:3", "16:9", "stretch", "native"},
++             {"4:3 (original)", "16:9 widescreen", "Stretch to window", "Square pixels"},
++             "16:9 shows more of the world to the sides. Menus and text are still stretched for now."},
++            {"Filter", "filter", {"sharp", "smooth", "pixel"}, {"Sharp", "Smooth", "Pixel"},
++             "How the picture is scaled to your screen."},
++            {"Whole-number scaling", "integer_scale", {"false", "true"}, {"Off", "On"},
++             "Only scale by 2x, 3x... (black borders, perfectly even pixels)."},
++            {"Fullscreen", "fullscreen", {"false", "true"}, {"Off", "On"}, "Borderless fullscreen (also F11)."},
++            {"VSync", "vsync", {"false", "true"}, {"Off", "On"}, "Sync to the monitor (no tearing)."},
++            {"Show FPS", "show_fps", {"false", "true"}, {"Off", "On"}, "Frame counter in the corner (also F3)."},
++            {"Renderer", "renderer", {"gpu", "cpu"}, {"Graphics card", "Processor"},
++             "Takes effect the next time the game starts."},
++        };
++        return items;
++    }
++
++    std::string currentValue(const MenuItem &item)
++    {
++        const HostSettings &s = g_hostSettings;
++        const std::string key = item.key;
++        if (key == "upscale") return std::to_string(s.upscale);
++        if (key == "aspect") return s.aspect;
++        if (key == "filter") return s.filter;
++        if (key == "integer_scale") return s.integerScale ? "true" : "false";
++        if (key == "fullscreen") return IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ? "true" : "false";
++        if (key == "vsync") return s.vsync ? "true" : "false";
++        if (key == "show_fps") return s.showFps ? "true" : "false";
++        if (key == "renderer") return s.renderer;
++        return {};
++    }
++
++    void applyMenuValue(const MenuItem &item, const std::string &value)
++    {
++        HostSettings &s = g_hostSettings;
++        const std::string key = item.key;
++        if (key == "upscale")
++        {
++            s.upscale = std::atoi(value.c_str());
++            ps2x_glSetResolution(s.upscale, s.aspect == "16:9");
++        }
++        else if (key == "aspect")
++            setAspect(value);
++        else if (key == "filter")
++            s.filter = value;
++        else if (key == "integer_scale")
++            s.integerScale = value == "true";
++        else if (key == "fullscreen")
++        {
++            if ((value == "true") != IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
++                ToggleBorderlessWindowed();
++            s.fullscreen = value == "true";
++        }
++        else if (key == "vsync")
++        {
++            s.vsync = value == "true";
++            if (s.vsync)
++                SetWindowState(FLAG_VSYNC_HINT);
++            else
++                ClearWindowState(FLAG_VSYNC_HINT);
++            const int refresh = GetMonitorRefreshRate(GetCurrentMonitor());
++            SetTargetFPS(refresh > 0 ? refresh : 60);
++        }
++        else if (key == "show_fps")
++            s.showFps = value == "true";
++        else if (key == "renderer")
++            s.renderer = value;
++        saveSettingValue(key, value);
++    }
++
++    void stepItem(int index, int dir)
++    {
++        const MenuItem &item = menuItems()[index];
++        const std::string cur = currentValue(item);
++        int at = 0;
++        for (size_t i = 0; i < item.values.size(); ++i)
++            if (item.values[i] == cur)
++                at = static_cast<int>(i);
++        const int n = static_cast<int>(item.values.size());
++        at = (at + dir + n) % n;
++        applyMenuValue(item, item.values[at]);
++    }
++
++    int menuGamepad()
++    {
++        for (int i = 0; i < 4; ++i)
++            if (IsGamepadAvailable(i))
++                return i;
++        return -1;
++    }
++
++    bool anyMenuButtonDown()
++    {
++        const int g = menuGamepad();
++        if (g >= 0)
++            for (int b = GAMEPAD_BUTTON_LEFT_FACE_UP; b <= GAMEPAD_BUTTON_RIGHT_THUMB; ++b)
++                if (IsGamepadButtonDown(g, b))
++                    return true;
++        return IsKeyDown(KEY_F1) || IsKeyDown(KEY_ESCAPE) || IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_BACKSPACE) ||
++               IsKeyDown(KEY_X) || IsKeyDown(KEY_C) || IsKeyDown(KEY_SPACE);
++    }
++
++    void updateSettingsMenu()
++    {
++        SettingsMenu &m = g_menu;
++        const int g = menuGamepad();
++        const auto pressed = [&](int button) { return g >= 0 && IsGamepadButtonPressed(g, button); };
++        const auto down = [&](int button) { return g >= 0 && IsGamepadButtonDown(g, button); };
++        bool stickCombo = (pressed(GAMEPAD_BUTTON_LEFT_THUMB) && down(GAMEPAD_BUTTON_RIGHT_THUMB)) ||
++                          (pressed(GAMEPAD_BUTTON_RIGHT_THUMB) && down(GAMEPAD_BUTTON_LEFT_THUMB));
++        // Test runs: PS2X_MENU_AT=s opens the menu at s seconds;
++        // PS2X_RES_SWITCH_AT=s:upscale:wide changes the resolution (not saved).
++        static double menuAt = std::getenv("PS2X_MENU_AT") ? std::atof(std::getenv("PS2X_MENU_AT")) : -1.0;
++        if (menuAt >= 0.0 && GetTime() >= menuAt)
++        {
++            menuAt = -1.0;
++            if (!m.open)
++                stickCombo = true;
++        }
++        static const char *switchSpec = std::getenv("PS2X_RES_SWITCH_AT");
++        if (switchSpec)
++        {
++            double at = 0.0;
++            int up = 3, wide = 0;
++            if (std::sscanf(switchSpec, "%lf:%d:%d", &at, &up, &wide) >= 2 && GetTime() >= at)
++            {
++                switchSpec = nullptr;
++                g_hostSettings.upscale = up;
++                g_hostSettings.aspect = wide ? "16:9" : "4:3";
++                g_widescreen.store(wide != 0);
++                ps2x_glSetResolution(up, wide != 0);
++            }
++        }
++        if (!m.open)
++        {
++            if (IsKeyPressed(KEY_F1) || stickCombo)
++            {
++                m.open = true;
++                m.waitRelease = false;
++                g_inputBlocked.store(true);
++            }
++            else if (m.waitRelease && !anyMenuButtonDown())
++            {
++                m.waitRelease = false;
++                g_inputBlocked.store(false);
++            }
++            return;
++        }
++        if (IsKeyPressed(KEY_F1) || IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) || stickCombo ||
++            pressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT) || pressed(GAMEPAD_BUTTON_MIDDLE_RIGHT))
++        {
++            m.open = false;
++            m.waitRelease = true; // keep the game from seeing the closing press
++            return;
++        }
++        const int count = static_cast<int>(menuItems().size());
++        // Directions: d-pad, arrow keys or the left stick, repeating when held.
++        const float sx = g >= 0 ? GetGamepadAxisMovement(g, GAMEPAD_AXIS_LEFT_X) : 0.0f;
++        const float sy = g >= 0 ? GetGamepadAxisMovement(g, GAMEPAD_AXIS_LEFT_Y) : 0.0f;
++        int vertical = 0, horizontal = 0;
++        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W) || down(GAMEPAD_BUTTON_LEFT_FACE_UP) || sy < -0.6f) vertical = -1;
++        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S) || down(GAMEPAD_BUTTON_LEFT_FACE_DOWN) || sy > 0.6f) vertical = 1;
++        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A) || down(GAMEPAD_BUTTON_LEFT_FACE_LEFT) || sx < -0.6f) horizontal = -1;
++        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D) || down(GAMEPAD_BUTTON_LEFT_FACE_RIGHT) || sx > 0.6f) horizontal = 1;
++        const int dir = vertical != 0 ? vertical * 10 : horizontal;
++        const double now = GetTime();
++        bool fire = false;
++        if (dir != m.repeatDir)
++        {
++            m.repeatDir = dir;
++            fire = dir != 0;
++            m.repeatAt = now + 0.4;
++        }
++        else if (dir != 0 && now >= m.repeatAt)
++        {
++            fire = true;
++            m.repeatAt = now + 0.12;
++        }
++        if (fire)
++        {
++            if (vertical != 0)
++                m.selected = (m.selected + vertical + count) % count;
++            else
++                stepItem(m.selected, horizontal);
++        }
++        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_X) ||
++            pressed(GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
++            stepItem(m.selected, 1);
++    }
++
++    void drawSettingsMenu()
++    {
++        const SettingsMenu &m = g_menu;
++        if (!m.open)
++            return;
++        const int sw = GetScreenWidth(), sh = GetScreenHeight();
++        DrawRectangle(0, 0, sw, sh, Color{0, 0, 0, 150});
++        const int size = std::max(18, sh / 34);
++        const int row = size + size / 2;
++        const auto &items = menuItems();
++        const int panelW = std::min(sw - 32, size * 30);
++        const int panelH = row * (static_cast<int>(items.size()) + 5);
++        const int x0 = (sw - panelW) / 2, y0 = (sh - panelH) / 2;
++        DrawRectangle(x0, y0, panelW, panelH, Color{12, 20, 36, 235});
++        DrawRectangleLines(x0, y0, panelW, panelH, Color{90, 140, 210, 255});
++        DrawText("Graphics", x0 + size, y0 + size / 2, size + size / 3, RAYWHITE);
++        const int listY = y0 + row * 2;
++        const int valueX = x0 + panelW / 2;
++        for (size_t i = 0; i < items.size(); ++i)
++        {
++            const int y = listY + static_cast<int>(i) * row;
++            const bool sel = static_cast<int>(i) == m.selected;
++            if (sel)
++                DrawRectangle(x0 + size / 2, y - size / 4, panelW - size, row - size / 6, Color{50, 90, 150, 200});
++            DrawText(items[i].label, x0 + size, y, size, sel ? RAYWHITE : Color{190, 200, 215, 255});
++            const std::string cur = currentValue(items[i]);
++            std::string shown = cur;
++            for (size_t v = 0; v < items[i].values.size(); ++v)
++                if (items[i].values[v] == cur)
++                    shown = items[i].names[v];
++            const std::string text = sel ? "<  " + shown + "  >" : shown;
++            DrawText(text.c_str(), valueX, y, size, sel ? Color{255, 220, 120, 255} : Color{170, 190, 215, 255});
++        }
++        const int noteY = listY + static_cast<int>(items.size()) * row + size / 2;
++        DrawText(items[m.selected].note, x0 + size, noteY, size * 3 / 4, Color{170, 190, 215, 255});
++        DrawText("Up/Down choose   Left/Right or Cross change   Circle, Start or F1 close",
++                 x0 + size, noteY + row, size * 3 / 4, Color{120, 140, 170, 255});
++    }
++}
++
 +// Game code reads its own options (settings.ini) with these.
 +bool ps2x_hostSettingBool(const char *key, bool fallback)
 +{
@@ -10599,12 +10983,19 @@ index 45cb9d2..ed21320 100644
 +// Read by game code (port overrides) that widens the 3D view.
 +bool ps2x_hostWidescreen()
 +{
-+    return g_hostSettings.aspect == "16:9";
++    return g_widescreen.load(std::memory_order_relaxed);
++}
++
++// The settings menu is open (or its closing button is still held): the game
++// sees a controller with nothing pressed.
++bool ps2x_hostInputBlocked()
++{
++    return g_inputBlocked.load(std::memory_order_relaxed);
 +}
  struct ElfHeader
  {
      uint32_t magic;
-@@ -373,6 +913,65 @@ namespace
+@@ -373,6 +1239,65 @@ namespace
      }
  }
  
@@ -10670,7 +11061,7 @@ index 45cb9d2..ed21320 100644
  static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
  {
      static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-@@ -537,6 +1136,7 @@ PS2Runtime::~PS2Runtime()
+@@ -537,6 +1462,7 @@ PS2Runtime::~PS2Runtime()
  #else
          if (IsAudioDeviceReady())
          {
@@ -10678,7 +11069,7 @@ index 45cb9d2..ed21320 100644
              CloseAudioDevice();
              m_audioBackend.setAudioReady(false);
          }
-@@ -610,6 +1210,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+@@ -610,6 +1536,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
      m_iopSubsystem->runEeCycles(eeCycles);
  }
  
@@ -10691,7 +11082,7 @@ index 45cb9d2..ed21320 100644
  void PS2Runtime::resetIop()
  {
      m_iopSubsystem->reset();
-@@ -661,6 +1267,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -661,6 +1593,8 @@ bool PS2Runtime::syncCoreSubsystems()
  
      if (m_boundRdram == rdram && m_boundGSVram == gsVram)
      {
@@ -10700,7 +11091,7 @@ index 45cb9d2..ed21320 100644
          return true;
      }
  
-@@ -668,42 +1276,103 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +1602,103 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -10823,7 +11214,7 @@ index 45cb9d2..ed21320 100644
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,12 +1400,57 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,12 +1726,57 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -10875,7 +11266,7 @@ index 45cb9d2..ed21320 100644
 +            // PS2X_UPSCALE=n (test runs) overrides the settings file.
 +            const char *upscaleEnv = std::getenv("PS2X_UPSCALE");
 +            const int upscale = upscaleEnv ? std::clamp(std::atoi(upscaleEnv), 1, 4) : g_hostSettings.upscale;
-+            if (auto gpu = ps2x_createGlBackend(upscale))
++            if (auto gpu = ps2x_createGlBackend(upscale, g_hostSettings.aspect == "16:9"))
 +                m_gs.setRasterBackend(std::move(gpu));
 +        }
 +        const int refresh = GetMonitorRefreshRate(GetCurrentMonitor());
@@ -10883,7 +11274,7 @@ index 45cb9d2..ed21320 100644
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -1134,6 +1848,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1134,6 +2174,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -10891,7 +11282,7 @@ index 45cb9d2..ed21320 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1358,6 +2073,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1358,6 +2399,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      // this charge bounds straight-line call chains that have no local loop.
      if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
      {
@@ -10899,7 +11290,7 @@ index 45cb9d2..ed21320 100644
          return false;
      }
  
-@@ -1403,6 +2119,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,6 +2445,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -10914,7 +11305,7 @@ index 45cb9d2..ed21320 100644
      if (ctx->pc == entryPc)
      {
          ctx->pc = fallthroughPc;
-@@ -1411,6 +2135,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1411,6 +2461,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  
@@ -10958,7 +11349,7 @@ index 45cb9d2..ed21320 100644
  void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
  {
      if (exception == EXCEPTION_INTEGER_OVERFLOW)
-@@ -2211,7 +2972,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+@@ -2211,7 +3298,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
  
  bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
  {
@@ -10970,7 +11361,7 @@ index 45cb9d2..ed21320 100644
  }
  
  [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
-@@ -2423,23 +3187,52 @@ void PS2Runtime::run()
+@@ -2423,23 +3513,54 @@ void PS2Runtime::run()
          uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -10987,6 +11378,7 @@ index 45cb9d2..ed21320 100644
 +
 +        countGameFrame();
 +        handleHostHotkeys();
++        updateSettingsMenu();
 +        updateHostWindowState();
  
 -        BeginDrawing();
@@ -11034,10 +11426,11 @@ index 45cb9d2..ed21320 100644
 +            }
 +        }
 +        drawHostOverlay();
++        drawSettingsMenu();
          if (m_debugUiInitialized && m_debugUiDrawCallback)
          {
              m_debugUiDrawCallback(*this, m_debugUiUserData);
-@@ -2465,6 +3258,7 @@ void PS2Runtime::run()
+@@ -2465,6 +3586,7 @@ void PS2Runtime::run()
          m_debugUiShutdownCallback(*this, m_debugUiUserData);
          m_debugUiInitialized = false;
      }

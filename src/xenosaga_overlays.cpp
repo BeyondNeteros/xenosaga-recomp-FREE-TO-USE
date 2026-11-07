@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -278,28 +279,52 @@ namespace
         }
     }
 
-    // Widescreen: xglCameraViewScreen (0x22B9B8) fills the camera's
-    // projection; +0x28 (camera +0x10 block, field 0x18) is the horizontal
-    // scale, rebuilt from scratch on every call. Narrowing it by 3/4 makes the
-    // 4:3 frame hold a 16:9 field of view (the presenter stretches it back),
-    // and the culling frustum built from it in xglCameraViewTravel widens too.
+    // Widescreen: xglCameraViewScreen (0x22B9B8, src/main/xgl_camera.c in the
+    // decomp) fills camera->screen (camera +0x10). Two fields set the
+    // horizontal view: clipRange.z (+0x28) feeds the projection matrix built in
+    // xglCameraViewVolume, projection.x (+0x50) the culling volume. Widening
+    // both by 4/3 gives a true 16:9 view (more to the sides, same height) that
+    // the presenter shows 16:9. (The first version narrowed +0x28 by 3/4,
+    // which zoomed in: runs/wide16.)
+    // clipRange.z is computed from the previous call's projection.x, so the
+    // one we widened is put back first or the widening would compound.
     constexpr uint32_t kCameraViewScreenAddr = 0x0022B9B8u;
     PS2Runtime::RecompiledFunction g_cameraViewScreenOriginal = nullptr;
+    std::unordered_map<uint32_t, std::pair<float, float>> g_widenedProjection; // camera -> (ours, original)
 
     void cameraViewScreen_widescreen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t camera = GPR_U32(ctx, 4);
+        uint8_t *clipZ = rdram + ((camera + 0x28u) & kRdramMask);
+        uint8_t *projX = rdram + ((camera + 0x50u) & kRdramMask);
+        if (const auto it = g_widenedProjection.find(camera); it != g_widenedProjection.end())
+        {
+            float current;
+            std::memcpy(&current, projX, 4);
+            if (current == it->second.first)
+                std::memcpy(projX, &it->second.second, 4);
+            g_widenedProjection.erase(it);
+        }
         g_cameraViewScreenOriginal(rdram, ctx, runtime);
         if (!ps2x_hostWidescreen())
             return;
-        static const float scale = [] {
-            const char *env = std::getenv("XS_WIDESCREEN_SCALE"); // for experiments
-            return env ? static_cast<float>(std::atof(env)) : 0.75f;
+        static const float clipScale = [] {
+            const char *env = std::getenv("XS_WS_CLIP"); // for experiments
+            return env ? static_cast<float>(std::atof(env)) : 4.0f / 3.0f;
         }();
-        float horizontal;
-        std::memcpy(&horizontal, rdram + ((camera + 0x28u) & kRdramMask), 4);
-        horizontal *= scale;
-        std::memcpy(rdram + ((camera + 0x28u) & kRdramMask), &horizontal, 4);
+        static const float projScale = [] {
+            const char *env = std::getenv("XS_WS_PROJ");
+            return env ? static_cast<float>(std::atof(env)) : 4.0f / 3.0f;
+        }();
+        float value;
+        std::memcpy(&value, clipZ, 4);
+        value *= clipScale;
+        std::memcpy(clipZ, &value, 4);
+        float original;
+        std::memcpy(&original, projX, 4);
+        value = original * projScale;
+        std::memcpy(projX, &value, 4);
+        g_widenedProjection[camera] = {value, original};
     }
 
     void installWidescreenHook()
