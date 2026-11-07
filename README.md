@@ -16,9 +16,9 @@ areas, at a locked 30 fps in the tutorial.
 | Overlays (`OV01/02/10/11/12.OVL`) | Recompile cleanly; swapped in at runtime |
 | Boot, disc access (dual-layer ISO) | Working |
 | Menus, text, FMVs, 3D scenes | Rendering |
-| Battles | Tutorial battle plays through; field battles being tested |
+| Battles | Tutorial and first field battles play through |
 | Sound and music | Working (game's own sound driver on an emulated SPU2) |
-| Speed | 30 fps in the tutorial; first field area ~20 fps until a battle |
+| Speed | Locked 30 fps in the tutorial, field and battles tested so far (GPU renderer) |
 | Display | 4:3 / 16:9 (experimental), fullscreen, sharp scaling, screenshots |
 
 ## Getting the game running (players)
@@ -58,6 +58,9 @@ the exe; the launcher's **Settings** opens it.
 | F5 | Picture shape: 4:3, 16:9 widescreen, stretch, native |
 | F12 | Screenshot (into the `screenshots` folder) |
 
+- **Renderer:** `renderer = gpu` in settings.ini draws on the graphics card, much
+  faster (needs OpenGL 4.5 with fragment shader interlock: NVIDIA and Intel;
+  other cards fall back to `cpu` automatically).
 - **Picture:** shown at the original TV shape (4:3) by default, scaled with a
   "sharp bilinear" filter (crisp, without uneven pixels). `16:9` widens the
   3D view; menus and the HUD are stretched with it (experimental).

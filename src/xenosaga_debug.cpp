@@ -400,6 +400,11 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                 PROCESS_MEMORY_COUNTERS_EX mem{};
                 mem.cb = sizeof(mem);
                 K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&mem), sizeof(mem));
+                {
+                    uint32_t soundFlags = 0;
+                    std::memcpy(&soundFlags, runtime.memory().getRDRAM() + 0x4AA080u, 4);
+                    std::printf("  sound driver flags=%08x\n", soundFlags);
+                }
                 std::printf("  fps: game %.1f, vsync %.1f, memory %llu MB\n", flips.exchange(0) / double(seconds),
                             (vsync - lastVsync) / double(seconds), static_cast<unsigned long long>(mem.PrivateUsage >> 20));
                 lastVsync = vsync;

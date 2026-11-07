@@ -109,7 +109,46 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
-## Decomp reference; battle freeze still open (2026-11-07, runs/rpcfix1, mash1)
+## GPU renderer; battle freeze root cause fixed (2026-11-07, runs/gpu1-5, tr1, heap1)
+
+**Battle freeze, root cause:** `IopMemory::allocate` only moved m_heapCursor
+forward, so freed blocks were never reused and the 832 KB IOP heap "ran out"
+after a few minutes of RSSD messages. iRssdCallFunc's AllocSysMemory then returned
+0, the "wave transfer done" (fn 37) node was lost, and the EE spun in
+SsdSpuDmaCompleted forever. Found with iopTrace, a silent ring buffer printed by
+PS2X_IOP_WATCH (printing live hid the bug): `irq 36 -> wakeup -> sleep`, no
+`call-ee 37`. Now next-fit with wrap-around. heap1: 6 min with battles, no freeze.
+The earlier "race" reading was wrong; it depended on total sound traffic, which
+is why drifting replays missed it. The WaitRpc and interrupt-gating fixes were
+still real bugs, but neither was this one.
+
+**GPU renderer:** `src/lib/gs/gs_gl_backend.cpp` (GL 4.5 +
+ARB_fragment_shader_interlock, own hidden WGL context, claimed by the first thread
+to draw). The GPU only rasterizes; textures, tests, blending and masks run in
+a fragment shader on integers in an ordered interlock, with WritePixel's maths on
+R32UI images. No fixed-function ROP, so masks like fbmsk 0x80000000 are exact. It
+wraps a GSCpuBackend that still owns local memory, transfers, CLUT and Present.
+Render targets are written back only when read: Present syncs just the displayed
+buffer (syncing all 60x/s cost 40% of the frame rate). Textures decode per page,
+via m_pageVersions. Feedback draws read a snapshot of the target.
+`renderer = gpu|cpu` in settings.ini, PS2X_RENDERER overrides, falls back to cpu
+without interlock (AMD on Windows lacks it).
+
+Offline: `GS_REPLAY_GL=1 GS_REPLAY_COMPARE=prefix gs_replay capture 1` compares
+with the capture's end VRAM and writes got/want/diff BMPs. Field capture 34.3 ->
+12.8 ms/frame. In game the field went from 20 fps to a locked 30, with eeidle
+~50%. VU1 is now the limit in heavy scenes.
+
+Differences from CPU are 5-7% of pixels, mostly one streak area: feedback triangles
+(tex = target, ALPHA 0x64) read pre-draw pixels on GPU, while the CPU's ordered draw
+reads pixels it just wrote and smears the ground beside Shion. GPU looks right but
+is unverified: compare with PCSX2. Also alpha differs on ~20k pixels in one buffer.
+
+Next: PBO readback instead of stalling in Present, retrain PGO, batch feedback
+draws, upscaling (images are 2048x2048; scale viewport/scissor/texel fetches and
+downsample on sync), Vulkan for AMD.
+
+## Decomp reference (2026-11-07, runs/rpcfix1, mash1; freeze solved above)
 
 `references/xsg-i-decomp` (not in this repo, stays local) is a shallow clone of
 github.com/OpokXeno/xsg-i-decomp, matching C for all 7,645 game functions incl.
