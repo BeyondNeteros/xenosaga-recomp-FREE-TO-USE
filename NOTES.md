@@ -1,4 +1,19 @@
 
+## Menu background black: VRNEXT was never written (2026-11-07, runs/ui-menu-*, ui-rtps)
+
+Menus (save, shop, results) draw a 3D backdrop (tya_menu_bg_entry.c: 16 strip
+tasks with random offsets from xglFRand). The strips reached the GS but all
+corners fell on two points, Z 0 (ZTST greater: nothing drawn). XS_RTPS_LOG=<n>
+(xglRotTransPersN hook, reads the scratchpad) showed inputs of 3e36: xglFRand is
+`vrnext.x vf1, R; qmfc2`, and the recompiler's VRNEXT/VRGET/VRINIT/VRXOR were
+invented ("LFSR-like"); VRNEXT never wrote ft. Now as PCSX2: R = 23 random bits
+| 0x3F800000, VRNEXT steps bit0 ^= bit4 ^ bit22 and writes ft's dest fields,
+RINIT/RXOR take fs.fsf (vu_translation_helpers.cpp; regenerate). Every
+xglFRand user (effects, particles) got garbage before.
+Tools: tools/gscap_draws.py lists what a GS capture (PS2X_GS_CAPTURE) draws;
+tools/xsarc.py lists/extracts files in the XENOSAGA.xx archives (offsets count
+from the start of XENOSAGA.00 / .10).
+
 ## Parallel VU1: built, correct, not faster yet - shelved (2026-11-07, runs/par-verify1-3, par-perf1-2)
 
 `patches/ps2recomp-runtime-vu1-parallel-wip.patch` is the full runtime patch WITH

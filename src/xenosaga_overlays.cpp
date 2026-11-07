@@ -642,6 +642,74 @@ namespace
         g_menuFileOriginal(rdram, ctx, runtime);
     }
 
+    // XS_RTPS_LOG=<n>: log the first n xglRotTransPersN calls (camera, matrix,
+    // points in, screen points out) - menu background debugging.
+    PS2Runtime::RecompiledFunction g_rotTransPersNOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_studioGetCamera2Original = nullptr;
+
+    void rotTransPersN_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static int budget = []() { const char *e = std::getenv("XS_RTPS_LOG"); return e ? std::atoi(e) : 0; }();
+        const uint32_t dest = GPR_U32(ctx, 4), matrix = GPR_U32(ctx, 5), points = GPR_U32(ctx, 6);
+        const int32_t count = static_cast<int32_t>(GPR_U32(ctx, 7));
+        const uint32_t cameraId = GPR_U32(ctx, 8);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const auto mem = [&](uint32_t addr) -> const uint8_t *
+        {
+            if ((addr & 0xF0000000u) == 0x70000000u)
+                return runtime->memory().getScratchpad() + (addr & 0x3FFFu);
+            return rdram + (addr & 0x01FFFFFFu);
+        };
+        const auto f4 = [&](uint32_t addr, const char *name)
+        {
+            float v[4];
+            std::memcpy(v, mem(addr), sizeof(v));
+            std::printf(" %s(%g %g %g %g)", name, v[0], v[1], v[2], v[3]);
+        };
+        const bool log = budget > 0 && count > 0 && count <= 64;
+        if (log)
+        {
+            --budget;
+            // xglStudioGetCamera2(id): camera table; read through the game's own function.
+            R5900Context probeCtx = *ctx;
+            R5900Context *probe = &probeCtx;
+            SET_GPR_U32(probe, 4, cameraId);
+            SET_GPR_U32(probe, 31, ra);
+            g_studioGetCamera2Original(rdram, probe, runtime);
+            const uint32_t camera = GPR_U32(probe, 2);
+            std::printf("[rtps] ra=0x%x cam=%u @0x%x count=%d matrix=0x%x\n", ra, cameraId, camera, count, matrix);
+            std::printf("[rtps]  ");
+            f4(camera + 0x70, "offset");
+            f4(camera + 0x80, "scale");
+            std::printf("\n[rtps]  view");
+            for (int r = 0; r < 4; ++r)
+                f4(camera + 0x470 + r * 16, "");
+            if (matrix)
+            {
+                std::printf("\n[rtps]  mat ");
+                for (int r = 0; r < 4; ++r)
+                    f4(matrix + r * 16, "");
+            }
+            std::printf("\n[rtps]  in  ");
+            for (int i = 0; i < count && i < 8; ++i)
+                f4(points + i * 16, "");
+            std::printf("\n");
+        }
+        g_rotTransPersNOriginal(rdram, ctx, runtime);
+        if (log)
+        {
+            std::printf("[rtps]  out ");
+            for (int i = 0; i < count && i < 8; ++i)
+            {
+                int32_t v[4];
+                std::memcpy(v, mem(dest + i * 16), sizeof(v));
+                std::printf(" (%d %d %d %d)", v[0], v[1], v[2], v[3]);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+    }
+
     // Puts a wrapper in the function table slot for addr; `original` keeps
     // what was there (an overlay's slot is refilled whenever it loads).
     void wrapSlot(uint32_t addr, PS2Runtime::RecompiledFunction wrapper, PS2Runtime::RecompiledFunction &original)
@@ -664,6 +732,12 @@ namespace
         wrapSlot(0x0024DD18u, saveThumbnail_guard, g_saveThumbnailOriginal);     // GameSnapShotSaveThumbnail
         wrapSlot(0x0032E168u, exit_guard, g_exitOriginal);                       // exit
         wrapSlot(0x00223FC0u, jpegEncode_note, g_jpegEncodeOriginal);            // xglJpegEncode
+        if (std::getenv("XS_RTPS_LOG"))
+        {
+            const uint32_t slot = (0x0022C6A0u - g_ps2RecompiledFunctionTableBase) >> 2; // xglStudioGetCamera2
+            g_studioGetCamera2Original = g_ps2RecompiledFunctionTable[slot];
+            wrapSlot(0x00229AB0u, rotTransPersN_log, g_rotTransPersNOriginal); // xglRotTransPersN
+        }
         static const uint32_t saveTest = []() -> uint32_t {
             const char *v = std::getenv("XS_TEST_SAVE");
             return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
