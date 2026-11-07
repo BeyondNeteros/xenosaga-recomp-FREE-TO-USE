@@ -1012,15 +1012,22 @@ heartbeat: each call resets and re-seeds a VU1Interpreter instance.
 - Matrix chain in nmlPacketAddParts: CurMatrixSet(s2+0x180 or camera+0x470),
   then CurMatrixMul(s2+0x180 / s2+0x80 / sp), CurMatrixGet(sp+0x150) -> VU1 962.
 
-## IPU movies (boot logos): decoder done, wiring not built yet (2026-11-07)
+## IPU movies (boot logos) play (2026-11-07, runs/ipu-boot9, ipu-regress)
 
-Black boot logos (namco.ipu, logo_msi.ipu, movie\full|small\*.ipu) = the IPU
-was not emulated (registers only stored). Story movies (.pss, sceMpeg via
-FFmpeg) already play. New src/lib/ps2_ipu.cpp (Ps2Ipu: BCLR/IDEC/FDEC/SETTH,
-MPEG-1/2 intra macroblocks, IDCT, PS2 CSC, VLC tables from ISO annex B):
-tools/ipu_test.cpp decodes all 121 frames of namco.ipu cleanly (896 MBs each,
-picture correct). PS2Memory glue (ipuFetchQword = channel 4 chain on demand,
-ipuServiceFromDma = channel 3, IPU register reads/writes) is written in
-patches/ps2recomp-runtime-ipu-wip.patch (= committed patch + IPU work) but NOT
-yet built/tested in game: apply it, full rebuild, PGO, then watch the boot
-logos (PS2X_SCREENSHOT_AT) and check BP/IFC rewind in xglMoviePlay.
+Black boot logos (namco.ipu, logo_msi.ipu; also movieull|small\*.ipu) =
+the IPU was not emulated. Story movies (.pss, sceMpeg via FFmpeg) already played.
+- src/lib/ps2_ipu.cpp (Ps2Ipu): BCLR, IDEC (MPEG-1/2 intra macroblocks, VLC
+  tables from ISO annex B, reference IDCT, PS2 CSC coefficients, TH0/TH1 alpha,
+  RGB32/RGB16), FDEC, SETTH; SETIQ/SETVQ ignored (default intra matrix).
+  tools/ipu_test.cpp decodes a .ipu file offline (tools/xsarc.py extracts one).
+- PS2Memory: IPU registers; channel 4 (toIPU) is pulled on demand by
+  ipuFetchQword, following chain tags, and reads its first tag when started
+  (xglMoviePlay checks D4_MADR right after the start; otherwise its ring logic
+  jumped to chain[1], the file header); channel 3 (fromIPU) copies decoded
+  output (ipuServiceFromDma). BP/IFC/FP report fetched-but-unused quadwords so
+  the game's rewind math works. PS2X_IPU_LOG=<n> logs commands/DMA.
+- Second bug: DMA addresses with bit 31 (MADR/TADR/tag ADDR = scratchpad +
+  offset) were read as RAM (KSEG0) and tag ADDR lost bit 31. The movie's GIF
+  upload chains live in scratchpad and read zeros. GIF/VIF chain code now maps
+  bit 31 to the scratchpad (dmaAddr in writeIORegister). Regression replay:
+  same fps (28.5 avg), no crash.
