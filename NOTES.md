@@ -1011,3 +1011,16 @@ heartbeat: each call resets and re-seeds a VU1Interpreter instance.
   text into GS privileged registers. Still open.
 - Matrix chain in nmlPacketAddParts: CurMatrixSet(s2+0x180 or camera+0x470),
   then CurMatrixMul(s2+0x180 / s2+0x80 / sp), CurMatrixGet(sp+0x150) -> VU1 962.
+
+## IPU movies (boot logos): decoder done, wiring not built yet (2026-11-07)
+
+Black boot logos (namco.ipu, logo_msi.ipu, movie\full|small\*.ipu) = the IPU
+was not emulated (registers only stored). Story movies (.pss, sceMpeg via
+FFmpeg) already play. New src/lib/ps2_ipu.cpp (Ps2Ipu: BCLR/IDEC/FDEC/SETTH,
+MPEG-1/2 intra macroblocks, IDCT, PS2 CSC, VLC tables from ISO annex B):
+tools/ipu_test.cpp decodes all 121 frames of namco.ipu cleanly (896 MBs each,
+picture correct). PS2Memory glue (ipuFetchQword = channel 4 chain on demand,
+ipuServiceFromDma = channel 3, IPU register reads/writes) is written in
+patches/ps2recomp-runtime-ipu-wip.patch (= committed patch + IPU work) but NOT
+yet built/tested in game: apply it, full rebuild, PGO, then watch the boot
+logos (PS2X_SCREENSHOT_AT) and check BP/IFC rewind in xglMoviePlay.
