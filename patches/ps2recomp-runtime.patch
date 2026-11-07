@@ -3742,6 +3742,90 @@ index d467c4b..ac967f8 100644
              PS2_IF_AGRESSIVE_LOGS({
                  const std::string logLine = sanitizeForLog(rendered);
                  uint32_t count = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..5d21fd0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -252,6 +252,44 @@ namespace ps2_stubs
+             return resolved.lexically_normal();
+         }
+ 
++        // Before a save is replaced, its old data goes to save-backups/ beside the
++        // card folder (newest three). Icons and such (names with a dot) are skipped.
++        void backupMcSave(int32_t port, const std::filesystem::path &hostPath)
++        {
++            namespace fs = std::filesystem;
++            std::error_code ec;
++            if (hostPath.has_extension() || !fs::is_regular_file(hostPath, ec) || fs::file_size(hostPath, ec) == 0u || ec)
++                return;
++            const fs::path root = getMcRootPath(port);
++            const fs::path dir = root.parent_path() / "save-backups" / root.filename() / hostPath.parent_path().filename();
++            fs::create_directories(dir, ec);
++            if (ec)
++                return;
++            const std::string name = hostPath.filename().string();
++            fs::rename(dir / (name + ".bak2"), dir / (name + ".bak3"), ec);
++            ec.clear();
++            fs::rename(dir / (name + ".bak1"), dir / (name + ".bak2"), ec);
++            ec.clear();
++            fs::copy_file(hostPath, dir / (name + ".bak1"), fs::copy_options::overwrite_existing, ec);
++        }
++
++        // A format never destroys the card folder: it is set aside instead.
++        void setAsideMcRoot(const std::filesystem::path &root)
++        {
++            namespace fs = std::filesystem;
++            std::error_code ec;
++            if (!fs::exists(root, ec) || fs::is_empty(root, ec))
++                return;
++            fs::path aside;
++            for (int i = 1; i < 1000; ++i)
++            {
++                aside = root.parent_path() / (root.filename().string() + "-before-format-" + std::to_string(i));
++                if (!fs::exists(aside, ec))
++                    break;
++            }
++            fs::rename(root, aside, ec);
++        }
++
+         bool localtimeSafeMc(const std::time_t *value, std::tm *out)
+         {
+ #ifdef _WIN32
+@@ -606,6 +644,7 @@ namespace ps2_stubs
+                         std::error_code ec;
+                         if (std::filesystem::exists(hostPath, ec) && !ec)
+                         {
++                            backupMcSave(port, hostPath);
+                             if (std::filesystem::is_directory(hostPath, ec) &&
+                                 !std::filesystem::is_empty(hostPath, ec))
+                             {
+@@ -677,7 +716,7 @@ namespace ps2_stubs
+                 closeMcFilesForPortLocked(port);
+                 const std::filesystem::path root = getMcRootPath(port);
+                 std::error_code ec;
+-                std::filesystem::remove_all(root, ec);
++                setAsideMcRoot(root);
+                 ec.clear();
+                 std::filesystem::create_directories(root, ec);
+                 if (!ec)
+@@ -1022,6 +1061,8 @@ namespace ps2_stubs
+                     }
+                     else
+                     {
++                        if (create && exists)
++                            backupMcSave(port, hostPath);
+                         FILE *file = openMcHostFile(hostPath, flags);
+                         if (!file)
+                         {
+@@ -1247,7 +1288,7 @@ namespace ps2_stubs
+                 closeMcFilesForPortLocked(port);
+                 const std::filesystem::path root = getMcRootPath(port);
+                 std::error_code ec;
+-                std::filesystem::remove_all(root, ec);
++                setAsideMcRoot(root);
+                 ec.clear();
+                 std::filesystem::create_directories(root, ec);
+                 if (!ec)
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 index dc975ed..172211c 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp

@@ -589,12 +589,13 @@ namespace
     PS2Runtime::RecompiledFunction g_checkTalkPointOriginal = nullptr;
     PS2Runtime::RecompiledFunction g_menuFileOriginal = nullptr;
     uint32_t g_saveTestAfter = 0;
+    bool g_saveTestSaved = false;
 
     void checkTalkPoint_saveTest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         constexpr uint32_t kLoopFlags = 0x00338690u, kPadPressed = 0x00490DBAu; // GameLoopState.flags, PadData.pressed
         static uint32_t calls = 0;
-        if (++calls >= g_saveTestAfter && (calls - g_saveTestAfter) % 60u == 0u)
+        if (!g_saveTestSaved && ++calls >= g_saveTestAfter && (calls - g_saveTestAfter) % 60u == 0u)
         {
             std::printf("[save-test] asking for the save screen (field frame %u)\n", calls);
             *reinterpret_cast<uint32_t *>(rdram + kLoopFlags) |= 0x20000000u;
@@ -617,11 +618,25 @@ namespace
     void menuFile_saveTest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         constexpr uint32_t kPadPressed = 0x00490DBAu;
+        constexpr uint32_t kPadMenu = 0x00490DC0u, kFileWork = 0x004DAA94u; // PadData +0x30, FileWork
         static uint32_t calls = 0;
+        static uint8_t lastState = 0;
+        uint32_t work = 0;
+        std::memcpy(&work, rdram + kFileWork, sizeof(work));
+        const uint8_t state = rdram[(work + 3u) & 0x01FFFFFFu];
+        if (state != lastState)
+        {
+            std::printf("[save-test] menu state 0x%02x after 0x%02x\n", state, lastState);
+            lastState = state;
+            if (state == 0x2Eu)
+                g_saveTestSaved = true;
+        }
         if (++calls % 60u == 0u)
         {
-            std::printf("[save-test] save screen frame %u: Circle\n", calls);
-            *reinterpret_cast<uint16_t *>(rdram + kPadPressed) |= 0x0020u;
+            // Circle until something saved, then Cross back out to the field.
+            const uint16_t press = g_saveTestSaved ? 0x0040u : 0x0020u;
+            *reinterpret_cast<uint16_t *>(rdram + kPadPressed) |= press;
+            *reinterpret_cast<uint16_t *>(rdram + kPadMenu) |= press;
         }
         g_menuFileOriginal(rdram, ctx, runtime);
     }
