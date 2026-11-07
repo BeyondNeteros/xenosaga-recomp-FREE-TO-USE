@@ -1,4 +1,41 @@
 
+## Frame-rate dips: what limits them (2026-11-07, runs/vifwait1, peek1-5, cap1)
+
+The dips left in gameplay (battles 21-24 fps, story cutscenes) are VU1-bound:
+the VIF1/VU1 worker is 86-92% busy, the EE waits on it (vifwait ~70%),
+eeidle 0. In the battle dip (cap1, PS2X_VU_CAPTURE_SKIP=25000000 on
+inputs-prev) every call is the same small effect program (entry 0x170: setup
+or a batch of tiny loops, 284 VU cycles, one 208-byte packet), ~125k calls/s.
+Native blocks cover everything (no vu1_blocks.vbl written); time is ~55% in
+two native blocks, ~35% per-block bookkeeping (run loop, finishStaticBlock,
+lazy flag commits): the loops are 2-4 pairs each, so every iteration is a block.
+
+Checked and not the cause:
+- Waits: PS2X_VIF1_SYNCLOG=1 logs who makes the EE wait (`[vif1-wait]`
+  return address ^ register address<<32). The big one is sceGsSyncPath at the
+  end of the frame (processPendingTransfers), i.e. the frame really waits for
+  VU1. VIF1_STAT/GIF_STAT reads now answer "busy" while the worker runs (up to
+  two reads per chain, then wait; PS2X_VIF1_PEEK=0 = old), as on hardware, but
+  that made no measurable difference. mapVuMemory no longer syncs for those two.
+- XGKICK drain at program end went cycle by cycle with full pipeline scans;
+  now bulk when only the kick is left (PS2X_VU1_BULKKICK=0 = old). Same
+  checksums/cycles, ~2% faster.
+- PS2X_VU1_STATS=1 (vu1_replay or game, printed at exit): static blocks vs
+  dynamic pairs and why. Battle capture: all static.
+
+The big lever (not done): run VU1 draw calls in parallel. VU_REPLAY_STALE=1
+(vu1_replay) reruns each call from the previous call's start registers: 299/299
+identical in cap1, audio2, soak1; 294/299 in field captures (the misses follow
+matrix-setup calls). So calls almost never depend on the previous call's
+register results. A safe design: one job per MSCAL/MSCNT with a private copy of
+VU data memory, per-job read/write qword bitmaps and register read/write masks
+(VF/VI/ACC from InstructionUsage; MAC/status/clip/Q/P/I/R need a decoder:
+flag reads FMAND/FSAND/FCAND..., CLIP and status sticky bits are
+read-modify-write), commit in order (GIF packets buffered per job), rerun
+sequentially on any overlap with earlier in-flight jobs' writes, barrier on
+MPG/DIRECT/end of chain, plus a verify mode that also runs every call
+sequentially and compares. Needs the battle dips ~1.35x to reach 30.
+
 ## Audio skipping fixed: SPU2 runs on IOP time (2026-11-07, runs/audio-old, audio2)
 
 Cause: the SPU2 was rendered on the host audio thread in real time, while the

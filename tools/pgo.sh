@@ -35,9 +35,12 @@ if [ "${1:-}" = "game" ]; then
     cmake "$USE" -DPS2X_PGO_GENERATE=ON -DPS2X_PGO_USE=OFF > /dev/null
     cmake --build "$USE" --target ps2EntryRunner | tail -1
     bash "$ROOT/port/tools/install.sh" | tail -1
-    echo "training: playing the tutorial script (instrumented build)..."
-    bash "$ROOT/port/tools/run_game.sh" pgo-train 300 --input "$ROOT/port/inputs/newgame-to-tutorial.txt" \
-        --env XS_PGO_DUMP=160 > /dev/null 2>&1 || true
+    # PGO_INPUT / PGO_SECONDS / PGO_DUMP pick another script (e.g. a recorded
+    # session with battles), how long it runs and when the profile is written.
+    echo "training: playing ${PGO_INPUT:-the tutorial script} (instrumented build)..."
+    bash "$ROOT/port/tools/run_game.sh" pgo-train "${PGO_SECONDS:-300}" \
+        --input "${PGO_INPUT:-$ROOT/port/inputs/newgame-to-tutorial.txt}" \
+        --env XS_PGO_DUMP="${PGO_DUMP:-160}" > /dev/null 2>&1 || true
     grep -q "PGO profile written" "$ROOT/runs/pgo-train/xenosaga.log" || { echo "no profile written"; exit 1; }
     src="$USE/$(printf "$BLOCKS_GCDA" ps2EntryRunner)"
     dst="$USE/$(printf "$BLOCKS_GCDA" vu1_replay)"
