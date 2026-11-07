@@ -4283,6 +4283,192 @@ index d467c4b..ac967f8 100644
              PS2_IF_AGRESSIVE_LOGS({
                  const std::string logLine = sanitizeForLog(rendered);
                  uint32_t count = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..2510256 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -523,6 +523,10 @@ namespace ps2_stubs
+             uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
+             uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
+             std::vector<MpegRegisteredCallback> callbacks;
++            // Audio: the packet's payload, handed to the callback from a
++            // scratch copy (it may wrap around the guest ring, and the ring
++            // moves on while a refused packet waits for its retry).
++            std::vector<uint8_t> bytes;
+         };
+ 
+         struct MpegStubState
+@@ -552,8 +556,10 @@ namespace ps2_stubs
+         constexpr uint32_t kStubMovieWidth = 320u;
+         constexpr uint32_t kStubMovieHeight = 240u;
+         constexpr uint32_t kMpegStrM2V = 0u;
+-        constexpr uint32_t kMpegStrPCM = 1u;
+-        constexpr uint32_t kMpegStrADPCM = 2u;
++        // sceMpegStrType (libmpeg.h): M2V 0, IPU 1, PCM 2, ADPCM 3, DATA 4. PCM and
++        // ADPCM were 1 and 2, so no game audio callback ever matched (movies silent).
++        constexpr uint32_t kMpegStrPCM = 2u;
++        constexpr uint32_t kMpegStrADPCM = 3u;
+         constexpr uint8_t kMpegPackHeader = 0xBAu;
+         constexpr uint8_t kMpegSystemHeader = 0xBBu;
+         constexpr uint8_t kMpegProgramEnd = 0xB9u;
+@@ -1345,6 +1351,7 @@ namespace ps2_stubs
+                     const size_t payloadStart = pes.payloadOffset;
+                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                     {
++                        const size_t before = callbackEvents.size();
+                         queueStreamCallbackEvent(
+                             mpegAddr,
+                             kMpegStrPCM,
+@@ -1361,6 +1368,9 @@ namespace ps2_stubs
+                             callbackEvents,
+                             pes.pts90k,
+                             pes.dts90k);
++                        for (size_t e = before; e < callbackEvents.size(); ++e)
++                            callbackEvents[e].bytes.assign(buffer.begin() + static_cast<std::ptrdiff_t>(payloadStart),
++                                                           buffer.begin() + static_cast<std::ptrdiff_t>(packetEnd));
+                     }
+                 }
+ 
+@@ -1579,63 +1589,104 @@ namespace ps2_stubs
+             return true;
+         }
+ 
+-        void dispatchGuestStreamCallback(uint8_t *rdram,
++        // Stream callbacks run right away, inside the demux call, as libmpeg
++        // does: the game's audio callback copies the packet into its own ring
++        // and reads the movie's sample rate from the first one, which must
++        // happen before the first picture. (They used to be queued to run
++        // later: by then the data pointer could point at newer ring data,
++        // giving noise, and the first frame started the audio at pitch 0,
++        // giving silent movies.) Returns the callback's result (0 = refused:
++        // the game's buffer is full, try again later).
++        uint32_t callGuestStreamCallback(uint8_t *rdram,
+                                          R5900Context *callerCtx,
+                                          PS2Runtime *runtime,
+                                          const MpegStreamCallbackEvent &event,
+                                          const MpegRegisteredCallback &callback)
+         {
+             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
+-            {
+-                return;
+-            }
+-
++                return 1u;
++            PS2Runtime::RecompiledFunction fn = runtime->lookupFunction(callback.func);
++            if (!fn)
++                return 1u;
+             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+             if (cbDataAddr == 0u)
+-            {
+-                return;
+-            }
+-            if (!writeMpegCallbackData(rdram, cbDataAddr, event))
+-            {
+-                runtime->guestFree(cbDataAddr);
+-                return;
+-            }
+-
+-            R5900Context callbackCtx = *callerCtx;
+-            SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
+-            SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
+-            SET_GPR_U32(&callbackCtx, 6, callback.data);
+-            SET_GPR_U32(&callbackCtx, 7, 0u);
+-            SET_GPR_U32(&callbackCtx, 29, 0u);
+-            SET_GPR_U32(&callbackCtx, 31, 0u);
+-            callbackCtx.pc = callback.func;
++                return 1u;
++            MpegStreamCallbackEvent sent = event;
++            uint32_t payloadAddr = 0u;
++            if (!event.bytes.empty())
++            {
++                payloadAddr = runtime->guestMalloc(static_cast<uint32_t>(event.bytes.size()), 16u);
++                if (payloadAddr == 0u)
++                {
++                    runtime->guestFree(cbDataAddr);
++                    return 1u;
++                }
++                std::memcpy(getMemPtr(rdram, payloadAddr), event.bytes.data(), event.bytes.size());
++                sent.dataAddr = payloadAddr;
++                sent.len = static_cast<uint32_t>(event.bytes.size());
++            }
++            uint32_t result = 1u;
++            if (writeMpegCallbackData(rdram, cbDataAddr, sent))
++            {
++                R5900Context callbackCtx = *callerCtx;
++                SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
++                SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
++                SET_GPR_U32(&callbackCtx, 6, callback.data);
++                SET_GPR_U32(&callbackCtx, 7, 0u);
++                SET_GPR_U32(&callbackCtx, 31, 0u);
++                callbackCtx.pc = callback.func;
++                fn(rdram, &callbackCtx, runtime);
++                R5900Context *done = &callbackCtx;
++                result = GPR_U32(done, 2);
++            }
++            if (payloadAddr != 0u)
++                runtime->guestFree(payloadAddr);
++            runtime->guestFree(cbDataAddr);
++            return result;
++        }
+ 
+-            GuestInvocation invocation{};
+-            invocation.kind = GuestInvocationKind::RpcCallback;
+-            invocation.context = callbackCtx;
+-            invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
+-            {
+-                runtime->guestFree(cbDataAddr);
+-            };
+-            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        bool isAudioStreamType(uint32_t type)
++        {
++            return type == kMpegStrPCM || type == kMpegStrADPCM;
+         }
+ 
++        // Audio packets the game refused (buffer full), oldest first; offered
++        // again before any newer audio so the order is kept.
++        std::deque<MpegStreamCallbackEvent> g_pendingAudioEvents;
++
+         void dispatchStreamCallbacks(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+                                      const std::vector<MpegStreamCallbackEvent> &events)
+         {
+-            if (events.empty())
++            const auto offer = [&](const MpegStreamCallbackEvent &event) -> bool
+             {
+-                return;
+-            }
++                bool accepted = true;
++                for (const MpegRegisteredCallback &callback : event.callbacks)
++                    if (callGuestStreamCallback(rdram, ctx, runtime, event, callback) == 0u)
++                        accepted = false;
++                return accepted;
++            };
++            // A different movie: whatever was waiting belongs to the old one.
++            if (!g_pendingAudioEvents.empty() && !events.empty() &&
++                g_pendingAudioEvents.front().mpegAddr != events.front().mpegAddr)
++                g_pendingAudioEvents.clear();
++            while (!g_pendingAudioEvents.empty() && offer(g_pendingAudioEvents.front()))
++                g_pendingAudioEvents.pop_front();
+ 
+             for (const MpegStreamCallbackEvent &event : events)
+             {
+-                for (const MpegRegisteredCallback &callback : event.callbacks)
++                if (isAudioStreamType(event.streamType))
+                 {
+-                    dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
++                    if (!g_pendingAudioEvents.empty() || !offer(event))
++                    {
++                        g_pendingAudioEvents.push_back(event);
++                        if (g_pendingAudioEvents.size() > 512u)
++                            g_pendingAudioEvents.pop_front(); // the game stopped taking audio
++                    }
++                    continue;
+                 }
++                offer(event);
+             }
+         }
+ 
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 index 564d873..5d21fd0 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp

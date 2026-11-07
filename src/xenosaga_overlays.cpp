@@ -362,6 +362,21 @@ namespace
         else
             logged = false;
         g_mpeg2PlayOriginal(rdram, ctx, runtime);
+        // XS_MOVIE_TRACE=1: the audio side of each movie frame (header read,
+        // the game's audio ring write/read positions) every 15 frames.
+        static const bool trace = std::getenv("XS_MOVIE_TRACE") != nullptr;
+        if (trace)
+        {
+            int32_t frame, rateNow, write, read;
+            std::memcpy(&frame, rdram + ((info + 0x38u) & kRdramMask), 4);
+            std::memcpy(&rateNow, rdram + ((info + 0x90u) & kRdramMask), 4);
+            std::memcpy(&write, rdram + ((info + 0xB8u) & kRdramMask), 4);
+            std::memcpy(&read, rdram + ((info + 0xBCu) & kRdramMask), 4);
+            const uint8_t header = rdram[(info + 0x94u) & kRdramMask];
+            if (frame % 15 == 0)
+                std::printf("[movie-trace] frame %d header %u rate %d audio write %d read %d\n", frame, header, rateNow,
+                            write, read);
+        }
     }
 
     void installMovieAudioHook()
