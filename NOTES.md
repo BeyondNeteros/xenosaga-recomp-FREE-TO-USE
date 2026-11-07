@@ -1,4 +1,29 @@
 
+## Parallel VU1: built, correct, not faster yet - shelved (2026-11-07, runs/par-verify1-3, par-perf1-2)
+
+`patches/ps2recomp-runtime-vu1-parallel-wip.patch` is the full runtime patch WITH
+the parallel VU1 work (apply it instead of ps2recomp-runtime.patch to resume).
+Design as in the section below: Vu1Parallel (src/lib/vu/ps2_vu1_parallel.cpp)
+queues MSCAL/MSCNT from the VIF1 worker to N threads, each job on a private VU
+memory snapshot with VU1Interpreter::Tracking (lane-level memory reads/writes,
+register live/written masks incl. Q/P landing times, CLIP shift counts, status
+sticky as read-modify-write), commits in order, reruns on conflicts, barriers
+on DIRECT/MPG/MSKPATH3/chain end. PS2X_VU1_PARALLEL=1 enables,
+PS2X_VU1_PAR_VERIFY=1 reruns everything and compares.
+
+Results: verify mode 0 mismatches over millions of calls; 90-93% of calls
+valid in parallel (remaining: vf25.x/vf3.x/vi15 set by matrix-setup calls,
+then memory). But the master (VIF1 thread) cost per call (~3.6 us: snapshot
+copy, checks, merge, reruns) exceeds a call's own cost (~1.5-3 us), so the
+game ran 17-20 fps instead of 28. Incremental snapshots (base job + delta,
+built by workers) and SIMD checks were added but not measured before
+shelving. The tracking hooks alone (one branch per load/store/block) cost
+~1-2 fps with the feature off, so the runtime was restored to the committed
+state. To make it pay: master work must be well under 1 us per call - e.g.
+batch many calls per job (a job = a run of calls between setup calls), keep
+write lists sparse, avoid re-validating every call; and learn to wait after
+matrix-setup calls instead of rerunning the queued calls behind them.
+
 ## Frame-rate dips: what limits them (2026-11-07, runs/vifwait1, peek1-5, cap1)
 
 The dips left in gameplay (battles 21-24 fps, story cutscenes) are VU1-bound:
