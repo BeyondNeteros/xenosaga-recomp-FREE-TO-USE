@@ -1,4 +1,27 @@
 
+## Audio skipping fixed: SPU2 runs on IOP time (2026-11-07, runs/audio-old, audio2)
+
+Cause: the SPU2 was rendered on the host audio thread in real time, while the
+IOP (sound driver) only runs as EE cycles pass on the game thread. Streams
+(decomp audio/ssd/ssd_vag.c: per voice two 1 KB chunks at SPU 0x6000, IRQ on
+the chunk being played, ~37 ms to refill the other) were missed whenever the EE
+stalled or ran slow, so old chunks played again. New counter: a stream chunk
+played again without a DMA refill = "stale". Replay of inputs-prev, 5 min:
+old 300 stale of 7526; new 0 stale, 0 underruns.
+
+Now (default; `PS2X_SPU2_SYNC=0` = old behaviour):
+- the IOP loop renders 16 samples per 768x16 IOP cycles into a ring
+  (`Spu2::produce`); idle jumps are capped to that step so IRQs land on time;
+- the audio callback plays the ring with a ~64 ms cushion and a +-1.5% speed
+  trim; empty ring = fade out and wait to refill;
+- the IOP is kept within -5/+20 ms of the host clock (`realtimeCatchUp`:
+  extra cycles when behind, at most 100 ms per catch-up; held when ahead),
+  as a real IOP keeps time while the EE is overloaded.
+- `[spu2] last 5 s:` log line: stream chunks, stale, underruns, dropped,
+  buffered frames, catch-up and held ms.
+Side effect to watch: in slow cutscenes voices now run at real speed and may
+lead the animation (before, they skipped instead).
+
 ## Known broken, parked until 30 fps (reported 2026-11-01)
 
 - Battles: the game skips them entirely (not investigated yet).

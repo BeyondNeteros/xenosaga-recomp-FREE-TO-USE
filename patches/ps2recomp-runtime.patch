@@ -475,10 +475,10 @@ index a932a5d..81ebba5 100644
  }
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
 new file mode 100644
-index 0000000..d2ba2a2
+index 0000000..9e6fac3
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,673 @@
 +#include "iop_spu2.h"
 +
 +#include <algorithm>
@@ -527,7 +527,7 @@ index 0000000..d2ba2a2
 +    }
 +
 +    Spu2::Spu2()
-+        : m_ram(kRamWords, 0u)
++        : m_ram(kRamWords, 0u), m_ring(static_cast<size_t>(kRingFrames) * 2u, int16_t{0})
 +    {
 +    }
 +
@@ -565,6 +565,16 @@ index 0000000..d2ba2a2
 +                m_irqInfo |= static_cast<uint16_t>(4u << c);
 +                m_interruptPending = true;
 +            }
++        }
++    }
++
++    void Spu2::markStreamWritten(uint32_t address, uint32_t words)
++    {
++        for (uint32_t i = 0; i < m_chunkFresh.size(); ++i)
++        {
++            const uint32_t start = kStreamBase + i * 0x200u;
++            if (((start - address) & kRamMask) < words || ((address - start) & kRamMask) < 0x200u)
++                m_chunkFresh[i] = true;
 +        }
 +    }
 +
@@ -609,6 +619,14 @@ index 0000000..d2ba2a2
 +    {
 +        const uint32_t address = v.nextAddress & kRamMask & ~7u;
 +        checkIrq(core, address, 8u);
++        if (address - kStreamBase < kStreamWords && (address & 0x1FFu) == 0u)
++        {
++            bool &fresh = m_chunkFresh[(address - kStreamBase) >> 9];
++            m_streamChunks.fetch_add(1u, std::memory_order_relaxed);
++            if (!fresh)
++                m_staleChunks.fetch_add(1u, std::memory_order_relaxed);
++            fresh = false;
++        }
 +        uint8_t block[16];
 +        for (uint32_t i = 0; i < 8u; ++i)
 +        {
@@ -916,6 +934,7 @@ index 0000000..d2ba2a2
 +            std::fprintf(stderr, "[spu2] %s c%d tsa=0x%05x words=0x%x\n", "dma write", core, c.transferAddress, words);
 +        }
 +        checkIrq(core, c.transferAddress, words);
++        markStreamWritten(c.transferAddress, words);
 +        for (uint32_t i = 0; i < words; ++i)
 +        {
 +            uint16_t word;
@@ -946,9 +965,116 @@ index 0000000..d2ba2a2
 +        c.transferAddress = (c.transferAddress + words) & kRamMask;
 +    }
 +
++    bool Spu2::synced() noexcept
++    {
++        static const bool value = []() {
++            const char *env = std::getenv("PS2X_SPU2_SYNC");
++            return !(env && env[0] == '0');
++        }();
++        return value;
++    }
++
++    void Spu2::produce(size_t frames)
++    {
++        int16_t block[2u * 64u];
++        while (frames > 0u)
++        {
++            const size_t count = std::min<size_t>(frames, 64u);
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                renderLocked(block, count);
++            }
++            frames -= count;
++            const uint64_t write = m_ringWrite.load(std::memory_order_relaxed);
++            const uint64_t read = m_ringRead.load(std::memory_order_acquire);
++            if (write - read + count > kRingFrames)
++            {
++                m_dropped.fetch_add(count, std::memory_order_relaxed);
++                continue;
++            }
++            for (size_t i = 0; i < count; ++i)
++            {
++                const size_t slot = static_cast<size_t>((write + i) % kRingFrames) * 2u;
++                m_ring[slot] = block[i * 2u];
++                m_ring[slot + 1u] = block[i * 2u + 1u];
++            }
++            m_ringWrite.store(write + count, std::memory_order_release);
++        }
++    }
++
 +    void Spu2::render(int16_t *output, size_t frames)
 +    {
-+        std::lock_guard<std::mutex> lock(m_mutex);
++        if (!synced())
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            renderLocked(output, frames);
++            return;
++        }
++        // Play the IOP-time output with a cushion of about 64 ms: the IOP runs
++        // in bursts on the game thread. A slight speed change (at most 1.5%)
++        // keeps the cushion level; an empty ring waits to refill.
++        constexpr double kTarget = 3072.0;
++        uint64_t read = m_ringRead.load(std::memory_order_relaxed);
++        const uint64_t write = m_ringWrite.load(std::memory_order_acquire);
++        uint64_t available = write - read;
++        if (!m_playing)
++        {
++            if (static_cast<double>(available) < kTarget)
++            {
++                std::memset(output, 0, frames * 4u);
++                return;
++            }
++            m_playing = true;
++            m_averageFill = static_cast<double>(available);
++            m_fraction = 0.0;
++        }
++        if (static_cast<double>(available) > kTarget * 4.0)
++        {
++            // Far behind (the game ran ahead, or a stall ended): skip ahead.
++            read = write - static_cast<uint64_t>(kTarget);
++            available = static_cast<uint64_t>(kTarget);
++            m_averageFill = kTarget;
++        }
++        m_averageFill += (static_cast<double>(available) - m_averageFill) * 0.05;
++        const double ratio = 1.0 + std::clamp((m_averageFill - kTarget) / kTarget * 0.02, -0.015, 0.015);
++        size_t frame = 0;
++        for (; frame < frames; ++frame)
++        {
++            if (write - read < 2u)
++            {
++                m_underruns.fetch_add(1u, std::memory_order_relaxed);
++                m_playing = false;
++                break;
++            }
++            const size_t a = static_cast<size_t>(read % kRingFrames) * 2u;
++            const size_t b = static_cast<size_t>((read + 1u) % kRingFrames) * 2u;
++            for (int ch = 0; ch < 2; ++ch)
++            {
++                const double value = m_ring[a + ch] + (m_ring[b + ch] - m_ring[a + ch]) * m_fraction;
++                m_last[ch] = static_cast<int16_t>(value);
++                output[frame * 2u + ch] = m_last[ch];
++            }
++            m_fraction += ratio;
++            while (m_fraction >= 1.0)
++            {
++                m_fraction -= 1.0;
++                ++read;
++            }
++        }
++        // Underrun: fade out from the last sample instead of clicking.
++        for (size_t i = frame; i < frames; ++i)
++        {
++            for (int ch = 0; ch < 2; ++ch)
++            {
++                m_last[ch] = static_cast<int16_t>((m_last[ch] * 15) / 16);
++                output[i * 2u + ch] = m_last[ch];
++            }
++        }
++        m_ringRead.store(read, std::memory_order_release);
++    }
++
++    void Spu2::renderLocked(int16_t *output, size_t frames)
++    {
 +        for (size_t frame = 0; frame < frames; ++frame)
 +        {
 +            int32_t coreOut[2][2] = {{0, 0}, {0, 0}};
@@ -1028,10 +1154,10 @@ index 0000000..d2ba2a2
 +}
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
 new file mode 100644
-index 0000000..b27738e
+index 0000000..46e0685
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,160 @@
 +#pragma once
 +
 +#include <array>
@@ -1078,7 +1204,26 @@ index 0000000..b27738e
 +        void dmaRead(int core, uint8_t *destination, size_t bytes);
 +
 +        // Interleaved stereo, 48 kHz, called from the host audio thread.
++        // In synced mode (default; PS2X_SPU2_SYNC=0 turns it off) it plays
++        // what produce() rendered on IOP time, through a small cushion.
 +        void render(int16_t *output, size_t frames);
++
++        // Synced mode: render the next frames on IOP time (the IOP thread
++        // calls this as its clock advances, so the sound driver's stream
++        // IRQs land when its code expects them).
++        void produce(size_t frames);
++        [[nodiscard]] static bool synced() noexcept;
++        // Counters for the heartbeat: frames dropped (ring full), underruns.
++        [[nodiscard]] uint64_t droppedFrames() const noexcept { return m_dropped.load(std::memory_order_relaxed); }
++        [[nodiscard]] uint64_t underruns() const noexcept { return m_underruns.load(std::memory_order_relaxed); }
++        // Stream chunks (driver stream area, 1 KB each) played again without
++        // a refill since their last play: an audible skip / repeat.
++        [[nodiscard]] uint64_t staleStreamChunks() const noexcept { return m_staleChunks.load(std::memory_order_relaxed); }
++        [[nodiscard]] uint64_t streamChunks() const noexcept { return m_streamChunks.load(std::memory_order_relaxed); }
++        [[nodiscard]] uint32_t bufferedFrames() const noexcept
++        {
++            return static_cast<uint32_t>(m_ringWrite.load(std::memory_order_acquire) - m_ringRead.load(std::memory_order_acquire));
++        }
 +
 +        // An SPU2 interrupt (IOP IRQ 9) became pending; clears the flag.
 +        [[nodiscard]] bool takeInterrupt() noexcept { return m_interruptPending.exchange(false); }
@@ -1121,6 +1266,7 @@ index 0000000..b27738e
 +        };
 +
 +        uint16_t read16Locked(uint32_t physical);
++        void renderLocked(int16_t *output, size_t frames);
 +        uint16_t &reg(uint32_t offset) { return m_regs[(offset & (kRegisterSize - 1u)) >> 1]; }
 +        [[nodiscard]] uint16_t regValue(uint32_t offset) const { return m_regs[(offset & (kRegisterSize - 1u)) >> 1]; }
 +        static uint32_t join(uint16_t high, uint16_t low) { return ((static_cast<uint32_t>(high) & 0xFu) << 16) | low; }
@@ -1150,6 +1296,26 @@ index 0000000..b27738e
 +        std::array<Reverb, 2> m_reverb{};
 +        uint16_t m_irqInfo = 0; // 0x7C2: bit 2 + core
 +        std::atomic<bool> m_interruptPending{false};
++
++        // Synced mode: single-producer (IOP thread) / single-consumer (audio
++        // thread) ring of stereo frames.
++        static constexpr uint32_t kRingFrames = 32768u; // ~680 ms
++        std::vector<int16_t> m_ring;
++        std::atomic<uint64_t> m_ringWrite{0};
++        std::atomic<uint64_t> m_ringRead{0};
++        std::atomic<uint64_t> m_dropped{0};
++        std::atomic<uint64_t> m_underruns{0};
++        static constexpr uint32_t kStreamBase = 0x3000u;  // words (byte 0x6000)
++        static constexpr uint32_t kStreamWords = 0x1000u; // 8 KB
++        void markStreamWritten(uint32_t address, uint32_t words);
++        std::array<bool, kStreamWords / 0x200u> m_chunkFresh{};
++        std::atomic<uint64_t> m_staleChunks{0};
++        std::atomic<uint64_t> m_streamChunks{0};
++        // Consumer state (audio thread only).
++        bool m_playing = false;
++        double m_fraction = 0.0;
++        double m_averageFill = 0.0;
++        int16_t m_last[2]{};
 +    };
 +}
 diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
@@ -1212,20 +1378,21 @@ index eed2b61..f9c23c6 100644
          case 5: // getchar
          case 10:
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..745e9d3 100644
+index e5f63a9..ef7f411 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -17,6 +17,9 @@
+@@ -17,6 +17,10 @@
  #include "imports/iop_vblank.h"
  #include "iop_emulator_const.h"
  
++#include <chrono>
 +#include <cstdlib>
 +#include <vector>
 +#include <cstdio>
  #include <algorithm>
  #include <cctype>
  #include <map>
-@@ -177,7 +180,11 @@ namespace ps2x::iop::detail
+@@ -177,7 +181,11 @@ namespace ps2x::iop::detail
          void schedulePendingDma()
          {
              if (const auto dma = memory.takeDmaStart())
@@ -1237,12 +1404,11 @@ index e5f63a9..745e9d3 100644
          }
  
          bool readRam(uint32_t address, void *destination, size_t size) const
-@@ -402,10 +409,22 @@ namespace ps2x::iop::detail
+@@ -402,10 +410,22 @@ namespace ps2x::iop::detail
              CpuState *previous = activeCpu;
              activeCpu = &cpu;
              const uint64_t start = totalInstructions;
 -            while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
--            {
 +            // Code between CpuDisableIntr/CpuSuspendIntr and the matching
 +            // enable must not be interrupted (the sound driver edits its DMA
 +            // queue there; a completion landing inside loses a transfer and
@@ -1250,7 +1416,7 @@ index e5f63a9..745e9d3 100644
 +            // enable, and the timeslice runs on until then (bounded).
 +            constexpr uint64_t kCriticalSectionGrace = 200000u;
 +            while (!cpu.stopped && !cpu.yielded)
-+            {
+             {
 +                const uint64_t ran = totalInstructions - start;
 +                if (ran >= instructionBudget &&
 +                    (memory.interruptControl() != 0u || ran >= instructionBudget + kCriticalSectionGrace))
@@ -1262,7 +1428,7 @@ index e5f63a9..745e9d3 100644
                  if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                      servicePendingDmaInterrupts();
                  if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
-@@ -483,6 +502,21 @@ namespace ps2x::iop::detail
+@@ -483,6 +503,21 @@ namespace ps2x::iop::detail
          // Not that good to use exception handling for control flow but will do for now
          void servicePendingDmaInterrupts()
          {
@@ -1284,7 +1450,7 @@ index e5f63a9..745e9d3 100644
              if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
                  return;
  
-@@ -502,7 +536,10 @@ namespace ps2x::iop::detail
+@@ -502,7 +537,10 @@ namespace ps2x::iop::detail
              try
              {
                  for (const int irq : completed)
@@ -1296,7 +1462,7 @@ index e5f63a9..745e9d3 100644
              }
              catch (...)
              {
-@@ -553,13 +590,67 @@ namespace ps2x::iop::detail
+@@ -553,13 +591,182 @@ namespace ps2x::iop::detail
              servicingGuestCallbacks = false;
          }
  
@@ -1352,19 +1518,143 @@ index e5f63a9..745e9d3 100644
 +            }
 +        }
 +
++        // Synced sound: the SPU2 renders as IOP time passes, 16 samples at a
++        // time (36.864 MHz / 48 kHz = 768 IOP cycles per sample), so stream
++        // IRQs reach the driver at the IOP time its code was written for.
++        static constexpr uint64_t kCyclesPerSample = 768u;
++        static constexpr uint64_t kAudioStep = 16u * kCyclesPerSample;
++        static constexpr uint64_t kIopHz = 36'864'000u;
++        uint64_t audioCycle = 0;
++
++        void advanceAudio()
++        {
++            if (totalCycles < audioCycle)
++                audioCycle = totalCycles;
++            if (totalCycles - audioCycle > kIopHz / 4u)
++                audioCycle = totalCycles - kIopHz / 4u; // never render more than 250 ms in one go
++            while (totalCycles - audioCycle >= kAudioStep)
++            {
++                memory.spu2().produce(kAudioStep / kCyclesPerSample);
++                audioCycle += kAudioStep;
++            }
++        }
++
++        // The IOP runs on the game thread, paced by EE cycles. On a real PS2 it
++        // keeps real time even when the EE is overloaded, so it may not fall
++        // more than 5 ms behind the host clock (catching up at most 100 ms at
++        // a time). Returns the extra IOP cycles to run.
++        std::chrono::steady_clock::time_point hostAnchor{};
++        uint64_t hostAnchorCycles = 0;
++        uint64_t hostCheckCycles = 0;
++        uint64_t catchUpTotal = 0;
++        std::chrono::steady_clock::time_point nextReport{};
++
++        // Returns how many IOP cycles to run for `pending` EE-paced ones.
++        bool throttled = false;
++        uint64_t heldTotal = 0;
++
++        uint64_t realtimeCatchUp(uint64_t pending, bool enabled)
++        {
++            hostCheckCycles += pending;
++            if (!throttled && hostCheckCycles < kIopHz / 4000u) // check the clock every 0.25 ms of IOP time
++                return pending;
++            hostCheckCycles = 0;
++            const auto now = std::chrono::steady_clock::now();
++            const uint64_t projected = totalCycles + pending;
++            if (hostAnchorCycles == 0u)
++            {
++                hostAnchor = now;
++                hostAnchorCycles = projected;
++                nextReport = now + std::chrono::seconds(5);
++                return pending;
++            }
++            reportAudio(now);
++            if (!enabled)
++                return pending;
++            const uint64_t elapsedUs = static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::microseconds>(now - hostAnchor).count());
++            const uint64_t hostCycles = hostAnchorCycles + elapsedUs * (kIopHz / 1'000'000u) +
++                                        (elapsedUs * (kIopHz % 1'000'000u)) / 1'000'000u;
++            constexpr uint64_t kMaxLag = kIopHz / 200u;    // 5 ms
++            constexpr uint64_t kMaxAhead = kIopHz / 50u;   // 20 ms
++            constexpr uint64_t kMaxCatchUp = kIopHz / 10u; // 100 ms
++            if (projected > hostCycles + kMaxAhead)
++            {
++                // Ahead of the host clock: hold the IOP (its sound would pile
++                // up in the output cushion). Checked on every call meanwhile.
++                const uint64_t over = projected - hostCycles - kMaxAhead;
++                const uint64_t held = std::min(over, pending);
++                heldTotal += held;
++                throttled = true;
++                return pending - held;
++            }
++            throttled = false;
++            if (projected + kMaxLag >= hostCycles)
++                return pending;
++            uint64_t extra = hostCycles - kMaxLag - projected;
++            if (extra > kMaxCatchUp)
++            {
++                // A long stall (loading, window drag): skip the rest.
++                extra = kMaxCatchUp;
++                hostAnchor = now;
++                hostAnchorCycles = projected + extra;
++            }
++            catchUpTotal += extra;
++            return pending + extra;
++        }
++
++        void reportAudio(std::chrono::steady_clock::time_point now)
++        {
++            if (now < nextReport)
++                return;
++            nextReport = now + std::chrono::seconds(5);
++            Spu2 &spu = memory.spu2();
++            static uint64_t lastChunks = 0, lastStale = 0, lastUnder = 0, lastDropped = 0, lastCatchUp = 0, lastHeld = 0;
++            const uint64_t chunks = spu.streamChunks(), stale = spu.staleStreamChunks();
++            const uint64_t under = spu.underruns(), dropped = spu.droppedFrames();
++            std::printf("[spu2] last 5 s: stream chunks %llu, stale %llu, underruns %llu, dropped frames %llu, "
++                        "buffered %u, iop catch-up %.1f ms, held %.1f ms\n",
++                        static_cast<unsigned long long>(chunks - lastChunks),
++                        static_cast<unsigned long long>(stale - lastStale),
++                        static_cast<unsigned long long>(under - lastUnder),
++                        static_cast<unsigned long long>(dropped - lastDropped),
++                        spu.bufferedFrames(),
++                        static_cast<double>(catchUpTotal - lastCatchUp) * 1000.0 / static_cast<double>(kIopHz),
++                        static_cast<double>(heldTotal - lastHeld) * 1000.0 / static_cast<double>(kIopHz));
++            std::fflush(stdout);
++            lastChunks = chunks;
++            lastStale = stale;
++            lastUnder = under;
++            lastDropped = dropped;
++            lastCatchUp = catchUpTotal;
++            lastHeld = heldTotal;
++        }
++
          void runCycles(uint64_t cycles) noexcept
          {
              try
              {
 +                watchDump();
                  const uint64_t target = totalCycles + cycles;
++                const bool syncedAudio = Spu2::synced();
                  while (totalCycles < target)
                  {
 +                    g_iopTraceCycle = totalCycles;
++                    if (syncedAudio)
++                        advanceAudio();
                      servicePendingDmaInterrupts();
                      servicePendingGuestCallbacks();
                      timrman.serviceDue(totalCycles, *this);
-@@ -588,6 +679,34 @@ namespace ps2x::iop::detail
+@@ -572,6 +779,8 @@ namespace ps2x::iop::detail
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
++                        if (syncedAudio)
++                            nextWake = std::min(nextWake, audioCycle + kAudioStep);
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
+@@ -588,6 +797,34 @@ namespace ps2x::iop::detail
              }
          }
  
@@ -1399,7 +1689,7 @@ index e5f63a9..745e9d3 100644
          ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
          {
              ModuleLoadResult result{true, -1, -1};
-@@ -632,6 +751,13 @@ namespace ps2x::iop::detail
+@@ -632,6 +869,13 @@ namespace ps2x::iop::detail
              result.startResult = static_cast<int32_t>(startResult);
              modules[module.id] = std::move(module);
  
@@ -1413,7 +1703,18 @@ index e5f63a9..745e9d3 100644
              std::ostringstream out;
              out << "[IOP] loaded IRX id=" << result.moduleId
                  << " entry=0x" << std::hex << modules[result.moduleId].entry
-@@ -822,6 +948,33 @@ namespace ps2x::iop::detail
+@@ -742,8 +986,9 @@ namespace ps2x::iop::detail
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+-        const uint64_t iopCycles = total / 8u;
++        uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
++        iopCycles = m_impl->realtimeCatchUp(iopCycles, Spu2::synced());
+         if (iopCycles)
+             m_impl->runCycles(iopCycles);
+     }
+@@ -822,6 +1067,33 @@ namespace ps2x::iop::detail
          return static_cast<uint32_t>(m_impl->kernel.threadCount());
      }
  
