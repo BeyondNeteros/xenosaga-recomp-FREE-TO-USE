@@ -527,6 +527,38 @@ namespace
         }
     }
 
+    // Test aid, only with XS_TEST_SAVE=<field frames>: opens the save screen that
+    // many frames into any field scene, as if standing on a save point, and presses
+    // Circle every second inside it, so saving can be tested with nobody at the PC.
+    PS2Runtime::RecompiledFunction g_checkTalkPointOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_menuFileOriginal = nullptr;
+    uint32_t g_saveTestAfter = 0;
+
+    void checkTalkPoint_saveTest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kLoopFlags = 0x00338690u, kPadPressed = 0x00490DBAu; // GameLoopState.flags, PadData.pressed
+        static uint32_t calls = 0;
+        if (++calls >= g_saveTestAfter && (calls - g_saveTestAfter) % 60u == 0u)
+        {
+            std::printf("[save-test] asking for the save screen (field frame %u)\n", calls);
+            *reinterpret_cast<uint32_t *>(rdram + kLoopFlags) |= 0x20000000u;
+            *reinterpret_cast<uint16_t *>(rdram + kPadPressed) |= 0x0020u;
+        }
+        g_checkTalkPointOriginal(rdram, ctx, runtime);
+    }
+
+    void menuFile_saveTest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kPadPressed = 0x00490DBAu;
+        static uint32_t calls = 0;
+        if (++calls % 60u == 0u)
+        {
+            std::printf("[save-test] save screen frame %u: Circle\n", calls);
+            *reinterpret_cast<uint16_t *>(rdram + kPadPressed) |= 0x0020u;
+        }
+        g_menuFileOriginal(rdram, ctx, runtime);
+    }
+
     // Puts a wrapper in the function table slot for addr; `original` keeps
     // what was there (an overlay's slot is refilled whenever it loads).
     void wrapSlot(uint32_t addr, PS2Runtime::RecompiledFunction wrapper, PS2Runtime::RecompiledFunction &original)
@@ -547,6 +579,16 @@ namespace
         wrapSlot(0x002E7830u, createEffect_options, g_createEffectOriginal);     // sefCreateEffectCf2
         wrapSlot(0x002E7A18u, isFinishEffect_options, g_isFinishEffectOriginal); // sefIsFinishEffect
         wrapSlot(0x0024DD18u, saveThumbnail_guard, g_saveThumbnailOriginal);     // GameSnapShotSaveThumbnail
+        static const uint32_t saveTest = []() -> uint32_t {
+            const char *v = std::getenv("XS_TEST_SAVE");
+            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+        }();
+        if (saveTest)
+        {
+            g_saveTestAfter = saveTest;
+            wrapSlot(0x002458D0u, checkTalkPoint_saveTest, g_checkTalkPointOriginal); // checkTalkPoint
+            wrapSlot(0x00287888u, menuFile_saveTest, g_menuFileOriginal);             // MenuFile
+        }
         if (overlay == 1) // battle/field module
         {
             wrapSlot(0x00A09A80u, battleExec_options, g_battleExecOriginal);   // battleExec
