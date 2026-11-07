@@ -1,4 +1,40 @@
 
+## Internal resolution upscaling (2026-11-07, runs/up3, up4)
+
+`settings.ini` `[display] upscale = 1-4` (default 3; env `PS2X_UPSCALE` overrides
+for test runs). GPU renderer only (`gs_gl_backend.cpp`):
+
+- Render targets are drawn at `kScale` x native (viewport `2048*S`, scissor x S;
+  the vertex shader is unchanged). Targets are allocated `min(fbw*64,2048) x
+  rows` (start 512 rows, grow in 256-row steps) instead of 2048x2048, so 4x
+  stays small. Lines become one-PS2-pixel-thick quads above 1x (core profile
+  has no wide lines).
+- Local memory keeps native pixels: `loadFromMemory` uploads to a native
+  staging texture and blits it up (NEAREST); `syncToMemory` blits down into
+  staging and reads that back. So everything the game reads stays exact.
+- A target used as a texture (CT32, same layout) is sampled at full
+  resolution: state `s10.x` = scale; `texelScaled` wraps on the native texel
+  and keeps the sub-pixel. Feedback snapshot texture is resized on demand.
+- Presentation: `Present` still builds the native frame, then
+  `readHiresFrame` reads the displayed rectangle (DISPFB fbp/fbw/DBX/DBY,
+  native display size x S) straight from the GPU target into
+  `PresentationFrame::hiresPixels`. The frontend keeps it
+  (`GS::copyLatchedHiresFrame`) and the window draws it instead of the native
+  texture (shape still from the native size). Skips (logged once as
+  `[gs-gl] native frame shown: <why>`): preferred source, circuits showing
+  different buffers, non-CT32/24, no GPU target (early boot). Field mode is
+  allowed: the game draws whole 448-line frames, so the hi-res path shows all
+  lines, where the native path line-doubles one field.
+- `XS_FRAME_KEEP=1` also saves `frame_NNNN_hi.bmp` per heartbeat.
+
+Results (RTX 5090): 3x 1536x1344 holds 30.1 fps through the tutorial run,
+4x 2048x1792 29.3-29.9 (vsync dips to ~58 from the 14 MB/frame readback and
+upload). The bottom line of the picture has garbage at every scale; it is in
+the game's buffer (overscan on a TV). Not yet checked: battles, effects that
+read the frame through local memory (they come back at native resolution).
+Possible speed-up: share the texture with the window's GL context instead of
+reading back.
+
 ## Menu background black: VRNEXT was never written (2026-11-07, runs/ui-menu-*, ui-rtps)
 
 Menus (save, shop, results) draw a 3D backdrop (tya_menu_bg_entry.c: 16 strip

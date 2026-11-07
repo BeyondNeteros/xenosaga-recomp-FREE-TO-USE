@@ -2629,7 +2629,7 @@ index 2421f9e..3a4728d 100644
      void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
 diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
-index 4c3f641..cee62b5 100644
+index 4c3f641..f4e741b 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
 @@ -100,7 +100,15 @@ class GS
@@ -2649,7 +2649,16 @@ index 4c3f641..cee62b5 100644
  
      void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
      void reset();
-@@ -149,6 +157,10 @@ public:
+@@ -136,6 +144,8 @@ public:
+                                           uint32_t *outDisplayFbp = nullptr,
+                                           uint32_t *outSourceFbp = nullptr,
+                                           bool *outUsedPreferred = nullptr) const;
++    // The latched frame at the upscaled resolution; false when there is none.
++    bool copyLatchedHiresFrame(std::vector<uint8_t> &outPixels, uint32_t &outWidth, uint32_t &outHeight) const;
+     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
+     bool clearActiveFramebuffer(uint32_t rgba);
+     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
+@@ -149,6 +159,10 @@ public:
      uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
  
  private:
@@ -2660,12 +2669,22 @@ index 4c3f641..cee62b5 100644
      void snapshotVRAM();
      void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);
      void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
+@@ -228,6 +242,9 @@ private:
+     uint32_t m_hostPresentationDisplayFbp = 0;
+     uint32_t m_hostPresentationSourceFbp = 0;
+     bool m_hostPresentationUsedPreferred = false;
++    std::vector<uint8_t> m_hostHiresFrame;
++    uint32_t m_hostHiresWidth = 0;
++    uint32_t m_hostHiresHeight = 0;
+     bool m_hasHostPresentationFrame = false;
+     uint64_t m_nativeImageUploadCount = 0;
+     uint64_t m_nativePackedGIFPacketCount = 0;
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gl_backend.h b/ps2xRuntime/include/runtime/gs/gs_gl_backend.h
 new file mode 100644
-index 0000000..c84aa6a
+index 0000000..fa3a764
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gl_backend.h
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,10 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_backend.h"
@@ -2674,7 +2693,8 @@ index 0000000..c84aa6a
 +
 +// The GPU GS backend, or nullptr when this PC can't run it (no OpenGL 4.5 with
 +// ARB_fragment_shader_interlock): callers then keep the CPU backend.
-+std::unique_ptr<GSRasterBackend> ps2x_createGlBackend();
++// scale (1-4) is the internal resolution multiplier.
++std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int scale = 1);
 diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
 index 1cb1540..1c0c0f5 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
@@ -2706,6 +2726,22 @@ index 1cb1540..1c0c0f5 100644
          uint32_t m_pageBase = UINT32_MAX;
      };
  }
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff..00bed0f 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -298,6 +298,11 @@ struct PresentationFrame
+     uint32_t displayFbp = 0;
+     uint32_t sourceFbp = 0;
+     bool usedPreferred = false;
++    // The same picture at the upscaled internal resolution (GPU renderer),
++    // tightly packed RGBA; empty when only the native frame is available.
++    std::vector<uint8_t> hiresPixels;
++    uint32_t hiresWidth = 0;
++    uint32_t hiresHeight = 0;
+ 
+     explicit operator bool() const
+     {
 diff --git a/ps2xRuntime/include/runtime/ps2_ipu.h b/ps2xRuntime/include/runtime/ps2_ipu.h
 new file mode 100644
 index 0000000..7849c0a
@@ -5659,7 +5695,7 @@ index f0ad507..a3943d1 100644
          return false;
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..9964996 100644
+index 9281d5f..4710e2b 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,14 +1,211 @@
@@ -6157,7 +6193,35 @@ index 9281d5f..9964996 100644
      }
  
      PresentationFrame frame{};
-@@ -640,13 +1072,56 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -566,6 +998,9 @@ void GS::latchHostPresentationFrame()
+         m_hostPresentationSourceFbp = sourceFbp;
+         m_hostPresentationUsedPreferred = usedPreferred;
+         m_hasHostPresentationFrame = hasFrame;
++        m_hostHiresFrame = std::move(frame.hiresPixels);
++        m_hostHiresWidth = frame.hiresWidth;
++        m_hostHiresHeight = frame.hiresHeight;
+     }
+ 
+     if (hasFrame)
+@@ -575,6 +1010,17 @@ void GS::latchHostPresentationFrame()
+     }
+ }
+ 
++bool GS::copyLatchedHiresFrame(std::vector<uint8_t> &outPixels, uint32_t &outWidth, uint32_t &outHeight) const
++{
++    std::lock_guard<std::mutex> lock(m_presentationMutex);
++    if (!m_hasHostPresentationFrame || m_hostHiresFrame.empty() || m_hostHiresWidth == 0u || m_hostHiresHeight == 0u)
++        return false;
++    outPixels = m_hostHiresFrame;
++    outWidth = m_hostHiresWidth;
++    outHeight = m_hostHiresHeight;
++    return true;
++}
++
+ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+                                           uint32_t &outWidth,
+                                           uint32_t &outHeight,
+@@ -640,13 +1086,56 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -6214,7 +6278,7 @@ index 9281d5f..9964996 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
          if (packetIndex < 48u)
-@@ -730,7 +1205,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -730,7 +1219,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
              // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
              uint32_t imageBytes = nloop * 16;
              if (offset + imageBytes > sizeBytes)
@@ -6224,7 +6288,7 @@ index 9281d5f..9964996 100644
              processImageData(data + offset, imageBytes);
              offset += imageBytes;
          }
-@@ -739,6 +1216,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -739,6 +1230,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  
  bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -6240,7 +6304,7 @@ index 9281d5f..9964996 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16u || !m_backend)
          return false;
-@@ -773,6 +1259,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -773,6 +1273,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
      if (!processed)
          return false;
  
@@ -6248,7 +6312,7 @@ index 9281d5f..9964996 100644
      ++m_nativePackedGIFPacketCount;
      return true;
  }
-@@ -784,7 +1271,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+@@ -784,7 +1285,23 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                             const uint8_t *data,
                             uint32_t sizeBytes)
  {
@@ -6272,7 +6336,7 @@ index 9281d5f..9964996 100644
      uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
  }
  
-@@ -1062,12 +1565,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,12 +1579,26 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -6299,7 +6363,7 @@ index 9281d5f..9964996 100644
      const bool interestingReg =
          regAddr == GS_REG_PRIM ||
          regAddr == GS_REG_RGBAQ ||
-@@ -1384,6 +1901,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1384,6 +1915,46 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      case GS_REG_TRXDIR:
      {
          m_trxdir = static_cast<uint32_t>(value & 0x3);
@@ -6346,7 +6410,7 @@ index 9281d5f..9964996 100644
  
          if (m_backend)
          {
-@@ -1578,6 +2135,86 @@ void GS::vertexKick(bool drawing)
+@@ -1578,6 +2149,86 @@ void GS::vertexKick(bool drawing)
          GSPrimitiveBatch batch = buildDrawBatch(needed);
          updatePreferredDisplaySourceForDraw(batch);
          m_backend->Submit(batch);
@@ -6433,7 +6497,7 @@ index 9281d5f..9964996 100644
          recordDrawDebugEventUnlocked(needed);
      }
  
-@@ -1608,27 +2245,82 @@ void GS::vertexKick(bool drawing)
+@@ -1608,27 +2259,82 @@ void GS::vertexKick(bool drawing)
      }
  }
  
@@ -6516,7 +6580,7 @@ index 9281d5f..9964996 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1664,12 +2356,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+@@ -1664,12 +2370,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
  
  uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
@@ -6531,7 +6595,7 @@ index 9281d5f..9964996 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (m_backend)
          m_backend->WriteVram(psm, base, bw, x, y, value);
-@@ -1734,3 +2428,8 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+@@ -1734,3 +2442,8 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
          m_hasPreferredDisplaySource = true;
      }
  }
@@ -6542,10 +6606,10 @@ index 9281d5f..9964996 100644
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
 new file mode 100644
-index 0000000..cfb16d7
+index 0000000..9e60092
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
-@@ -0,0 +1,1377 @@
+@@ -0,0 +1,1587 @@
 +// GPU GS backend (OpenGL 4.5 + ARB_fragment_shader_interlock, Windows).
 +//
 +// The GPU rasterizes; everything the GS does per pixel (texture lookup, alpha
@@ -6624,14 +6688,19 @@ index 0000000..cfb16d7
 +    X(PFNGLFENCESYNCPROC, glFenceSync)                                                                   \
 +    X(PFNGLCLIENTWAITSYNCPROC, glClientWaitSync)                                                         \
 +    X(PFNGLDELETESYNCPROC, glDeleteSync)                                                                 \
-+    X(PFNGLGETSTRINGIPROC, glGetStringi)
++    X(PFNGLGETSTRINGIPROC, glGetStringi)                                                                 \
++    X(PFNGLNAMEDFRAMEBUFFERTEXTUREPROC, glNamedFramebufferTexture)                                       \
++    X(PFNGLBLITNAMEDFRAMEBUFFERPROC, glBlitNamedFramebuffer)
 +
 +#define X(type, name) type p_##name = nullptr;
 +    XS_GL_FUNCS(X)
 +#undef X
 +
++    // GS coordinates are 0..2047; targets are drawn at kScale times that
++    // (internal resolution upscaling). Local memory keeps native pixels.
 +    constexpr int kRtWidth = 2048;
 +    constexpr int kRtHeight = 2048;
++    int kScale = 1;
 +    constexpr uint32_t kPages = 512u;
 +    constexpr uint32_t kPageBytes = 8192u;
 +    constexpr GLsizeiptr kVertexRingBytes = 64 * 1024 * 1024;
@@ -6681,6 +6750,7 @@ index 0000000..cfb16d7
 +    ivec4 s7; // date, datm, pabe, sprite
 +    ivec4 s8; // fge, fogR, fogG, fogB
 +    uvec4 s9; // fbmsk, zmask
++    ivec4 s10; // texture scale (a render target drawn at the upscale factor, else 1)
 +};
 +noperspective in vec3 vStq;
 +noperspective in vec4 vColor;
@@ -6704,6 +6774,32 @@ index 0000000..cfb16d7
 +    if (s0.x == 2) raw = texelFetch(uClut, ivec2(int(raw & 255u), s6.w), 0).r;
 +    return uvec4(raw & 255u, (raw >> 8) & 255u, (raw >> 16) & 255u, raw >> 24);
 +}
++// A texel of an upscaled render target: (U, V) in scaled pixels. Wrapping
++// works on the native texel, the sub-pixel inside it is kept.
++uvec4 texelScaled(int U, int V)
++{
++    int S = s10.x;
++    int nu = U >= 0 ? U / S : -((S - 1 - U) / S);
++    int nv = V >= 0 ? V / S : -((S - 1 - V) / S);
++    int u = wrapCoord(nu, s1.z, s1.x, s2.x, s2.y) * S + (U - nu * S);
++    int v = wrapCoord(nv, s1.w, s1.y, s2.z, s2.w) * S + (V - nv * S);
++    uint raw = texelFetch(uTex, ivec2(u, v), 0).r;
++    return uvec4(raw & 255u, (raw >> 8) & 255u, (raw >> 16) & 255u, raw >> 24);
++}
++ivec4 sampleScaled(float fu, float fv)
++{
++    float S = float(s10.x);
++    if (s0.w == 0)
++        return ivec4(texelScaled(int(floor(fu * S)), int(floor(fv * S))));
++    float su = fu * S - 0.5, sv = fv * S - 0.5;
++    int u0 = int(floor(su)), v0 = int(floor(sv));
++    float fx = su - float(u0), fy = sv - float(v0);
++    vec4 c00 = vec4(texelScaled(u0, v0)), c10 = vec4(texelScaled(u0 + 1, v0));
++    vec4 c01 = vec4(texelScaled(u0, v0 + 1)), c11 = vec4(texelScaled(u0 + 1, v0 + 1));
++    vec4 top = c00 + (c10 - c00) * fx;
++    vec4 bottom = c01 + (c11 - c01) * fx;
++    return clamp(ivec4(floor(top + (bottom - top) * fy + 0.5)), ivec4(0), ivec4(255));
++}
 +ivec4 sampleTexture()
 +{
 +    float fu, fv;
@@ -6720,6 +6816,8 @@ index 0000000..cfb16d7
 +        fu = vStq.x / q * float(s1.z);
 +        fv = vStq.y / q * float(s1.w);
 +    }
++    if (s10.x > 1)
++        return sampleScaled(fu, fv);
 +    if (s0.w == 0)
 +        return ivec4(texel(int(fu), int(fv)));
 +    float su = fu - 0.5, sv = fv - 0.5;
@@ -6858,6 +6956,7 @@ index 0000000..cfb16d7
 +    {
 +        int32_t s0[4], s1[4], s2[4], s3[4], s4[4], s5[4], s6[4], s7[4], s8[4];
 +        uint32_t s9[4];
++        int32_t s10[4];
 +    };
 +
 +    struct DrawKey
@@ -6988,7 +7087,15 @@ index 0000000..cfb16d7
 +                if (!t.isDepth && (t.page == fbp1 || t.page == fbp2))
 +                    syncToMemory(t);
 +        }
-+        return m_cpu.Present(request);
++        PresentationFrame frame = m_cpu.Present(request);
++        if (kScale > 1 && frame)
++        {
++            if (onGlThread())
++                readHiresFrame(request, frame);
++            else
++                hiresSkip("not on the GL thread");
++        }
++        return frame;
 +    }
 +
 +    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
@@ -7010,6 +7117,7 @@ index 0000000..cfb16d7
 +        bool gpuDirty = false; // GPU has pixels local memory lacks
 +        int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0; // the dirty rectangle (exclusive end)
 +        bool stale = false;    // local memory has pixels the GPU lacks
++        int allocW = 0, allocH = 0; // texture size in native pixels (x kScale on the GPU)
 +    };
 +    struct Texture
 +    {
@@ -7041,8 +7149,22 @@ index 0000000..cfb16d7
 +    void appendVertices(const GpuVertex *v, uint32_t count);
 +    void reserveVertices(GLsizeiptr bytes);
 +    void markDirty(Target &t, int x0, int y0, int x1, int y1);
++    GLuint newTargetTexture(int w, int h);
++    void growTarget(Target &t, int rows);
++    void blit(GLuint src, int sx0, int sy0, int sx1, int sy1, GLuint dst, int dx0, int dy0, int dx1, int dy1);
++    void ensureStaging();
++    void readHiresFrame(const GSPresentationRequest &request, PresentationFrame &frame);
++    // First few reasons the upscaled picture wasn't available (log only).
++    void hiresSkip(const char *why)
++    {
++        static int count = 0;
++        if (count < 8 && ++count)
++            std::fprintf(stderr, "[gs-gl] native frame shown: %s\n", why);
++    }
 +
 +    GSCpuBackend m_cpu;
++    GLuint m_stagingTex = 0, m_readFbo = 0, m_drawFbo = 0;
++    int m_snapW = 0, m_snapH = 0; // m_snapshotTex size (scaled pixels)
 +    uint8_t *m_vram = nullptr;
 +    HWND m_hwnd = nullptr;
 +    HDC m_hdc = nullptr;
@@ -7132,13 +7254,16 @@ index 0000000..cfb16d7
 +            interlock = true;
 +    std::fprintf(stderr, "[gs-gl] %s, OpenGL %s, interlock %s\n", reinterpret_cast<const char *>(glGetString(GL_RENDERER)),
 +                 reinterpret_cast<const char *>(glGetString(GL_VERSION)), interlock ? "yes" : "NO");
++    std::fprintf(stderr, "[gs-gl] internal resolution %dx\n", kScale);
 +    if (!interlock || !compileProgram())
 +        return false;
 +
 +    p_glCreateVertexArrays(1, &m_vao);
 +    p_glCreateFramebuffers(1, &m_fbo);
-+    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_WIDTH, kRtWidth);
-+    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_HEIGHT, kRtHeight);
++    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_WIDTH, kRtWidth * kScale);
++    p_glNamedFramebufferParameteri(m_fbo, GL_FRAMEBUFFER_DEFAULT_HEIGHT, kRtHeight * kScale);
++    p_glCreateFramebuffers(1, &m_readFbo);
++    p_glCreateFramebuffers(1, &m_drawFbo);
 +
 +    const GLbitfield mapFlags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
 +    p_glCreateBuffers(1, &m_vbo);
@@ -7171,10 +7296,6 @@ index 0000000..cfb16d7
 +    p_glTextureStorage2D(m_clutTex, 1, GL_R32UI, 256, kClutRows);
 +    p_glTextureParameteri(m_clutTex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 +    p_glTextureParameteri(m_clutTex, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-+    p_glCreateTextures(GL_TEXTURE_2D, 1, &m_snapshotTex);
-+    p_glTextureStorage2D(m_snapshotTex, 1, GL_R32UI, kRtWidth, kRtHeight);
-+    p_glTextureParameteri(m_snapshotTex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-+    p_glTextureParameteri(m_snapshotTex, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 +
 +    // The context moves to the thread that first draws.
 +    wglMakeCurrent(nullptr, nullptr);
@@ -7240,7 +7361,9 @@ index 0000000..cfb16d7
 +        p_glUseProgram(m_program);
 +        p_glBindVertexArray(m_vao);
 +        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fbo);
-+        glViewport(0, 0, kRtWidth, kRtHeight);
++        glViewport(0, 0, kRtWidth * kScale, kRtHeight * kScale);
++        glPointSize(static_cast<float>(kScale));
++        glLineWidth(static_cast<float>(kScale));
 +        glEnable(GL_SCISSOR_TEST);
 +        glDisable(GL_DEPTH_TEST);
 +        glDisable(GL_CULL_FACE);
@@ -7264,6 +7387,36 @@ index 0000000..cfb16d7
 +    m_textures.clear();
 +}
 +
++GLuint GSGlBackend::newTargetTexture(int w, int h)
++{
++    GLuint tex = 0;
++    p_glCreateTextures(GL_TEXTURE_2D, 1, &tex);
++    p_glTextureStorage2D(tex, 1, GL_R32UI, w * kScale, h * kScale);
++    p_glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    p_glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    return tex;
++}
++
++// Targets start 512 rows tall and grow when something reaches further down
++// (at 4x a full 2048x2048 texture would be 256 MB each).
++void GSGlBackend::growTarget(Target &t, int rows)
++{
++    if (rows <= t.allocH)
++        return;
++    const int h = std::min(kRtHeight, (rows + 255) / 256 * 256);
++    flushDraws(); // queued draws use the old texture
++    const GLuint tex = newTargetTexture(t.allocW, h);
++    if (t.tex)
++    {
++        p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
++        p_glCopyImageSubData(t.tex, GL_TEXTURE_2D, 0, 0, 0, 0, tex, GL_TEXTURE_2D, 0, 0, 0, 0,
++                             t.allocW * kScale, t.allocH * kScale, 1);
++        glDeleteTextures(1, &t.tex);
++    }
++    t.tex = tex;
++    t.allocH = h;
++}
++
 +GSGlBackend::Target &GSGlBackend::colorTarget(const GSFrameReg &frame)
 +{
 +    const uint64_t key = (static_cast<uint64_t>(frame.fbp) << 16) | (static_cast<uint64_t>(frame.fbw) << 8) | frame.psm;
@@ -7271,13 +7424,11 @@ index 0000000..cfb16d7
 +    if (it != m_targets.end())
 +        return it->second;
 +    Target t;
-+    p_glCreateTextures(GL_TEXTURE_2D, 1, &t.tex);
-+    p_glTextureStorage2D(t.tex, 1, GL_R32UI, kRtWidth, kRtHeight);
-+    p_glTextureParameteri(t.tex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-+    p_glTextureParameteri(t.tex, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 +    t.page = frame.fbp;
 +    t.fbw = std::max<uint32_t>(frame.fbw, 1u);
 +    t.psm = frame.psm;
++    t.allocW = std::min<int>(static_cast<int>(t.fbw) * 64, kRtWidth);
++    growTarget(t, 512);
 +    return m_targets.emplace(key, t).first->second;
 +}
 +
@@ -7289,32 +7440,62 @@ index 0000000..cfb16d7
 +    if (it != m_targets.end())
 +        return it->second;
 +    Target t;
-+    p_glCreateTextures(GL_TEXTURE_2D, 1, &t.tex);
-+    p_glTextureStorage2D(t.tex, 1, GL_R32UI, kRtWidth, kRtHeight);
 +    t.page = ctx.zbuf.zbp;
 +    t.fbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
 +    t.psm = ctx.zbuf.psm;
 +    t.isDepth = true;
++    t.allocW = std::min<int>(static_cast<int>(t.fbw) * 64, kRtWidth);
++    growTarget(t, 512);
 +    return m_targets.emplace(key, t).first->second;
++}
++
++void GSGlBackend::ensureStaging()
++{
++    if (m_stagingTex)
++        return;
++    p_glCreateTextures(GL_TEXTURE_2D, 1, &m_stagingTex);
++    p_glTextureStorage2D(m_stagingTex, 1, GL_R32UI, kRtWidth, kRtHeight);
++}
++
++// Nearest-neighbour copy between two textures (scaling up or down).
++void GSGlBackend::blit(GLuint src, int sx0, int sy0, int sx1, int sy1, GLuint dst, int dx0, int dy0, int dx1, int dy1)
++{
++    p_glNamedFramebufferTexture(m_readFbo, GL_COLOR_ATTACHMENT0, src, 0);
++    p_glNamedFramebufferTexture(m_drawFbo, GL_COLOR_ATTACHMENT0, dst, 0);
++    p_glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
++    glDisable(GL_SCISSOR_TEST);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    p_glBlitNamedFramebuffer(m_readFbo, m_drawFbo, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
++    glEnable(GL_SCISSOR_TEST);
 +}
 +
 +void GSGlBackend::loadFromMemory(Target &t, int y0, int y1)
 +{
++    y1 = std::min(y1, t.allocH);
 +    if (y1 <= y0)
 +        return;
-+    const uint32_t width = std::min<uint32_t>(t.fbw * 64u, kRtWidth);
++    const uint32_t width = static_cast<uint32_t>(t.allocW);
 +    const uint32_t block = t.page * 32u;
 +    m_decode.resize(static_cast<size_t>(width) * (y1 - y0));
 +    uint32_t *out = m_decode.data();
 +    for (int y = y0; y < y1; ++y)
 +        for (uint32_t x = 0; x < width; ++x)
 +            *out++ = GSMem::ReadTexture(m_pageCache, m_vram, t.psm, block, t.fbw, x, static_cast<uint32_t>(y));
-+    p_glTextureSubImage2D(t.tex, 0, 0, y0, width, y1 - y0, GL_RED_INTEGER, GL_UNSIGNED_INT, m_decode.data());
++    if (kScale == 1)
++    {
++        p_glTextureSubImage2D(t.tex, 0, 0, y0, width, y1 - y0, GL_RED_INTEGER, GL_UNSIGNED_INT, m_decode.data());
++        return;
++    }
++    ensureStaging();
++    p_glTextureSubImage2D(m_stagingTex, 0, 0, y0, width, y1 - y0, GL_RED_INTEGER, GL_UNSIGNED_INT, m_decode.data());
++    blit(m_stagingTex, 0, y0, width, y1, t.tex, 0, y0 * kScale, width * kScale, y1 * kScale);
 +}
 +
 +void GSGlBackend::ensureRows(Target &t, int rows)
 +{
 +    rows = std::min(rows, kRtHeight);
++    growTarget(t, rows);
 +    if (t.stale)
 +    {
 +        loadFromMemory(t, 0, std::max(t.rows, rows));
@@ -7351,13 +7532,25 @@ index 0000000..cfb16d7
 +    if (!t.gpuDirty)
 +        return;
 +    t.gpuDirty = false;
++    t.dx0 = std::max(t.dx0, 0);
++    t.dy0 = std::max(t.dy0, 0);
++    t.dx1 = std::min(t.dx1, t.allocW);
++    t.dy1 = std::min(t.dy1, t.allocH);
 +    const int w = t.dx1 - t.dx0, h = t.dy1 - t.dy0;
 +    if (w <= 0 || h <= 0)
 +        return;
 +    ++m_syncs;
 +    p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
 +    m_readback.resize(static_cast<size_t>(w) * h);
-+    p_glGetTextureSubImage(t.tex, 0, t.dx0, t.dy0, 0, w, h, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
++    GLuint source = t.tex;
++    if (kScale > 1)
++    {
++        // Down to native pixels first (one sample per pixel, near its centre).
++        ensureStaging();
++        blit(t.tex, t.dx0 * kScale, t.dy0 * kScale, t.dx1 * kScale, t.dy1 * kScale, m_stagingTex, t.dx0, t.dy0, t.dx1, t.dy1);
++        source = m_stagingTex;
++    }
++    p_glGetTextureSubImage(source, 0, t.dx0, t.dy0, 0, w, h, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
 +                           static_cast<GLsizei>(m_readback.size() * 4u), m_readback.data());
 +    const uint32_t block = t.page * 32u;
 +    const uint32_t *in = m_readback.data();
@@ -7614,6 +7807,7 @@ index 0000000..cfb16d7
 +            Target &source = it->second;
 +            ensureRows(source, source.rows);
 +            block.s0[0] = 1;
++            block.s10[0] = kScale;
 +            if (&source == &frame)
 +            {
 +                feedback = true;
@@ -7717,10 +7911,11 @@ index 0000000..cfb16d7
 +    }
 +    key.frameTex = frame.tex;
 +    key.depthTex = depth.tex;
-+    key.scissor[0] = ctx.scissor.x0;
-+    key.scissor[1] = ctx.scissor.y0;
-+    key.scissor[2] = ctx.scissor.x1 - ctx.scissor.x0 + 1;
-+    key.scissor[3] = ctx.scissor.y1 - ctx.scissor.y0 + 1;
++    key.scissor[0] = ctx.scissor.x0 * kScale;
++    key.scissor[1] = ctx.scissor.y0 * kScale;
++    key.scissor[2] = (ctx.scissor.x1 - ctx.scissor.x0 + 1) * kScale;
++    key.scissor[3] = (ctx.scissor.y1 - ctx.scissor.y0 + 1) * kScale;
++    b.s10[0] = 1;
 +
 +    const auto &tex = ctx.tex0;
 +    const uint64_t clamp = ctx.clamp;
@@ -7845,6 +8040,28 @@ index 0000000..cfb16d7
 +            out[i] = vertex(batch.vertices[i], batch.vertices[i].x - ofx + 0.5f, batch.vertices[i].y - ofy + 0.5f);
 +        count = 2;
 +        key.mode = GL_LINES;
++        if (kScale > 1)
++        {
++            // Upscaled: a line one PS2 pixel thick, as a thin quad (core
++            // profile has no wide lines). Offset across its major axis.
++            const GpuVertex p0 = out[0], p1 = out[1];
++            const bool horizontal = std::fabs(p1.x - p0.x) >= std::fabs(p1.y - p0.y);
++            const auto shifted = [&](GpuVertex v, float d)
++            {
++                (horizontal ? v.y : v.x) += d;
++                return v;
++            };
++            const GpuVertex a = shifted(p0, -0.5f), c = shifted(p1, -0.5f);
++            const GpuVertex e = shifted(p0, 0.5f), f = shifted(p1, 0.5f);
++            out[0] = a;
++            out[1] = c;
++            out[2] = e;
++            out[3] = c;
++            out[4] = e;
++            out[5] = f;
++            count = 6;
++            key.mode = GL_TRIANGLES;
++        }
 +        bx0 = static_cast<int>(std::min(out[0].x, out[1].x)) - 1;
 +        by0 = static_cast<int>(std::min(out[0].y, out[1].y)) - 1;
 +        bx1 = static_cast<int>(std::max(out[0].x, out[1].x)) + 2;
@@ -7876,8 +8093,21 @@ index 0000000..cfb16d7
 +            // Samples its own target: from a copy of the pixels before this draw.
 +            flushDraws();
 +            p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
++            const int sw = frame.allocW * kScale, sh = frame.allocH * kScale;
++            if (sw > m_snapW || sh > m_snapH)
++            {
++                if (m_snapshotTex)
++                    glDeleteTextures(1, &m_snapshotTex);
++                m_snapW = std::max(m_snapW, sw);
++                m_snapH = std::max(m_snapH, sh);
++                p_glCreateTextures(GL_TEXTURE_2D, 1, &m_snapshotTex);
++                p_glTextureStorage2D(m_snapshotTex, 1, GL_R32UI, m_snapW, m_snapH);
++                p_glTextureParameteri(m_snapshotTex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++                p_glTextureParameteri(m_snapshotTex, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++                key.tex = m_snapshotTex;
++            }
 +            p_glCopyImageSubData(frame.tex, GL_TEXTURE_2D, 0, 0, 0, 0, m_snapshotTex, GL_TEXTURE_2D, 0, 0, 0, 0,
-+                                 std::min<int>(frame.fbw * 64, kRtWidth), std::max(frame.rows, 1), 1);
++                                 sw, std::min(std::max(frame.rows, 1), frame.allocH) * kScale, 1);
 +        }
 +    }
 +
@@ -7898,8 +8128,52 @@ index 0000000..cfb16d7
 +        flushDraws();
 +}
 +
-+std::unique_ptr<GSRasterBackend> ps2x_createGlBackend()
++// The picture on screen at the upscaled resolution, read straight from the
++// GPU target (local memory only has native pixels). Only for the simple case
++// the game uses: one buffer shown by one circuit, or both circuits showing the
++// same buffer. Interlaced field mode included: the game draws whole 448-line
++// frames, so showing every line is the progressive picture (the native path
++// line-doubles one field). Anything else keeps the native frame.
++void GSGlBackend::readHiresFrame(const GSPresentationRequest &request, PresentationFrame &frame)
 +{
++    if (frame.usedPreferred)
++        return hiresSkip("preferred source");
++    const bool en1 = (request.pmode & 1u) != 0u, en2 = (request.pmode & 2u) != 0u;
++    if (!en1 && !en2)
++        return hiresSkip("no circuit");
++    if (en1 && en2 && request.dispfb1 != request.dispfb2)
++        return hiresSkip("two different buffers");
++    const uint64_t d = en1 ? request.dispfb1 : request.dispfb2;
++    const uint32_t fbp = static_cast<uint32_t>(d & 0x1FFu);
++    const uint32_t fbw = static_cast<uint32_t>((d >> 9) & 0x3Fu);
++    const uint32_t psm = static_cast<uint32_t>((d >> 15) & 0x1Fu);
++    const int dbx = static_cast<int>((d >> 32) & 0x7FFu), dby = static_cast<int>((d >> 43) & 0x7FFu);
++    if (frame.sourceFbp != fbp || (psm != GS_PSM_CT32 && psm != GS_PSM_CT24))
++        return hiresSkip("source buffer/format");
++    const uint64_t key = (static_cast<uint64_t>(fbp) << 16) | (static_cast<uint64_t>(fbw) << 8) | psm;
++    const auto it = m_targets.find(key);
++    if (it == m_targets.end() || it->second.rows == 0)
++        return hiresSkip("no GPU target");
++    Target &t = it->second;
++    const int w = static_cast<int>(frame.width), h = static_cast<int>(frame.height);
++    if (dbx + w > t.allocW || dby + h > kRtHeight)
++        return hiresSkip("outside the target");
++    ensureRows(t, dby + h);
++    const int sw = w * kScale, sh = h * kScale;
++    frame.hiresPixels.resize(static_cast<size_t>(sw) * sh * 4u);
++    p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
++    p_glGetTextureSubImage(t.tex, 0, dbx * kScale, dby * kScale, 0, sw, sh, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
++                           static_cast<GLsizei>(frame.hiresPixels.size()), frame.hiresPixels.data());
++    uint32_t *px = reinterpret_cast<uint32_t *>(frame.hiresPixels.data());
++    for (size_t i = 0, n = static_cast<size_t>(sw) * sh; i < n; ++i)
++        px[i] |= 0xFF000000u;
++    frame.hiresWidth = static_cast<uint32_t>(sw);
++    frame.hiresHeight = static_cast<uint32_t>(sh);
++}
++
++std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int scale)
++{
++    kScale = std::clamp(scale, 1, 4);
 +    // create() switches OpenGL contexts on this thread, which is the window's:
 +    // put the window's back, or everything it draws goes nowhere.
 +    const HDC windowDc = wglGetCurrentDC();
@@ -7917,7 +8191,7 @@ index 0000000..cfb16d7
 +
 +#else // not Windows
 +
-+std::unique_ptr<GSRasterBackend> ps2x_createGlBackend()
++std::unique_ptr<GSRasterBackend> ps2x_createGlBackend(int)
 +{
 +    return nullptr;
 +}
@@ -9755,7 +10029,7 @@ index 8590f14..e717c2d 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..f15529c 100644
+index 45cb9d2..ed21320 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -9893,7 +10167,7 @@ index 45cb9d2..f15529c 100644
  
  namespace ps2_stubs
  {
-@@ -49,6 +159,429 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
+@@ -49,6 +159,436 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
  static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
  static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
  #endif
@@ -9912,6 +10186,7 @@ index 45cb9d2..f15529c 100644
 +        std::string aspect = "4:3";   // 4:3, 16:9 (widescreen), stretch, native
 +        std::string filter = "sharp"; // sharp, smooth, pixel
 +        std::string renderer = "gpu"; // gpu (falls back to cpu if unavailable), cpu
++        int upscale = 3;              // gpu internal resolution multiplier, 1-4
 +        bool integerScale = false;
 +        bool vsync = true;
 +        int monitor = -1;             // -1 = the monitor the OS picks
@@ -9937,6 +10212,9 @@ index 45cb9d2..f15529c 100644
 +        "; Who draws the game: gpu (graphics card, much faster) or cpu.\n"
 +        "; gpu falls back to cpu on graphics cards that can't run it.\n"
 +        "renderer = gpu\n"
++        "; Internal resolution (gpu renderer): 1 = original PS2 (512x448),\n"
++        "; 2, 3 or 4 = that many times sharper. Higher needs a faster graphics card.\n"
++        "upscale = 3\n"
 +        "; Start in borderless fullscreen (toggle any time with F11 or Alt+Enter).\n"
 +        "fullscreen = false\n"
 +        "; Picture shape: 4:3 (original TV shape), 16:9 (widescreen: wider 3D view,\n"
@@ -10005,6 +10283,7 @@ index 45cb9d2..f15529c 100644
 +        else if (key == "aspect") s.aspect = value;
 +        else if (key == "filter") s.filter = value;
 +        else if (key == "renderer") s.renderer = value;
++        else if (key == "upscale") s.upscale = std::clamp(std::atoi(value.c_str()), 1, 4);
 +        else if (key == "integer_scale") s.integerScale = parseBool(value, s.integerScale);
 +        else if (key == "vsync") s.vsync = parseBool(value, s.vsync);
 +        else if (key == "monitor") s.monitor = std::atoi(value.c_str());
@@ -10122,11 +10401,13 @@ index 45cb9d2..f15529c 100644
 +    // picture up by whole numbers with nearest filtering. Step 2 then blends
 +    // only the last fraction of a pixel, so it stays crisp like "pixel"
 +    // without uneven, shimmering pixel widths.
-+    void prepareGameFrame(Texture2D &frameTex, float srcW, float srcH)
++    // srcW/srcH: the texture's picture size; shapeW/shapeH: the PS2's display
++    // size, which decides the shape (the texture may be upscaled).
++    void prepareGameFrame(Texture2D &frameTex, float srcW, float srcH, float shapeW, float shapeH)
 +    {
 +        if (!useSharpFilter())
 +            return;
-+        const Rectangle dst = computeDestination(srcW, srcH);
++        const Rectangle dst = computeDestination(shapeW, shapeH);
 +        const float dpi = static_cast<float>(GetRenderWidth()) / std::max(1, GetScreenWidth());
 +        const int kx = std::max(1, static_cast<int>(std::ceil(dst.width * dpi / srcW)));
 +        const int ky = std::max(1, static_cast<int>(std::ceil(dst.height * dpi / srcH)));
@@ -10151,9 +10432,9 @@ index 45cb9d2..f15529c 100644
 +        EndTextureMode();
 +    }
 +
-+    void drawGameFrame(Texture2D &frameTex, float srcW, float srcH)
++    void drawGameFrame(Texture2D &frameTex, float srcW, float srcH, float shapeW, float shapeH)
 +    {
-+        const Rectangle dst = computeDestination(srcW, srcH);
++        const Rectangle dst = computeDestination(shapeW, shapeH);
 +        if (!useSharpFilter())
 +        {
 +            SetTextureFilter(frameTex, g_hostSettings.filter == "smooth" ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
@@ -10323,7 +10604,7 @@ index 45cb9d2..f15529c 100644
  struct ElfHeader
  {
      uint32_t magic;
-@@ -373,6 +906,38 @@ namespace
+@@ -373,6 +913,65 @@ namespace
      }
  }
  
@@ -10359,10 +10640,37 @@ index 45cb9d2..f15529c 100644
 +    PlayAudioStream(stream);
 +}
 +
++// The upscaled picture, when the GPU renderer has one: uploaded to its own
++// texture (resized as needed). Returns false to fall back to the native frame.
++static bool UploadHiresFrame(Texture2D &hiTex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
++{
++    static std::vector<uint8_t> s_pixels;
++    uint32_t w = 0u, h = 0u;
++    if (!rt->gs().copyLatchedHiresFrame(s_pixels, w, h))
++        return false;
++    if (hiTex.id == 0 || hiTex.width != static_cast<int>(w) || hiTex.height != static_cast<int>(h))
++    {
++        if (hiTex.id != 0)
++            UnloadTexture(hiTex);
++        Image img{};
++        img.data = s_pixels.data();
++        img.width = static_cast<int>(w);
++        img.height = static_cast<int>(h);
++        img.mipmaps = 1;
++        img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++        hiTex = LoadTextureFromImage(img);
++    }
++    else
++        UpdateTexture(hiTex, s_pixels.data());
++    outWidth = w;
++    outHeight = h;
++    return true;
++}
++
  static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
  {
      static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-@@ -537,6 +1102,7 @@ PS2Runtime::~PS2Runtime()
+@@ -537,6 +1136,7 @@ PS2Runtime::~PS2Runtime()
  #else
          if (IsAudioDeviceReady())
          {
@@ -10370,7 +10678,7 @@ index 45cb9d2..f15529c 100644
              CloseAudioDevice();
              m_audioBackend.setAudioReady(false);
          }
-@@ -610,6 +1176,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+@@ -610,6 +1210,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
      m_iopSubsystem->runEeCycles(eeCycles);
  }
  
@@ -10383,7 +10691,7 @@ index 45cb9d2..f15529c 100644
  void PS2Runtime::resetIop()
  {
      m_iopSubsystem->reset();
-@@ -661,6 +1233,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -661,6 +1267,8 @@ bool PS2Runtime::syncCoreSubsystems()
  
      if (m_boundRdram == rdram && m_boundGSVram == gsVram)
      {
@@ -10392,7 +10700,7 @@ index 45cb9d2..f15529c 100644
          return true;
      }
  
-@@ -668,42 +1242,103 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +1276,103 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -10515,7 +10823,7 @@ index 45cb9d2..f15529c 100644
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,12 +1366,52 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,12 +1400,57 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -10563,14 +10871,19 @@ index 45cb9d2..f15529c 100644
 +        // PS2X_RENDERER=gpu|cpu (test runs) overrides the settings file.
 +        const char *rendererEnv = std::getenv("PS2X_RENDERER");
 +        if (std::string(rendererEnv ? rendererEnv : g_hostSettings.renderer.c_str()) == "gpu")
-+            if (auto gpu = ps2x_createGlBackend())
++        {
++            // PS2X_UPSCALE=n (test runs) overrides the settings file.
++            const char *upscaleEnv = std::getenv("PS2X_UPSCALE");
++            const int upscale = upscaleEnv ? std::clamp(std::atoi(upscaleEnv), 1, 4) : g_hostSettings.upscale;
++            if (auto gpu = ps2x_createGlBackend(upscale))
 +                m_gs.setRasterBackend(std::move(gpu));
++        }
 +        const int refresh = GetMonitorRefreshRate(GetCurrentMonitor());
 +        SetTargetFPS(g_hostSettings.vsync && refresh > 0 ? refresh : 60);
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -1134,6 +1809,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1134,6 +1848,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -10578,7 +10891,7 @@ index 45cb9d2..f15529c 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1358,6 +2034,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1358,6 +2073,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      // this charge bounds straight-line call chains that have no local loop.
      if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
      {
@@ -10586,7 +10899,7 @@ index 45cb9d2..f15529c 100644
          return false;
      }
  
-@@ -1403,6 +2080,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,6 +2119,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -10601,7 +10914,7 @@ index 45cb9d2..f15529c 100644
      if (ctx->pc == entryPc)
      {
          ctx->pc = fallthroughPc;
-@@ -1411,6 +2096,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1411,6 +2135,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  
@@ -10645,7 +10958,7 @@ index 45cb9d2..f15529c 100644
  void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
  {
      if (exception == EXCEPTION_INTEGER_OVERFLOW)
-@@ -2211,7 +2933,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+@@ -2211,7 +2972,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
  
  bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
  {
@@ -10657,16 +10970,27 @@ index 45cb9d2..f15529c 100644
  }
  
  [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
-@@ -2424,22 +3149,38 @@ void PS2Runtime::run()
+@@ -2423,23 +3187,52 @@ void PS2Runtime::run()
+         uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
- 
--        BeginDrawing();
--        ClearBackground(BLACK);
++        // The upscaled picture, refreshed when a new frame was latched.
++        static Texture2D s_hiTex{};
++        static bool s_hiValid = false;
++        static uint32_t s_hiW = 0u, s_hiH = 0u;
++        static uint64_t s_hiTick = std::numeric_limits<uint64_t>::max();
++        if (const uint64_t tick = eeScheduler().currentVSyncTick(); tick != s_hiTick)
++        {
++            s_hiTick = tick;
++            s_hiValid = UploadHiresFrame(s_hiTex, this, s_hiW, s_hiH);
++        }
++
 +        countGameFrame();
 +        handleHostHotkeys();
 +        updateHostWindowState();
-+
+ 
+-        BeginDrawing();
+-        ClearBackground(BLACK);
          const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
          const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
 -        const float screenWidth = static_cast<float>(GetScreenWidth());
@@ -10681,11 +11005,14 @@ index 45cb9d2..f15529c 100644
 -            dstWidth,
 -            dstHeight};
 -        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-+        prepareGameFrame(frameTex, srcWidth, srcHeight);
++        Texture2D &drawTex = s_hiValid ? s_hiTex : frameTex;
++        const float texWidth = s_hiValid ? static_cast<float>(s_hiW) : srcWidth;
++        const float texHeight = s_hiValid ? static_cast<float>(s_hiH) : srcHeight;
++        prepareGameFrame(drawTex, texWidth, texHeight, srcWidth, srcHeight);
 +
 +        BeginDrawing();
 +        ClearBackground(BLACK);
-+        drawGameFrame(frameTex, srcWidth, srcHeight);
++        drawGameFrame(drawTex, texWidth, texHeight, srcWidth, srcHeight);
 +        {
 +            // PS2X_SCREENSHOT_AT=s1,s2,...: screenshots at those seconds (test runs).
 +            static std::vector<double> shotTimes = []
@@ -10710,7 +11037,7 @@ index 45cb9d2..f15529c 100644
          if (m_debugUiInitialized && m_debugUiDrawCallback)
          {
              m_debugUiDrawCallback(*this, m_debugUiUserData);
-@@ -2465,6 +3206,7 @@ void PS2Runtime::run()
+@@ -2465,6 +3258,7 @@ void PS2Runtime::run()
          m_debugUiShutdownCallback(*this, m_debugUiUserData);
          m_debugUiInitialized = false;
      }

@@ -300,11 +300,14 @@ namespace
 {
     // Save the frame the runtime would present, as a BMP next to the exe, so
     // it can be inspected even when the game window can't be seen.
-    bool saveFrameBmp(PS2Runtime &runtime, const std::filesystem::path &path)
+    // hires: the upscaled picture (GPU renderer) instead of the native one.
+    bool saveFrameBmp(PS2Runtime &runtime, const std::filesystem::path &path, bool hires = false)
     {
         std::vector<uint8_t> rgba;
         uint32_t w = 0, h = 0;
-        if (!runtime.gs().copyLatchedHostPresentationFrame(rgba, w, h, nullptr, nullptr, nullptr) || !w || !h)
+        const bool got = hires ? runtime.gs().copyLatchedHiresFrame(rgba, w, h)
+                               : runtime.gs().copyLatchedHostPresentationFrame(rgba, w, h, nullptr, nullptr, nullptr);
+        if (!got || !w || !h)
             return false;
         const uint32_t rowBytes = w * 3u, pad = (4u - rowBytes % 4u) % 4u;
         const uint32_t dataSize = (rowBytes + pad) * h;
@@ -444,6 +447,8 @@ void xs_startHeartbeat(PS2Runtime &runtime)
                     char name[32];
                     std::snprintf(name, sizeof(name), "frame_%04d.bmp", beat * seconds);
                     std::filesystem::copy_file(shot, dir / name, std::filesystem::copy_options::overwrite_existing, ec);
+                    std::snprintf(name, sizeof(name), "frame_%04d_hi.bmp", beat * seconds);
+                    saveFrameBmp(runtime, dir / name, true);
                 }
                 // Raw 4 MB GS memory next to the frame, for decoding textures
                 // offline (port/tools/gsvram.py). Taken without locking, so a
