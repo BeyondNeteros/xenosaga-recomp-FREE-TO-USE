@@ -5828,10 +5828,10 @@ index 9281d5f..9964996 100644
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
 new file mode 100644
-index 0000000..90e459a
+index 0000000..84d6ec0
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
-@@ -0,0 +1,1363 @@
+@@ -0,0 +1,1373 @@
 +// GPU GS backend (OpenGL 4.5 + ARB_fragment_shader_interlock, Windows).
 +//
 +// The GPU rasterizes; everything the GS does per pixel (texture lookup, alpha
@@ -5933,6 +5933,7 @@ index 0000000..90e459a
 +noperspective out vec4 vColor;
 +flat out vec4 vFlatColor;
 +noperspective out float vZ;
++flat out float vFlatZ;
 +noperspective out float vFog;
 +void main()
 +{
@@ -5941,6 +5942,7 @@ index 0000000..90e459a
 +    vColor = aColor;
 +    vFlatColor = aColor;
 +    vZ = aPos.z;
++    vFlatZ = aPos.z;
 +    vFog = aFog;
 +}
 +)GLSL";
@@ -5970,6 +5972,7 @@ index 0000000..90e459a
 +noperspective in vec4 vColor;
 +flat in vec4 vFlatColor;
 +noperspective in float vZ;
++flat in float vFlatZ;
 +noperspective in float vFog;
 +
 +int wrapCoord(int c, int size, int mode, int lo, int hi)
@@ -6073,7 +6076,11 @@ index 0000000..90e459a
 +        writeA = s3.w == 1;
 +        writeZ = s3.w == 2;
 +    }
-+    uint z = uint(vZ + 0.5);
++    // A float holds whole numbers only from 2^23 up, where adding 0.5 would
++    // round up by one (at maximum depth that beat equal-depth tests). Sprites
++    // have one depth, so they skip interpolation and its rounding altogether.
++    float depth = s7.w != 0 ? vFlatZ : vZ;
++    uint z = min(depth >= 8388608.0 ? uint(depth) : uint(depth + 0.5), s9.y);
 +
 +    beginInvocationInterlockARB();
 +    if (writeRgb || writeA || writeZ)
@@ -6244,7 +6251,10 @@ index 0000000..90e459a
 +        if (!onGlThread())
 +            return;
 +        flushDraws();
-+        if (reason == GSSyncReason::DebugReadback || reason == GSSyncReason::Reset || reason == GSSyncReason::LocalToHost)
++        // GS_REPLAY_GL (gs_replay): its final FINISH writes everything back to compare.
++        static const bool replay = std::getenv("GS_REPLAY_GL") != nullptr;
++        if (reason == GSSyncReason::DebugReadback || reason == GSSyncReason::Reset || reason == GSSyncReason::LocalToHost ||
++            (replay && reason == GSSyncReason::Finish))
 +            syncAllToMemory();
 +    }
 +    PresentationFrame Present(const GSPresentationRequest &request) override
@@ -10914,10 +10924,10 @@ index 6974254..5e30791 100644
              applyDest(vtDest, result, dest);
 diff --git a/ps2xRuntime/tools/gs_replay.cpp b/ps2xRuntime/tools/gs_replay.cpp
 new file mode 100644
-index 0000000..666ac75
+index 0000000..3ae36b8
 --- /dev/null
 +++ b/ps2xRuntime/tools/gs_replay.cpp
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,324 @@
 +// Replays a GS capture recorded with PS2X_GS_CAPTURE=seconds,frames
 +// (gs_capture.bin) through the runtime's GS frontend and CPU backend, for
 +// profiling and for checking that renderer optimizations don't change a pixel.
@@ -11192,8 +11202,6 @@ index 0000000..666ac75
 +            }
 +        }
 +        gs.writeRegister(0x61, 0); // FINISH: draws the rasterizer's queued primitives
-+        if (std::getenv("GS_REPLAY_GL"))
-+            gs.latchHostPresentationFrame(); // writes the GPU's pictures back to local memory
 +        std::fesetround(FE_TONEAREST);
 +        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 +        if (pass > 0 || repeat == 1)

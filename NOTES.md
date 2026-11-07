@@ -139,10 +139,21 @@ with the capture's end VRAM and writes got/want/diff BMPs. Field capture 34.3 ->
 12.8 ms/frame. In game the field went from 20 fps to a locked 30, with eeidle
 ~50%. VU1 is now the limit in heavy scenes.
 
-Differences from CPU are 5-7% of pixels, mostly one streak area: feedback triangles
-(tex = target, ALPHA 0x64) read pre-draw pixels on GPU, while the CPU's ordered draw
-reads pixels it just wrote and smears the ground beside Shion. GPU looks right but
-is unverified: compare with PCSX2. Also alpha differs on ~20k pixels in one buffer.
+Differences from CPU (GS_REPLAY_GL syncs everything at the final FINISH; without
+that, undisplayed buffers look wildly different): bplay2 0.03%, hpcap2 0.02-2.3%,
+hpcap 0-2.7%, gscap1 43% but nearly all within 8 levels, ffcap1 4-10%, mostly one
+streak area: feedback triangles (tex = target, ALPHA 0x64) read pre-draw pixels on
+GPU, while the CPU's ordered draw reads pixels it just wrote and smears the ground
+beside Shion. GPU looks right but is unverified: compare with PCSX2.
+
+Two bugs after the first install, both missed because tests read frames from
+memory, not the window (use PS2X_SCREENSHOT_AT to see the real window):
+- ps2x_createGlBackend must restore the window thread's GL context, or the window
+  is black while the game runs.
+- Z rounding: uint(z + 0.5) in a float rounds up from 2^23, so z 0xFFFFFF became
+  0x1000000 and won equal-depth tests. That darkened the movie pause text
+  (PauseMenu's shadow sprite is ZTST greater at the text's depth). Sprites now use
+  a flat Z.
 
 Next: PBO readback instead of stalling in Present, retrain PGO, batch feedback
 draws, upscaling (images are 2048x2048; scale viewport/scissor/texel fetches and
