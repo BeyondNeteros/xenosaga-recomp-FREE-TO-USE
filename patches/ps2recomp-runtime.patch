@@ -2087,11 +2087,28 @@ index 4b9242c..3c96b6f 100644
  
      inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
 diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
-index 0485d50..40c7680 100644
+index 0485d50..0b39342 100644
 --- a/ps2xRuntime/include/ps2_runtime_macros.h
 +++ b/ps2xRuntime/include/ps2_runtime_macros.h
-@@ -856,21 +856,21 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
- #define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+@@ -843,6 +843,12 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_ABS_S(a) fabsf((float)(a))
+ #define FPU_MOV_S(a) ((float)(a))
+ #define FPU_NEG_S(a) (-(float)(a))
++// EE cvt.w.s always truncates, whatever the rounding mode, and clamps on overflow.
++static inline int32_t ps2_fpu_to_word(float a)
++{
++    const int32_t r = _mm_cvttss_si32(_mm_set_ss(a));
++    return (r == INT32_MIN && a > 0.0f) ? INT32_MAX : r;
++}
+ #define FPU_ROUND_L_S(a) ((int64_t)roundf((float)(a)))
+ #define FPU_TRUNC_L_S(a) ((int64_t)(float)(a))
+ #define FPU_CEIL_L_S(a) ((int64_t)ceilf((float)(a)))
+@@ -853,24 +859,24 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++#define FPU_CVT_W_S(a) ps2_fpu_to_word((float)(a))
  #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
  #define FPU_C_F_S(a, b) (0)
 -#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
@@ -3547,7 +3564,7 @@ index b1083af..1ed9294 100644
  
      void close(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
-index aed4cb5..0eda59b 100644
+index aed4cb5..558d73d 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
 @@ -1,3 +1,4 @@
@@ -3555,7 +3572,103 @@ index aed4cb5..0eda59b 100644
  #include "Common.h"
  #include "GS.h"
  #include "ps2_log.h"
-@@ -798,9 +799,9 @@ namespace ps2_stubs
+@@ -590,17 +591,47 @@ namespace ps2_stubs
+         setReturnU32(ctx, terminatePacketBuilderState(rdram, ctx, runtime));
+     }
+ 
++    // sceGsSetDefLoadImage/StoreImage run as the game's own code here, so the image
++    // struct is the real libgraph GIF packet, not GsImageMem: its register values sit
++    // at +0x20 BITBLTBUF, +0x30 TRXPOS, +0x40 TRXREG. Reading it as GsImageMem gave a
++    // garbage source, which is what made the save screen's thumbnail too big.
++    struct GsDefImagePacket
++    {
++        uint64_t bitbltbuf, trxpos, trxreg;
++    };
++
++    static bool readGsDefImagePacket(uint8_t *rdram, uint32_t addr, GsDefImagePacket &out)
++    {
++        const uint8_t *ptr = getConstMemPtr(rdram, addr);
++        if (!ptr)
++            return false;
++        uint64_t regs[6];
++        std::memcpy(regs, ptr + 0x20, sizeof(regs));
++        if ((regs[1] & 0xFFu) != 0x50u || (regs[3] & 0xFFu) != 0x51u || (regs[5] & 0xFFu) != 0x52u)
++            return false;
++        out = {regs[0], regs[2], regs[4]};
++        return true;
++    }
++
+     void sceGsExecLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t imgAddr = getRegU32(ctx, 4);
+         uint32_t srcAddr = getRegU32(ctx, 5);
+ 
+         GsImageMem img{};
+-        if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img))
++        GsDefImagePacket def{};
++        const bool hasDef = runtime && readGsDefImagePacket(rdram, imgAddr, def);
++        if (!runtime || !runtime->syncCoreSubsystems() || (!hasDef && !readGsImage(rdram, imgAddr, img)))
+         {
+             setReturnS32(ctx, -1);
+             return;
+         }
++        if (hasDef)
++        {
++            img.psm = static_cast<uint8_t>((def.bitbltbuf >> 56) & 0x3Fu);
++            img.width = static_cast<uint16_t>(def.trxreg & 0xFFFu);
++            img.height = static_cast<uint16_t>((def.trxreg >> 32) & 0xFFFu);
++        }
+ 
+         const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
+         if (rowBytes == 0)
+@@ -647,6 +678,12 @@ namespace ps2_stubs
+         q[5] = 0x51ULL;
+         q[6] = (static_cast<uint64_t>(img.height) << 32) | static_cast<uint64_t>(img.width);
+         q[7] = 0x52ULL;
++        if (hasDef)
++        {
++            q[2] = def.bitbltbuf;
++            q[4] = def.trxpos;
++            q[6] = def.trxreg;
++        }
+         q[8] = 0ULL;
+         q[9] = 0x53ULL;
+         q[10] = (static_cast<uint64_t>(2) << 58) | (static_cast<uint64_t>(imageQwc) & 0x7FFF) |
+@@ -673,11 +710,19 @@ namespace ps2_stubs
+         uint32_t dstAddr = getRegU32(ctx, 5);
+ 
+         GsImageMem img{};
+-        if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img))
++        GsDefImagePacket def{};
++        const bool hasDef = runtime && readGsDefImagePacket(rdram, imgAddr, def);
++        if (!runtime || !runtime->syncCoreSubsystems() || (!hasDef && !readGsImage(rdram, imgAddr, img)))
+         {
+             setReturnS32(ctx, -1);
+             return;
+         }
++        if (hasDef)
++        {
++            img.psm = static_cast<uint8_t>((def.bitbltbuf >> 24) & 0x3Fu);
++            img.width = static_cast<uint16_t>(def.trxreg & 0xFFFu);
++            img.height = static_cast<uint16_t>((def.trxreg >> 32) & 0xFFFu);
++        }
+ 
+         const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
+         if (rowBytes == 0)
+@@ -708,6 +753,12 @@ namespace ps2_stubs
+                           (static_cast<uint64_t>(0u) << 32) |
+                           (static_cast<uint64_t>(0u) << 48);
+         uint64_t trxreg = static_cast<uint64_t>(img.height) << 32 | static_cast<uint64_t>(img.width);
++        if (hasDef)
++        {
++            bitbltbuf = def.bitbltbuf;
++            trxpos = def.trxpos;
++            trxreg = def.trxreg;
++        }
+ 
+         uint32_t pktAddr = runtime->guestMalloc(80u, 16u);
+         if (pktAddr == 0)
+@@ -798,9 +849,9 @@ namespace ps2_stubs
                  return;
              }
  
@@ -3568,7 +3681,7 @@ index aed4cb5..0eda59b 100644
              writeGsGParamToScratch(runtime);
              uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
              uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
-@@ -1016,6 +1017,17 @@ namespace ps2_stubs
+@@ -1016,6 +1067,17 @@ namespace ps2_stubs
          uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
  
          writeGsDispEnv(rdram, envAddr, display, dispfb);

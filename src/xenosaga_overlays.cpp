@@ -505,26 +505,82 @@ namespace
     // The save screen's thumbnail (GameSnapShotSaveThumbnail, called with quality
     // 30 from 0x289DB4) must fit 4 KB or the game calls exit(1). A busy picture
     // that doesn't fit is encoded again at lower quality rather than quitting.
+    // The retry lives at the exit() call, because the encoder can pause at a
+    // checkpoint and then return straight into the save screen's code, past
+    // anything wrapped around the encoder itself.
     PS2Runtime::RecompiledFunction g_saveThumbnailOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_exitOriginal = nullptr;
+    uint32_t g_thumbnailQuality = 0, g_thumbnailBuffer = 0;
 
     void saveThumbnail_guard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         constexpr uint32_t kFileScreenReturn = 0x00289DBCu;
-        const uint32_t ra = GPR_U32(ctx, 31), quality = GPR_U32(ctx, 4), buffer = GPR_U32(ctx, 5);
-        g_saveThumbnailOriginal(rdram, ctx, runtime);
-        if (runtime->m_checkpointYielded || ra != kFileScreenReturn)
-            return;
-        std::printf("[save] thumbnail %u bytes at quality %u\n", GPR_U32(ctx, 2), quality);
-        for (uint32_t q = quality / 2u; q >= 4u && GPR_U32(ctx, 2) > 0x1000u; q /= 2u)
+        if (GPR_U32(ctx, 31) == kFileScreenReturn)
         {
-            SET_GPR_U32(ctx, 4, q);
-            SET_GPR_U32(ctx, 5, buffer);
-            SET_GPR_U32(ctx, 31, ra);
-            g_saveThumbnailOriginal(rdram, ctx, runtime);
-            if (runtime->m_checkpointYielded)
-                return;
-            std::printf("[save] thumbnail %u bytes at quality %u\n", GPR_U32(ctx, 2), q);
+            g_thumbnailQuality = GPR_U32(ctx, 4);
+            g_thumbnailBuffer = GPR_U32(ctx, 5);
+            std::printf("[save] encoding thumbnail at quality %u\n", g_thumbnailQuality);
         }
+        g_saveThumbnailOriginal(rdram, ctx, runtime);
+    }
+
+    // Remembers where the encoder reports its size (request +8).
+    PS2Runtime::RecompiledFunction g_jpegEncodeOriginal = nullptr;
+    uint32_t g_jpegRequest = 0;
+
+    void jpegEncode_note(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_jpegRequest = GPR_U32(ctx, 4);
+        g_jpegEncodeOriginal(rdram, ctx, runtime);
+    }
+
+    uint32_t lastJpegSize(const uint8_t *rdram)
+    {
+        uint32_t size = 0;
+        std::memcpy(&size, rdram + ((g_jpegRequest + 8u) & 0x01FFFFFFu), sizeof(size));
+        return size;
+    }
+
+    void exit_guard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kAfterThumbnailCheck = 0x00289DD0u;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (ra == kAfterThumbnailCheck)
+        {
+            const uint32_t size = lastJpegSize(rdram);
+            std::printf("[save] thumbnail was %u bytes at quality %u\n", size, g_thumbnailQuality);
+            if (std::getenv("XS_TEST_SAVE") && size < 0x100000u)
+            {
+                char name[64];
+                std::snprintf(name, sizeof(name), "xs_thumb_q%u.jpg", g_thumbnailQuality);
+                if (FILE *f = std::fopen(name, "wb"))
+                {
+                    std::fwrite(rdram + (g_thumbnailBuffer & 0x01FFFFFFu), 1, size, f);
+                    std::fclose(f);
+                }
+            }
+        }
+        if (ra != kAfterThumbnailCheck)
+        {
+            std::printf("[exit] the game called exit(%d) from 0x%x\n", static_cast<int>(GPR_U32(ctx, 4)), ra);
+            std::fflush(stdout);
+            g_exitOriginal(rdram, ctx, runtime);
+            return;
+        }
+        g_thumbnailQuality /= 2u;
+        if (g_thumbnailQuality >= 4u)
+        {
+            std::printf("[save] thumbnail over 4 KB, trying quality %u\n", g_thumbnailQuality);
+            SET_GPR_U32(ctx, 4, g_thumbnailQuality);
+            SET_GPR_U32(ctx, 5, g_thumbnailBuffer);
+            SET_GPR_U32(ctx, 31, 0x00289DBCu);
+            ctx->pc = 0x0024DD18u; // GameSnapShotSaveThumbnail
+            return;
+        }
+        // Better a save with a blank picture than no save.
+        std::printf("[save] thumbnail still over 4 KB, saving without one\n");
+        std::memset(rdram + (g_thumbnailBuffer & 0x01FFFFFFu), 0, 0x1000u);
+        ctx->pc = kAfterThumbnailCheck;
     }
 
     // Test aid, only with XS_TEST_SAVE=<field frames>: opens the save screen that
@@ -545,6 +601,17 @@ namespace
             *reinterpret_cast<uint16_t *>(rdram + kPadPressed) |= 0x0020u;
         }
         g_checkTalkPointOriginal(rdram, ctx, runtime);
+    }
+
+    // The yes/no question starts on "No": answer Yes.
+    PS2Runtime::RecompiledFunction g_menuSelectMoveOriginal = nullptr;
+
+    void menuSelectMove_saveTest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t rows = GPR_U32(ctx, 5);
+        g_menuSelectMoveOriginal(rdram, ctx, runtime);
+        if (rows == 2u && !runtime->m_checkpointYielded)
+            SET_GPR_U32(ctx, 2, 0u);
     }
 
     void menuFile_saveTest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -579,6 +646,8 @@ namespace
         wrapSlot(0x002E7830u, createEffect_options, g_createEffectOriginal);     // sefCreateEffectCf2
         wrapSlot(0x002E7A18u, isFinishEffect_options, g_isFinishEffectOriginal); // sefIsFinishEffect
         wrapSlot(0x0024DD18u, saveThumbnail_guard, g_saveThumbnailOriginal);     // GameSnapShotSaveThumbnail
+        wrapSlot(0x0032E168u, exit_guard, g_exitOriginal);                       // exit
+        wrapSlot(0x00223FC0u, jpegEncode_note, g_jpegEncodeOriginal);            // xglJpegEncode
         static const uint32_t saveTest = []() -> uint32_t {
             const char *v = std::getenv("XS_TEST_SAVE");
             return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
@@ -588,6 +657,7 @@ namespace
             g_saveTestAfter = saveTest;
             wrapSlot(0x002458D0u, checkTalkPoint_saveTest, g_checkTalkPointOriginal); // checkTalkPoint
             wrapSlot(0x00287888u, menuFile_saveTest, g_menuFileOriginal);             // MenuFile
+            wrapSlot(0x00274E08u, menuSelectMove_saveTest, g_menuSelectMoveOriginal); // MenuSelectMove
         }
         if (overlay == 1) // battle/field module
         {
