@@ -109,6 +109,27 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Save point crash; vsync catch-up limited (2026-11-07, runs/field-freeze/session3.log, save1, pace1)
+
+Beyond's first long live session: about 10 min, battles fine, no freeze. Confirm at a
+save point ended the game: `Game thread returned. PC=0x289dbc` is the game's own
+`if (GameSnapShotSaveThumbnail(30, buf) > 0x1000) exit(1)` (main/file.c). The
+thumbnail is a sprite at Z 0xFFFFFFFF with ZTST greater into page 0x1C0
+(game_snap_shot.c). The GPU shader's float z overflowed uint and failed the test, so
+the JPEG encoded whatever texture data sat there. The test now uses the full value
+and masks only the store. saveThumbnail_guard also re-encodes at lower quality if it
+still doesn't fit (skipped if the call yields). NOT yet confirmed: replays drift and
+didn't reach the save.
+
+Cutscene swings (20-40 fps): VBlank fires when both cycle and host deadlines pass,
+and host deadlines were absolute, so after a slow stretch vsync ran up to 115 Hz.
+No catch-up at all halves slow scenes (save1: 25 -> 15 fps, 3 min at 14-17), so the
+host deadline may lag by at most two periods. pace1: max 34.6 fps, mostly 30.
+save1's story cutscenes were VU1/VIF-heavy (~38 ms/frame); pace1's replay drifted
+and may not have hit them. Audio glitches not measured.
+VU1 blocks now 440 (runs/vu1blocks/game-1107.vbl), PGO retrained, vu1_check clean.
+Also: use the normal git for pushing; the MSYS2 one on PATH hangs without credentials.
+
 ## GPU renderer; battle freeze root cause fixed (2026-11-07, runs/gpu1-5, tr1, heap1)
 
 **Battle freeze, root cause:** `IopMemory::allocate` only moved m_heapCursor

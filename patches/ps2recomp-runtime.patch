@@ -3387,7 +3387,7 @@ index 0000000..be362c5
 +
 +#endif
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..0e98785 100644
+index c5e31c4..080ee63 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,6 @@
@@ -3470,7 +3470,22 @@ index c5e31c4..0e98785 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
                                                m_stopRequested.load(std::memory_order_acquire); });
-@@ -1867,6 +1910,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1850,8 +1893,13 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
++                // Don't rush to make up for a long slow stretch: vsyncs at up to
++                // twice the real rate swung the game between 20 and 40 fps. Two
++                // periods of slack remain: with none, a frame that misses its
++                // vsync pair waits for the next pair (25 fps becomes 15).
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                              std::max(scheduled.hostDeadline + kVBlankPeriod,
++                                       std::chrono::steady_clock::now() - 2 * kVBlankPeriod),
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+@@ -1867,6 +1915,8 @@ void EeScheduler::processEvent(const EeEvent &event)
          requestStop();
          break;
      case EeEventType::VBlankStart:
@@ -3479,7 +3494,7 @@ index c5e31c4..0e98785 100644
          ++m_vsyncTick;
          m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
          if ((m_vsyncTick & 1u) != 0u)
-@@ -2005,6 +2050,7 @@ void EeScheduler::waitForEvent()
+@@ -2005,6 +2055,7 @@ void EeScheduler::waitForEvent()
      const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
      if (m_deadlines.empty() && !hasTimerDeadline)
      {
@@ -3487,7 +3502,7 @@ index c5e31c4..0e98785 100644
          m_eventCv.wait(lock, [this]()
                         { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
          return;
-@@ -2036,9 +2082,12 @@ void EeScheduler::waitForEvent()
+@@ -2036,9 +2087,12 @@ void EeScheduler::waitForEvent()
          }
      }
  
@@ -5828,10 +5843,10 @@ index 9281d5f..9964996 100644
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
 new file mode 100644
-index 0000000..84d6ec0
+index 0000000..cfb16d7
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
-@@ -0,0 +1,1373 @@
+@@ -0,0 +1,1377 @@
 +// GPU GS backend (OpenGL 4.5 + ARB_fragment_shader_interlock, Windows).
 +//
 +// The GPU rasterizes; everything the GS does per pixel (texture lookup, alpha
@@ -6079,8 +6094,12 @@ index 0000000..84d6ec0
 +    // A float holds whole numbers only from 2^23 up, where adding 0.5 would
 +    // round up by one (at maximum depth that beat equal-depth tests). Sprites
 +    // have one depth, so they skip interpolation and its rounding altogether.
++    // The test uses the full value, as WritePixel does: the save thumbnail draws
++    // at 0xFFFFFFFF (a float rounds that to 2^32, which uint() can't hold) and must
++    // pass "greater" against a stored 0xFFFFFF. Only the store is masked.
 +    float depth = s7.w != 0 ? vFlatZ : vZ;
-+    uint z = min(depth >= 8388608.0 ? uint(depth) : uint(depth + 0.5), s9.y);
++    uint z = depth >= 4294967040.0 ? 0xFFFFFFFFu : (depth >= 8388608.0 ? uint(depth) : uint(depth + 0.5));
++    if (s7.w == 0) z = min(z, s9.y); // interpolation can round just past the top
 +
 +    beginInvocationInterlockARB();
 +    if (writeRgb || writeA || writeZ)

@@ -502,6 +502,31 @@ namespace
         SET_GPR_U32(ctx, 2, swapped);
     }
 
+    // The save screen's thumbnail (GameSnapShotSaveThumbnail, called with quality
+    // 30 from 0x289DB4) must fit 4 KB or the game calls exit(1). A busy picture
+    // that doesn't fit is encoded again at lower quality rather than quitting.
+    PS2Runtime::RecompiledFunction g_saveThumbnailOriginal = nullptr;
+
+    void saveThumbnail_guard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kFileScreenReturn = 0x00289DBCu;
+        const uint32_t ra = GPR_U32(ctx, 31), quality = GPR_U32(ctx, 4), buffer = GPR_U32(ctx, 5);
+        g_saveThumbnailOriginal(rdram, ctx, runtime);
+        if (runtime->m_checkpointYielded || ra != kFileScreenReturn)
+            return;
+        std::printf("[save] thumbnail %u bytes at quality %u\n", GPR_U32(ctx, 2), quality);
+        for (uint32_t q = quality / 2u; q >= 4u && GPR_U32(ctx, 2) > 0x1000u; q /= 2u)
+        {
+            SET_GPR_U32(ctx, 4, q);
+            SET_GPR_U32(ctx, 5, buffer);
+            SET_GPR_U32(ctx, 31, ra);
+            g_saveThumbnailOriginal(rdram, ctx, runtime);
+            if (runtime->m_checkpointYielded)
+                return;
+            std::printf("[save] thumbnail %u bytes at quality %u\n", GPR_U32(ctx, 2), q);
+        }
+    }
+
     // Puts a wrapper in the function table slot for addr; `original` keeps
     // what was there (an overlay's slot is refilled whenever it loads).
     void wrapSlot(uint32_t addr, PS2Runtime::RecompiledFunction wrapper, PS2Runtime::RecompiledFunction &original)
@@ -521,6 +546,7 @@ namespace
         wrapSlot(0x0022CC08u, renderSyncMove_options, g_renderSyncMoveOriginal); // xglRenderSyncMove
         wrapSlot(0x002E7830u, createEffect_options, g_createEffectOriginal);     // sefCreateEffectCf2
         wrapSlot(0x002E7A18u, isFinishEffect_options, g_isFinishEffectOriginal); // sefIsFinishEffect
+        wrapSlot(0x0024DD18u, saveThumbnail_guard, g_saveThumbnailOriginal);     // GameSnapShotSaveThumbnail
         if (overlay == 1) // battle/field module
         {
             wrapSlot(0x00A09A80u, battleExec_options, g_battleExecOriginal);   // battleExec
