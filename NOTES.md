@@ -109,6 +109,45 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Saving and loading work (2026-11-07, runs/savecrash2, savetest1-7, loadtest2, soak1)
+
+The save point still crashed after the first fix below. Log: "Game thread
+returned. PC=0x289dbc": the game called exit(1) because the thumbnail JPEG was
+over 4 KB (file.c MenuFileMain). Three bugs:
+
+- **`cvt.w.s` rounded to nearest** (`FPU_CVT_W_S` used `nearbyintf`). The EE
+  always truncates. Every `F2I` in the game was off; in the JPEG quantizer
+  (`xgl_jpeg.c` Quantize adds +-0.5 then F2I) every coefficient became +-1:
+  speckled ~17 KB thumbnails whatever the quality. Now `ps2_fpu_to_word`
+  (truncate, clamp on overflow) in ps2_runtime_macros.h. VU FTOI already
+  truncated. Side effect seen: the "Ssd function error -19" (sound effect
+  index out of range) lines are gone from a 10-minute replay (soak1).
+- `sceGsExecLoadImage/StoreImage` (stubs) read the image struct as the stub's
+  own `GsImageMem`, but `sceGsSetDefLoad/StoreImage` run as the game's code and
+  fill the real libgraph packet (+0x20 BITBLTBUF, +0x30 TRXPOS, +0x40 TRXREG).
+  Both now detect that packet (`readGsDefImagePacket`, GS.cpp).
+- The thumbnail guard sat around GameSnapShotSaveThumbnail, but the encoder can
+  pause at a checkpoint and resume straight into MenuFileMain past the wrapper.
+  The retry now wraps `exit` (0x32E168) at ra 0x289DD0: lower quality, pc back
+  to the encoder; other exit() calls are logged as `[exit]`.
+
+Verified by replay: save writes mc0/BASLUS-20469Xeno00 (91 KB data, icon.sys,
+xenosaga.ico); the slot list shows the thumbnail; title Continue
+(inputs/title-continue.txt) loads it to the field; overwriting 30 times in a
+row works; backing out of the menu returns to the field. Slots past ~No. 50 show
+"NOT USABLE": 8 MB card / ~160 KB per save, as on hardware.
+
+Saves are now backed up before being replaced: `save-backups/mc0/<dir>/<file>.bak1..3`
+beside mc0 (MemoryCard.cpp `backupMcSave`), and a format renames the card
+folder (`mc0-before-format-N`) instead of `remove_all`.
+
+Test aid: `XS_TEST_SAVE=<field frames>` opens the save screen that many field
+frames in, presses Circle (PadData +0x2A and the list's +0x30), answers Yes
+(MenuSelectMove with 2 rows returns 0), logs menu states (`FileWork` +3), and
+backs out with Cross after one save. Combined with title-continue.txt it tests
+load + save + return. Not done: replays that follow a recording only in the
+field (skip cutscenes, auto-battle) - recordings carry no scene markers yet.
+
 ## Save point crash; vsync catch-up limited (2026-11-07, runs/field-freeze/session3.log, save1, pace1)
 
 Beyond's first long live session: about 10 min, battles fine, no freeze. Confirm at a

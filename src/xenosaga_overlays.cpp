@@ -627,9 +627,10 @@ namespace
         if (state != lastState)
         {
             std::printf("[save-test] menu state 0x%02x after 0x%02x\n", state, lastState);
-            lastState = state;
-            if (state == 0x2Eu)
+            // The "save complete" message (0x2E) still wants Circle.
+            if (lastState == 0x2Eu)
                 g_saveTestSaved = true;
+            lastState = state;
         }
         if (++calls % 60u == 0u)
         {
