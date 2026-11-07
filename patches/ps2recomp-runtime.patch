@@ -73,7 +73,7 @@ index 3491440..ca5c68d 100644
      {
          uint64_t emulatorCycles = 0;
 diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
-index 4832d8f..e7a208f 100644
+index 4832d8f..e9ce3c0 100644
 --- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
 +++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
 @@ -1,5 +1,7 @@
@@ -84,14 +84,48 @@ index 4832d8f..e7a208f 100644
  #include "iop_memory.h"
  #include "../iop_emulator_const.h"
  
-@@ -741,4 +743,33 @@ namespace ps2x::iop::detail
+@@ -204,7 +206,11 @@ namespace ps2x::iop::detail
+             if (it->second.state == IopThreadState::Sleep)
+                 it->second.state = IopThreadState::Ready;
+             else
++            {
++                if (it->second.state == IopThreadState::WaitRpc)
++                    ++m_wakeupsDuringRpc;
+                 ++it->second.wakeupCount;
++            }
+             setV0(0);
+             return true;
+         }
+@@ -660,6 +666,21 @@ namespace ps2x::iop::detail
+         cpu.yielded = true;
+     }
+ 
++    void IopKernel::blockCurrentOnRpc(IopCpuState &cpu)
++    {
++        if (m_currentThread == nullptr)
++            return;
++        m_currentThread->state = IopThreadState::WaitRpc;
++        cpu.yielded = true;
++    }
++
++    void IopKernel::releaseRpcWait(int id)
++    {
++        const auto it = m_threads.find(id);
++        if (it != m_threads.end() && it->second.state == IopThreadState::WaitRpc)
++            it->second.state = IopThreadState::Ready;
++    }
++
+     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
+     {
+         if (m_currentThread == nullptr)
+@@ -741,4 +762,33 @@ namespace ps2x::iop::detail
                  thread.state = IopThreadState::Dead;
          }
      }
 +
 +    std::vector<std::string> IopKernel::describeThreads() const
 +    {
-+        static const char *const kStates[] = {"dormant", "ready", "running", "sleep", "delay",
++        static const char *const kStates[] = {"dormant", "ready", "running", "sleep", "rpcwait", "delay",
 +                                              "semaphore", "eventflag", "suspended", "dead"};
 +        std::vector<std::string> lines;
 +        for (const auto &entry : m_threads)
@@ -119,7 +153,7 @@ index 4832d8f..e7a208f 100644
 +    }
  }
 diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
-index 4977102..17b32e9 100644
+index 4977102..5f8ea68 100644
 --- a/ps2xIOP/src/emulator/core/iop_kernel.h
 +++ b/ps2xIOP/src/emulator/core/iop_kernel.h
 @@ -5,6 +5,8 @@
@@ -131,17 +165,30 @@ index 4977102..17b32e9 100644
  
  namespace ps2x::iop::detail
  {
-@@ -58,6 +60,9 @@ namespace ps2x::iop::detail
+@@ -16,6 +18,7 @@ namespace ps2x::iop::detail
+         Ready,
+         Running,
+         Sleep,
++        WaitRpc, // inside a blocking sceSifCallRpc to the EE
+         Delay,
+         Semaphore,
+         EventFlag,
+@@ -58,6 +61,14 @@ namespace ps2x::iop::detail
          [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
  
          void sleepCurrent(IopCpuState &cpu);
 +        // WakeupThread for host code; false if there is no such thread.
 +        bool wakeupThread(int id);
++        // Blocking sceSifCallRpc: a separate state from SleepThread, so a
++        // WakeupThread meanwhile is counted and doesn't end the wait.
++        void blockCurrentOnRpc(IopCpuState &cpu);
++        void releaseRpcWait(int id);
++        [[nodiscard]] uint64_t wakeupsDuringRpc() const noexcept { return m_wakeupsDuringRpc; }
 +        [[nodiscard]] int currentThreadId() const noexcept { return m_currentThread ? m_currentThread->id : 0; }
          void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
  
          [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
-@@ -67,6 +72,8 @@ namespace ps2x::iop::detail
+@@ -67,8 +78,12 @@ namespace ps2x::iop::detail
          void terminateThreadsInRange(uint32_t base, uint32_t size);
  
          [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
@@ -149,7 +196,11 @@ index 4977102..17b32e9 100644
 +        [[nodiscard]] std::vector<std::string> describeThreads() const;
  
      private:
++
++        uint64_t m_wakeupsDuringRpc = 0;
          struct Semaphore
+         {
+             int id = 0;
 diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
 index 25e9b36..4cd9e3e 100644
 --- a/ps2xIOP/src/emulator/core/iop_memory.cpp
@@ -1037,8 +1088,23 @@ index 48fdb14..07173d2 100644
  
      private:
          struct Handler
+diff --git a/ps2xIOP/src/emulator/imports/iop_stdio.cpp b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+index eed2b61..f9c23c6 100644
+--- a/ps2xIOP/src/emulator/imports/iop_stdio.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+@@ -31,7 +31,10 @@ namespace ps2x::iop::detail
+         switch (ordinal)
+         {
+         case 4: // printf
++            // The format string, then its first arguments as raw values.
+             logString("[IOP printf] ", a0);
++            m_host.log(LogLevel::Info, "[IOP printf args] a1=" + std::to_string(static_cast<int32_t>(cpu.gpr[5])) +
++                                           " a2=" + std::to_string(static_cast<int32_t>(cpu.gpr[6])));
+             return true;
+         case 5: // getchar
+         case 10:
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..d794017 100644
+index e5f63a9..88b05c3 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -17,6 +17,9 @@
@@ -1126,10 +1192,10 @@ index e5f63a9..d794017 100644
 +            if (ranges.empty() || totalCycles < nextDump)
 +                return;
 +            nextDump = totalCycles + 184'000'000u;
-+            std::fprintf(stderr, "[iop-watch] cycle=%llu intctl=%u mask=%08x stat=%08x en36=%d en40=%d en9=%d pending:",
++            std::fprintf(stderr, "[iop-watch] cycle=%llu intctl=%u mask=%08x stat=%08x en36=%d en40=%d en9=%d wakesInRpc=%llu pending:",
 +                         static_cast<unsigned long long>(totalCycles), memory.interruptControl(), memory.interruptMask(),
 +                         memory.interruptStatus(), intrman.isEnabled(36) ? 1 : 0, intrman.isEnabled(40) ? 1 : 0,
-+                         intrman.isEnabled(9) ? 1 : 0);
++                         intrman.isEnabled(9) ? 1 : 0, static_cast<unsigned long long>(kernel.wakeupsDuringRpc()));
 +            for (const auto &[irq, due] : pendingDmaInterrupts)
 +                std::fprintf(stderr, " %d@%+lld", irq, static_cast<long long>(due - totalCycles));
 +            std::fprintf(stderr, "\n");
@@ -1249,7 +1315,7 @@ index 01b48df..c4bde7f 100644
  
      private:
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-index cf4fdc6..57e05aa 100644
+index cf4fdc6..d732f17 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
 +++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 @@ -1,3 +1,5 @@
@@ -1348,8 +1414,8 @@ index cf4fdc6..57e05aa 100644
 +                return true;
 +            }
 +            setV0(0);
-+            if (!noWait && pending.waitingThread != 0)
-+                m_kernel.sleepCurrent(cpu); // woken by completeEeRpc
++            if (!noWait && pending.waitingThread != 0 && m_eeCalls.find(token) != m_eeCalls.end())
++                m_kernel.blockCurrentOnRpc(cpu); // released by completeEeRpc
 +            return true;
 +        }
          case 12: // sceSifSendCmd
@@ -1393,7 +1459,7 @@ index cf4fdc6..57e05aa 100644
 +        // As the SDK: the end function (if any) runs on completion in either
 +        // mode, and a blocking caller is released.
 +        if (call.waitingThread != 0)
-+            (void)m_kernel.wakeupThread(call.waitingThread);
++            m_kernel.releaseRpcWait(call.waitingThread);
 +        if (call.endFunction == 0u)
 +            return std::nullopt;
 +        return EeRpcCallback{call.endFunction, call.endParameter, call.gp};

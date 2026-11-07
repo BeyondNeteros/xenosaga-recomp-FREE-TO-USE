@@ -109,6 +109,35 @@ textures, camera and text. Remaining big item: speed (below). Things not yet
 looked at: sound (skipped), FMV playback quality, later scenes/battles
 (overlays ov10/ov11/ov12), widescreen.
 
+## Decomp reference; battle freeze still open (2026-11-07, runs/rpcfix1, mash1)
+
+`references/xsg-i-decomp` (not in this repo, stays local) is a shallow clone of
+github.com/OpokXeno/xsg-i-decomp, matching C for all 7,645 game functions incl.
+SSD.IRX and RSSD.IRX (src/audio), main (src/main), overlays (src/ov*). No
+license and derived from the game: read it, never copy it into this repo.
+Useful map: EE driver src/main/ssd_init.c + ssd_1.c, IOP driver
+src/audio/rssd/rssdinit.c + rssdfunc.c, DMA queue src/audio/ssd/ssd_dma.c, wave
+upload src/audio/ssd/ssd_wave.c, per-attack sound upload src/ov01/snd.c
+(sndSeTrans).
+
+Real bug fixed: a blocking IOP sceSifCallRpc used the same Sleep state as
+SleepThread, so a WakeupThread during the wait (iRssdCallFunc from a DMA
+interrupt) ended the wait early. RssdSifClientThread then frees the node
+whose packet is the RPC's receive buffer, and the reply is written into freed
+memory. New state IopThreadState::WaitRpc: wakeups are counted, completeEeRpc
+releases it. `wakesInRpc=` in [iop-watch] counts how often this happens.
+
+That is NOT shown to be the freeze: wakesInRpc stayed 0 in rpcfix1 and mash1,
+and neither froze. mash1 (runs/field-freeze/inputs-mash.txt: the session plus
+scripted attacks, ~30 sndSeTrans) did not reproduce it. Live freezes: 2 of 2
+sessions, at battle state 3 (action start); thread 7 in SsdSpuDmaCompleted
+(flags bit 2), IOP client thread in SleepThread. Replays: 0 of 7. Next freeze:
+read [iop-watch] (SSD dma_queue +0x180, flags +0; RSSD firstRequest 0x5FA08)
+and `[IOP printf args]` after "Ssd function error".
+
+Performance: PS2Recomp (upstream too, checked e563698 = its head) only has
+the CPU GS backend. Field: gs 92%, vu1 62%. A GPU backend is the one big lever.
+
 ## First field area: window at 1-2 fps fixed, scenery 24% faster (2026-11-02, runs/ffcap1, ffrep1-5)
 
 Beyond's session to the first field area (runs/field-freeze/inputs-last.txt
