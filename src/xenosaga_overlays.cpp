@@ -32,6 +32,8 @@ void xs_configureDiscImage();
 void ps2x_armGsCapture(); // gs_frontend.cpp
 bool ps2x_hostWidescreen(); // ps2_runtime.cpp (settings.ini aspect = 16:9)
 bool ps2x_hostSettingBool(const char *key, bool fallback); // ps2_runtime.cpp (settings.ini)
+bool ps2x_debugOneHitKill();   // ps2_runtime.cpp (debug toggles, menu)
+bool ps2x_debugNoEncounters();
 void ps2x_setHostBadge(const char *text);                  // ps2_runtime.cpp (top-left label)
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -327,8 +329,53 @@ namespace
         g_widenedProjection[camera] = {value, original};
     }
 
+    // Movie audio: xglMpeg2Play (0x222428, decomp src/main/xgl_1.c) starts the
+    // movie's audio stream on its first frame with a pitch made from
+    // info->audioSampleRate (+0x90), which audioCallback reads from the first
+    // audio packet. The FFmpeg-backed sceMpeg can hand over the first picture
+    // before that packet is demuxed: the rate is still 0, the stream plays at
+    // pitch 0 and the whole movie is silent. PSS audio is 48 kHz, so supply
+    // that if no header has arrived by the first frame.
+    constexpr uint32_t kMpeg2PlayAddr = 0x00222428u;
+    PS2Runtime::RecompiledFunction g_mpeg2PlayOriginal = nullptr;
+
+    void mpeg2Play_audioRate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t info = GPR_U32(ctx, 4);
+        int32_t frameCount, rate;
+        std::memcpy(&frameCount, rdram + ((info + 0x38u) & kRdramMask), 4);
+        std::memcpy(&rate, rdram + ((info + 0x90u) & kRdramMask), 4);
+        static bool logged = false;
+        if (frameCount == 0)
+        {
+            if (rate == 0)
+            {
+                const int32_t standard = 48000;
+                std::memcpy(rdram + ((info + 0x90u) & kRdramMask), &standard, 4);
+                if (!logged)
+                    std::printf("[movie] no audio header before the first frame: using 48000 Hz\n");
+            }
+            else if (!logged)
+                std::printf("[movie] audio header ready at the first frame: %d Hz\n", rate);
+            logged = true;
+        }
+        else
+            logged = false;
+        g_mpeg2PlayOriginal(rdram, ctx, runtime);
+    }
+
+    void installMovieAudioHook()
+    {
+        const uint32_t slot = (kMpeg2PlayAddr - g_ps2RecompiledFunctionTableBase) >> 2;
+        if (g_mpeg2PlayOriginal || slot >= g_ps2RecompiledFunctionTableSlotCount || !g_ps2RecompiledFunctionTable[slot])
+            return;
+        g_mpeg2PlayOriginal = g_ps2RecompiledFunctionTable[slot];
+        g_ps2RecompiledFunctionTable[slot] = mpeg2Play_audioRate;
+    }
+
     void installWidescreenHook()
     {
+        installMovieAudioHook();
         const uint32_t slot = (kCameraViewScreenAddr - g_ps2RecompiledFunctionTableBase) >> 2;
         if (g_cameraViewScreenOriginal || slot >= g_ps2RecompiledFunctionTableSlotCount ||
             !g_ps2RecompiledFunctionTable[slot])
@@ -749,8 +796,113 @@ namespace
         g_ps2RecompiledFunctionTable[slot] = wrapper;
     }
 
+    // Debug toggles (graphics menu / settings.ini [debug]):
+    // - one-hit kills: calcHp (ov01 0xA12428, decomp src/ov01/calc.c) takes
+    //   (BattleUnit *unit, int delta); unit +0x10 is its Actor, whose flags
+    //   word has ACTOR_FLAG_ENEMY (0x40). Any HP loss on an enemy becomes
+    //   lethal (calcHp clamps at 0).
+    // - no encounters: Check_Encount (0x2D11D8, src/main/set_motion.c) with
+    //   enable = 0 is an enemy touching the player; enable = 1 is a scripted
+    //   battle (bosses, story fights), which still happens.
+    PS2Runtime::RecompiledFunction g_calcHpOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_checkEncountOriginal = nullptr;
+
+    void calcHp_debug(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ps2x_debugOneHitKill())
+        {
+            const uint32_t unit = GPR_U32(ctx, 4);
+            const int32_t delta = static_cast<int32_t>(GPR_U32(ctx, 5));
+            uint32_t actor, flags;
+            std::memcpy(&actor, rdram + ((unit + 0x10u) & kRdramMask), 4);
+            std::memcpy(&flags, rdram + (actor & kRdramMask), 4);
+            if (actor != 0u && (flags & 0x40u) != 0u && delta < 0)
+                SET_GPR_S32(ctx, 5, -0x3FFFFFFF);
+        }
+        g_calcHpOriginal(rdram, ctx, runtime);
+    }
+
+    void checkEncount_debug(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ps2x_debugNoEncounters() && static_cast<int8_t>(GPR_U32(ctx, 5)) == 0)
+            return; // touched by an enemy: no battle
+        g_checkEncountOriginal(rdram, ctx, runtime);
+    }
+
+    // Landmarks for following a session in the log: every named disc read
+    // (areas, events, models), movie starts and overlay loads, stamped with
+    // seconds since start. Same name twice in a row is logged once.
+    PS2Runtime::RecompiledFunction g_cdReadFilePartOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_gameMpeg2PlayOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_movieOpenOriginal = nullptr;
+
+    double landmarkSeconds()
+    {
+        static const auto start = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    std::string guestString(uint8_t *rdram, uint32_t addr)
+    {
+        std::string out;
+        for (uint32_t i = 0; i < 96u; ++i)
+        {
+            const char c = static_cast<char>(rdram[(addr + i) & kRdramMask]);
+            if (c == 0)
+                break;
+            out.push_back(c >= 32 && c < 127 ? c : '?');
+        }
+        return out;
+    }
+
+    void landmark(const char *kind, const std::string &what)
+    {
+        static std::string last;
+        const std::string key = std::string(kind) + what;
+        if (key == last)
+            return;
+        last = key;
+        std::printf("[landmark] %.1fs %s %s\n", landmarkSeconds(), kind, what.c_str());
+        std::fflush(stdout);
+    }
+
+    void cdReadFilePart_landmark(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (const uint32_t name = GPR_U32(ctx, 4))
+            landmark("file", guestString(rdram, name));
+        g_cdReadFilePartOriginal(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction g_cdReadFileOriginal = nullptr;
+    void cdReadFile_landmark(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (const uint32_t name = GPR_U32(ctx, 4))
+            landmark("file", guestString(rdram, name));
+        g_cdReadFileOriginal(rdram, ctx, runtime);
+    }
+
+    void gameMpeg2Play_landmark(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        landmark("movie", guestString(rdram, GPR_U32(ctx, 4)));
+        g_gameMpeg2PlayOriginal(rdram, ctx, runtime);
+        landmark("movie-end", "");
+    }
+
+    void movieOpen_landmark(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t name = GPR_U32(ctx, 5); // a name, or a mode number (unit6003.c)
+        landmark("ipu-movie", name >= 0x100000u ? guestString(rdram, name) : std::to_string(name));
+        g_movieOpenOriginal(rdram, ctx, runtime);
+    }
+
     void installGameOptionHooks(uint32_t overlay)
     {
+        landmark("overlay", std::to_string(overlay));
+        wrapSlot(0x0021DEB8u, cdReadFilePart_landmark, g_cdReadFilePartOriginal); // xglCdReadFilePart
+        wrapSlot(0x0021E310u, cdReadFile_landmark, g_cdReadFileOriginal);         // xglCdReadFile
+        wrapSlot(0x002507C8u, gameMpeg2Play_landmark, g_gameMpeg2PlayOriginal);   // GameMpeg2Play
+        wrapSlot(0x002210F0u, movieOpen_landmark, g_movieOpenOriginal);           // xglMovieOpen
+        wrapSlot(0x002D11D8u, checkEncount_debug, g_checkEncountOriginal); // Check_Encount
         wrapSlot(0x0022CC08u, renderSyncMove_options, g_renderSyncMoveOriginal); // xglRenderSyncMove
         wrapSlot(0x002E7830u, createEffect_options, g_createEffectOriginal);     // sefCreateEffectCf2
         wrapSlot(0x002E7A18u, isFinishEffect_options, g_isFinishEffectOriginal); // sefIsFinishEffect
@@ -778,6 +930,7 @@ namespace
         {
             wrapSlot(0x00A09A80u, battleExec_options, g_battleExecOriginal);   // battleExec
             wrapSlot(0x00A1D2D0u, dataPadRead_options, g_dataPadReadOriginal); // dataPadRead
+            wrapSlot(0x00A12428u, calcHp_debug, g_calcHpOriginal);             // calcHp
         }
     }
 
