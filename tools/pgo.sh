@@ -12,14 +12,17 @@
 #   every runs/*/vu1_capture.bin, copies the .gcda files next to the matching
 #   objects in build-runtime and rebuilds there with PS2X_PGO_USE=ON.
 # Same output either way (check with tools/vu1_check.sh). Rerun after VU1/GS
-# code changes or regenerating the native blocks.
+# code changes or regenerating the native blocks or programs.
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export PATH="/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH"
 RECOMP="$ROOT/PS2Recomp"
 USE="$RECOMP/build-runtime"
 FLAGS="-msse4.2 -mavx2 -Wa,-mbig-obj"
-BLOCKS_GCDA="ps2xRuntime/CMakeFiles/%s.dir/src/runner/xenosaga_vu1_blocks.cpp.gcda"
+# Generated native VU1 code (vu1gen.py blocks, vu1prog.py programs) is built
+# into both targets; their profiles are shared.
+GENERATED="xenosaga_vu1_blocks xenosaga_vu1_programs"
+GEN_GCDA="ps2xRuntime/CMakeFiles/%s.dir/src/runner/%s.cpp.gcda"
 
 pgo_objects() # objects of the PGO sources in build-runtime
 {
@@ -42,9 +45,11 @@ if [ "${1:-}" = "game" ]; then
         --input "${PGO_INPUT:-$ROOT/port/inputs/newgame-to-tutorial.txt}" \
         --env XS_PGO_DUMP="${PGO_DUMP:-160}" > /dev/null 2>&1 || true
     grep -q "PGO profile written" "$ROOT/runs/pgo-train/xenosaga.log" || { echo "no profile written"; exit 1; }
-    src="$USE/$(printf "$BLOCKS_GCDA" ps2EntryRunner)"
-    dst="$USE/$(printf "$BLOCKS_GCDA" vu1_replay)"
-    [ -f "$src" ] && { mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; }
+    for g in $GENERATED; do
+        src="$USE/$(printf "$GEN_GCDA" ps2EntryRunner "$g")"
+        dst="$USE/$(printf "$GEN_GCDA" vu1_replay "$g")"
+        [ -f "$src" ] && { mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; }
+    done
 else
     GEN="$RECOMP/build-pgo"
     cmake -S "$RECOMP" -B "$GEN" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF \
@@ -60,9 +65,10 @@ else
     while IFS= read -r gcda; do
         rel="${gcda#$GEN/}"
         case "$rel" in
-        */vu1_replay.dir/src/runner/xenosaga_vu1_blocks.cpp.gcda)
+        */vu1_replay.dir/src/runner/xenosaga_vu1_*.cpp.gcda)
+            g=$(basename "$gcda" .cpp.gcda)
             for t in ps2EntryRunner vu1_replay; do
-                dst="$USE/$(printf "$BLOCKS_GCDA" "$t")"; mkdir -p "$(dirname "$dst")"; cp "$gcda" "$dst"
+                dst="$USE/$(printf "$GEN_GCDA" "$t" "$g")"; mkdir -p "$(dirname "$dst")"; cp "$gcda" "$dst"
             done ;;
         */ps2_runtime.dir/*)
             dst="$USE/$rel"; mkdir -p "$(dirname "$dst")"; cp "$gcda" "$dst" ;;

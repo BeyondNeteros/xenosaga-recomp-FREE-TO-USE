@@ -125,6 +125,10 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
 - VU1 native blocks: `python port/tools/vu1gen.py runs/vu1blocks/*.vbl "<install folder>/vu1_blocks.vbl"`
   regenerates the C++ for every VU1 block logged so far (see NOTES.md); then
   reconfigure and rebuild. Never commit the logs or the generated file.
+- VU1 native programs (whole calls, 2.1-2.4x faster than blocks):
+  `python port/tools/vu1prog.py runs/*/vu1_capture.bin --min-calls 50`, then
+  rebuild; check with `VU_REPLAY_NATIVE_CMP=1 vu1_replay <capture> 1` and
+  vu1_check.sh. `PS2X_VU1_PROGRAMS=0` disables them. Never commit the output.
 - PGO: `bash port/tools/pgo.sh` profiles the hot VU1/VIF1/GS code on the
   captures and rebuilds build-runtime with it (~11% faster VU1). Rerun it
   after VU1/GS changes or regenerating native blocks, then vu1_check.sh.

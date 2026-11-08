@@ -146,6 +146,11 @@ def main():
     if vu1_blocks.exists():
         shutil.copy2(vu1_blocks, RUNNER / vu1_blocks.name)
         print(f"vu1 blocks: {vu1_blocks.name}")
+    # Native VU1 programs from tools/vu1prog.py (generated from game code).
+    vu1_programs = RECOMP / "xenosaga_vu1_programs.cpp"
+    if vu1_programs.exists():
+        shutil.copy2(vu1_programs, RUNNER / vu1_programs.name)
+        print(f"vu1 programs: {vu1_programs.name}")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,42 @@
+## Native VU1 programs (2026-11-07 night, runs/native-on, last-on/off)
+
+`tools/vu1prog.py` compiles whole VU1 calls into C++ (recomp/xenosaga_vu1_programs.cpp,
+copied to the runner; derived from game code, never commit): from each entry pc
+seen in the captures (3D program resumed at 0x188 with its renderers, battle
+effect program at 0x170, the MSCAL setup entries) through every branch to the
+E-bit end, as gotos with *sequential* semantics (results land at once, MAC /
+status / CLIP / Q / P commit immediately, no cycle bookkeeping). Arithmetic is
+the interpreter's own (fastops fast paths, else execUpperGeneric/execLower with
+the queued entries committed on the spot: `VU1FastOps::nUpper`, `nLowerGeneric`).
+
+Exact because the generator proves, along every CFG path, that each Q/P/flag/
+CLIP read sees the newest writer (writer >= its latency in pairs earlier), the
+branch-VI quirk is honoured (backup), a pair's lower sees the registers before
+its upper (shadow), and no store follows an XGKICK before the end (the packet
+goes out at once). Jump targets: captured register values + constants/links in
+reachable code (iterated; the effect image carries stale 3D code). Unknown
+targets hand off to the interpreter at that pc. Programs are keyed on the entry
+pc + a hash of exactly the pairs compiled, so other microcode does not matter.
+The runtime hook (VU1Interpreter::run) only enters at a clean start.
+
+- `PS2X_VU1_PROGRAMS=0` turns them off (PS2X_VU1_NATIVE=0 still means blocks).
+- vu1_replay `VU_REPLAY_NATIVE_CMP=1`: per call native vs interpreter.
+  All 257 captures: 0 differences; vu1_check.sh 257/257.
+- vu1_replay per call vs interpreter + native blocks: 2.1-2.4x faster
+  (mv1 3.1 -> 1.3 us, battle-fast 1.7 -> 0.7, menu1 5.1 -> 2.4, run3 5.5 -> 3.0).
+- Game: Beyond's 21:32 session replayed (runs/inputs-last-2132.txt) diverged
+  between runs (save picked differently), so no same-scene A/B yet. Heavy
+  stretch off: 16.6-17 fps, VU1 87% host; on: 30 fps, VU1 23-25% (different
+  scene, paused). Woglinde field glimpse: VU1 6.5% on vs 58% off.
+- Not done: same-scene game A/B (Beyond will record new inputs); PGO retrain
+  (pgo.sh knows the new file); launcher build_from_iso has no captures, so it
+  cannot generate programs yet (needs a committed entry spec: pc + register
+  values, no game data); flag work could skip dead MAC/status updates.
+- Test-run lesson: restoring mc0 with `cp -r` resets file times and the load
+  screen then picks a different save; use `cp -rp`.
+- Also: `PS2X_VU1_STATS=<file>` writes every dynamic pc with its count (with
+  PS2X_VU1_STATIC=0 = program coverage); tools/vucap.py reads captures.
+
 
 ## Session 2026-11-07 evening: movie audio fixed, where the slowdowns are (runs/session-1830, mv1-4)
 
