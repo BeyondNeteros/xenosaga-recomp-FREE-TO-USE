@@ -38,6 +38,51 @@ The runtime hook (VU1Interpreter::run) only enters at a clean start.
   PS2X_VU1_STATIC=0 = program coverage); tools/vucap.py reads captures.
 
 
+### In-game A/B (2026-11-08)
+
+Beyond recorded `inputs/ab-scene.txt` (9.5 min: load save, field, cutscenes,
+ends at the hangar save point; card state = runs/mc0-backup-record, restore
+with `cp -rp`). Replays with `--env PS2X_VU1_PROGRAMS=0` (ab-off) and default
+(ab-on) both ended on the recording's final frame.
+
+- avg fps after boot: off 24.5, on 27.2 (recording itself 27.2); samples under
+  20 fps: off 27, on 8; worst 5 s: off 13.4, on 18.0; replay took ~615 s vs ~560 s.
+- per call in game: 0x8188 4.05 -> 2.66 us, 0x8170 1.75 -> 0.96 us; 0x85e8
+  (not compiled, no 3D-image captures with it) 2.4-2.6 both.
+- Still 18-19 fps stretches with VU1 ~80% of host time. In-game us/call for
+  0x8188 is ~2x the offline replay figure: look at hook/lookup overhead, cache
+  effects and kick/GS work counted inside VU1 time. The run captures were all
+  the battle-effect image (first 300 calls), so they don't cover the slow scenes.
+
+
+### Slow stretches after native programs (2026-11-08)
+
+- The 18-19 fps stretch at the end of ab-scene (hangar, 505-565 s) is GS-bound,
+  not VU1-bound: the VIF1/VU1 thread blocks in `AsyncQueue::push` when the GS
+  is 8 MB behind, and that wait is counted as VU1 time (the 5-cycle 0x8010
+  program showed 46-62 us/call). XS_PROFILE showed no thread at 100%: the EE,
+  VIF1/VU1 and GS threads mostly wait on each other and on the GPU.
+- `PS2X_VU_CAPTURE_FILES=N` keeps capturing each time the heartbeat arms
+  (vu1_capture_K.bin); runs/cap-slow has 40. With them vu1prog.py also
+  compiles 0x85e8 (13 programs); 310/310 captures match the reference.
+- GS capture of the hangar (runs/cap-slow/gs_capture.bin), GL at 3x/16:9:
+  per frame ~7.5 ms texture decoding (the game re-uploads textures every
+  frame; ~3.9M texels) and ~6.5 ms reading the displayed buffer back to local
+  memory at Present (waits for the GPU). gs_replay: `GS_REPLAY_UPSCALE=3w`,
+  `PS2X_GL_STATS=1` prints draws/readbacks/decoded cells with times.
+- Fixes: `GSMem::ReadTextureRect` decodes a cell with the format fixed at
+  compile time (same texels); upscaled Present no longer syncs the displayed
+  buffer (only when the native picture has to be shown) and reads the upscaled
+  picture through two persistent PBOs with fences, showing the previous
+  frame's (one frame of display delay). gs_replay hangar: 18.5 -> 13.7 ms per
+  frame (decoder; Present isn't in gs_replay), VRAM hash unchanged.
+  xs_frame.bmp now samples the upscaled picture down to native size.
+- XS_PROFILE also writes `tmod` (per thread and module) and `chain` lines
+  (first three exe frames under each sample, by stack unwinding).
+- Not verified in a same-scene replay: the replay drifts when host speed
+  changes load timing (prof-slow2 ended in the main menu). Replays need a
+  sync point (e.g. hold the script while the game loads) to be reliable.
+
 ## Session 2026-11-07 evening: movie audio fixed, where the slowdowns are (runs/session-1830, mv1-4)
 
 Movie audio (all PSS story movies were silent): the sceMpeg stub numbered the

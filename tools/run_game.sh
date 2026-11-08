@@ -24,7 +24,7 @@ done
 
 taskkill //IM XenosagaRecomp.exe //F >/dev/null 2>&1 || true
 cd "$GAME"
-rm -f xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin xs_spr.bin
+rm -f vu1_capture_*.bin gs_capture.bin xs_profile.txt xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin xs_spr.bin
 # PS2X_WINDOW_MONITOR=1 (env or --env) opens the window on the second
 # monitor, e.g. while Beyond is using the main one. Default: primary.
 export XS_NO_SOUND="${XS_NO_SOUND:-0}" XS_DISC_IMAGE="$DISC" PS2X_VU_CAPTURE=1 PS2X_GS_TRXLOG=1
@@ -47,7 +47,7 @@ wait $pid 2>/dev/null || true
 
 out="$ROOT/runs/$name"
 mkdir -p "$out"
-for f in xenosaga.log xs_frame.bmp xs_vram.bin vu1_capture.bin xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin xs_spr.bin; do
+for f in xenosaga.log xs_frame.bmp xs_vram.bin vu1_capture.bin vu1_capture_*.bin gs_capture.bin xs_profile.txt xs_trx_*.bin xs_vram_after_*.bin xs_texdump* xs_ram.bin xs_spr.bin; do
     [ -f "$f" ] && cp -p "$f" "$out/"
 done
 # XS_FRAME_KEEP=1 frame series: move it into the run folder.

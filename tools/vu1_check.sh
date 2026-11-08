@@ -16,8 +16,8 @@ mkdir -p "$TMP"
 FAST_ENV=("$@")
 [ ${#FAST_ENV[@]} -eq 0 ] && FAST_ENV=(PS2X_VU1_CHECK=1)
 fail=0
-for cap in "$ROOT"/runs/*/vu1_capture.bin; do
-    name=$(basename "$(dirname "$cap")")
+for cap in "$ROOT"/runs/*/vu1_capture*.bin; do
+    name=$(basename "$(dirname "$cap")")/$(basename "$cap" .bin)
     ref=$(env VU_REPLAY_NOGS=1 VU_REPLAY_GIFDUMP="$TMP/ref.bin" "$REF" "$cap" 1 2>/dev/null)
     new=$(env "${FAST_ENV[@]}" VU_REPLAY_NOGS=1 VU_REPLAY_GIFDUMP="$TMP/new.bin" "$EXE" "$cap" 1 2>/dev/null)
     rc=$(grep checksum <<<"$ref"); nc=$(grep checksum <<<"$new")

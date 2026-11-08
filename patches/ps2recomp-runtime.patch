@@ -2752,6 +2752,20 @@ index 836a3ff..00bed0f 100644
  
      explicit operator bool() const
      {
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+index c784ff7..c7b7fba 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+@@ -542,6 +542,9 @@ namespace GSMem
+ 
+     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
+     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
++    // A w x h rectangle of texels from (x0, y0), row by row (same values as ReadTexture).
++    void ReadTextureRect(const u8* data, u32 psm, u32 bp, u32 bw, u32 x0, u32 y0, u32 w, u32 h, u32* out);
++    void ReadTextureRect(const u8* data, u32 psm, u32 bp, u32 bw, u32 x0, u32 y0, u32 w, u32 h, u8* out);
+ 
+ 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+ 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 diff --git a/ps2xRuntime/include/runtime/ps2_ipu.h b/ps2xRuntime/include/runtime/ps2_ipu.h
 new file mode 100644
 index 0000000..7849c0a
@@ -7046,10 +7060,10 @@ index 9281d5f..4710e2b 100644
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
 new file mode 100644
-index 0000000..c72b24b
+index 0000000..01febea
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gl_backend.cpp
-@@ -0,0 +1,1643 @@
+@@ -0,0 +1,1729 @@
 +// GPU GS backend (OpenGL 4.5 + ARB_fragment_shader_interlock, Windows).
 +//
 +// The GPU rasterizes; everything the GS does per pixel (texture lookup, alpha
@@ -7063,6 +7077,7 @@ index 0000000..c72b24b
 +// on the GPU and written back to local memory only when something reads them
 +// (presentation, a transfer, a texture that isn't the target itself), and
 +// reloaded when something else writes their pages.
++#include <chrono>
 +#include "runtime/gs/gs_gl_backend.h"
 +#include "runtime/gs/gs_cpu_backend.h"
 +#include "runtime/gs/ps2_gs_memory.h"
@@ -7131,7 +7146,9 @@ index 0000000..c72b24b
 +    X(PFNGLDELETESYNCPROC, glDeleteSync)                                                                 \
 +    X(PFNGLGETSTRINGIPROC, glGetStringi)                                                                 \
 +    X(PFNGLNAMEDFRAMEBUFFERTEXTUREPROC, glNamedFramebufferTexture)                                       \
-+    X(PFNGLBLITNAMEDFRAMEBUFFERPROC, glBlitNamedFramebuffer)
++    X(PFNGLBLITNAMEDFRAMEBUFFERPROC, glBlitNamedFramebuffer)                                             \
++    X(PFNGLBINDBUFFERPROC, glBindBuffer)                                                                 \
++    X(PFNGLDELETEBUFFERSPROC, glDeleteBuffers)
 +
 +#define X(type, name) type p_##name = nullptr;
 +    XS_GL_FUNCS(X)
@@ -7481,7 +7498,15 @@ index 0000000..c72b24b
 +{
 +public:
 +    GSGlBackend() = default;
-+    ~GSGlBackend() override = default;
++    ~GSGlBackend() override
++    {
++        // PS2X_GL_STATS=1: where the GS thread's time went (gs_replay prints it per pass).
++        if (std::getenv("PS2X_GL_STATS"))
++            std::fprintf(stderr, "[gs-gl] stats: draws %llu, readbacks %llu (%.1f ms, %llu px), decoded cells %llu (%.1f ms, %llu texels)\n",
++                         (unsigned long long)m_draws, (unsigned long long)m_syncs, m_syncNs / 1e6,
++                         (unsigned long long)m_syncPixels, (unsigned long long)m_decodedCells, m_decodeNs / 1e6,
++                         (unsigned long long)m_decodedTexels);
++    }
 +
 +    bool create();
 +
@@ -7527,25 +7552,40 @@ index 0000000..c72b24b
 +    }
 +    PresentationFrame Present(const GSPresentationRequest &request) override
 +    {
-+        if (onGlThread())
++        const bool gl = onGlThread();
++        if (gl)
 +        {
-+            // Only the buffers on screen: reading the one being drawn stalls
-+            // the GPU for nothing.
 +            applyRequestedResolution();
 +            flushDraws();
++        }
++        const bool upscaled = kScaleX > 1 || kScaleY > 1;
++        auto syncDisplayed = [&] {
++            // Only the buffers on screen: reading the one being drawn stalls
++            // the GPU for nothing.
 +            const uint32_t fbp1 = static_cast<uint32_t>(request.dispfb1 & 0x1FFu);
 +            const uint32_t fbp2 = static_cast<uint32_t>(request.dispfb2 & 0x1FFu);
 +            for (auto &[key, t] : m_targets)
 +                if (!t.isDepth && (t.page == fbp1 || t.page == fbp2))
 +                    syncToMemory(t);
-+        }
++        };
++        // Upscaled: the window shows the GPU's picture, so the displayed
++        // buffer is not copied back to local memory (that waited for the GPU
++        // every frame). It still is when something reads it, or when the
++        // upscaled picture can't be used and the native one is shown.
++        if (gl && !upscaled)
++            syncDisplayed();
 +        PresentationFrame frame = m_cpu.Present(request);
-+        if ((kScaleX > 1 || kScaleY > 1) && frame)
++        if (upscaled && frame)
 +        {
-+            if (onGlThread())
++            if (gl)
 +                readHiresFrame(request, frame);
 +            else
 +                hiresSkip("not on the GL thread");
++            if (gl && frame.hiresWidth == 0u)
++            {
++                syncDisplayed();
++                frame = m_cpu.Present(request);
++            }
 +        }
 +        return frame;
 +    }
@@ -7617,6 +7657,20 @@ index 0000000..c72b24b
 +    }
 +
 +    GSCpuBackend m_cpu;
++    // Upscaled pictures are read through two pixel buffers: each present
++    // starts reading the current frame and hands over the previous one, so
++    // the GS thread doesn't wait for the GPU (one frame of display delay).
++    struct HiresSlot
++    {
++        GLuint pbo = 0;
++        const uint8_t *map = nullptr;
++        size_t bytes = 0;
++        GLsync fence = nullptr;
++        uint32_t w = 0, h = 0;
++        bool valid = false;
++    };
++    HiresSlot m_hires[2];
++    int m_hiresNext = 0;
 +    GLuint m_stagingTex = 0, m_readFbo = 0, m_drawFbo = 0;
 +    int m_snapW = 0, m_snapH = 0; // m_snapshotTex size (scaled pixels)
 +    uint8_t *m_vram = nullptr;
@@ -7655,6 +7709,7 @@ index 0000000..c72b24b
 +    GSTransferCommand m_transferCommand{};
 +    bool m_transferWrites = false;
 +    uint64_t m_draws = 0, m_syncs = 0;
++    uint64_t m_syncNs = 0, m_syncPixels = 0, m_decodedCells = 0, m_decodeNs = 0, m_decodedTexels = 0;
 +};
 +
 +// --- context ---------------------------------------------------------------
@@ -8023,6 +8078,8 @@ index 0000000..c72b24b
 +    if (w <= 0 || h <= 0)
 +        return;
 +    ++m_syncs;
++    const auto syncStart = std::chrono::steady_clock::now();
++    m_syncPixels += static_cast<uint64_t>(w) * h;
 +    p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
 +    m_readback.resize(static_cast<size_t>(w) * h);
 +    GLuint source = t.tex;
@@ -8055,6 +8112,7 @@ index 0000000..c72b24b
 +        }
 +    }
 +    markPages(block, t.isDepth ? static_cast<uint8_t>(GS_PSM_Z32) : t.psm, t.fbw, t.dx0, t.dy0, w, h);
++    m_syncNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - syncStart).count());
 +}
 +
 +void GSGlBackend::syncAllToMemory()
@@ -8237,34 +8295,32 @@ index 0000000..c72b24b
 +            if (seen != ~0ull || !t.valid)
 +                flushDraws(); // queued draws use the old texels
 +            seen = version;
++            const auto decodeStart = std::chrono::steady_clock::now();
 +            const uint32_t x0 = col * t.cellW, y0 = row * t.cellH;
 +            const uint32_t w = std::min(t.cellW, width - x0), h = std::min(t.cellH, height - y0);
++            ++m_decodedCells;
++            m_decodedTexels += static_cast<uint64_t>(w) * h;
 +            if (indexed)
 +            {
 +                std::vector<uint8_t> &out = m_decode8;
 +                out.resize(static_cast<size_t>(w) * h);
-+                uint8_t *o = out.data();
-+                for (uint32_t y = y0; y < y0 + h; ++y)
-+                    for (uint32_t x = x0; x < x0 + w; ++x)
-+                        *o++ = static_cast<uint8_t>(GSMem::ReadTexture(m_pageCache, m_vram, tex.psm, tex.tbp0, tex.tbw, x, y));
++                GSMem::ReadTextureRect(m_vram, tex.psm, tex.tbp0, tex.tbw, x0, y0, w, h, out.data());
 +                p_glTextureSubImage2D(t.tex, 0, x0, y0, w, h, GL_RED_INTEGER, GL_UNSIGNED_BYTE, out.data());
 +            }
 +            else
 +            {
 +                m_decode.resize(static_cast<size_t>(w) * h);
 +                uint32_t *o = m_decode.data();
-+                for (uint32_t y = y0; y < y0 + h; ++y)
-+                    for (uint32_t x = x0; x < x0 + w; ++x)
-+                    {
-+                        uint32_t texel = GSMem::ReadTexture(m_pageCache, m_vram, tex.psm, tex.tbp0, tex.tbw, x, y);
-+                        if (tex.psm == GS_PSM_CT16 || tex.psm == GS_PSM_CT16S)
-+                            texel = texaExpand(state.texa, tex.psm, expand5551(texel));
-+                        else if (tex.psm != GS_PSM_CT32)
-+                            texel = texaExpand(state.texa, tex.psm, texel);
-+                        *o++ = texel;
-+                    }
++                GSMem::ReadTextureRect(m_vram, tex.psm, tex.tbp0, tex.tbw, x0, y0, w, h, o);
++                if (tex.psm == GS_PSM_CT16 || tex.psm == GS_PSM_CT16S)
++                    for (size_t i = 0; i < m_decode.size(); ++i)
++                        o[i] = texaExpand(state.texa, tex.psm, expand5551(o[i]));
++                else if (tex.psm != GS_PSM_CT32)
++                    for (size_t i = 0; i < m_decode.size(); ++i)
++                        o[i] = texaExpand(state.texa, tex.psm, o[i]);
 +                p_glTextureSubImage2D(t.tex, 0, x0, y0, w, h, GL_RED_INTEGER, GL_UNSIGNED_INT, m_decode.data());
 +            }
++            m_decodeNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - decodeStart).count());
 +        }
 +    t.valid = true;
 +    return t;
@@ -8646,13 +8702,57 @@ index 0000000..c72b24b
 +        return hiresSkip("outside the target");
 +    ensureRows(t, dby + h);
 +    const int sw = w * kScaleX, sh = h * kScaleY;
-+    frame.hiresPixels.resize(static_cast<size_t>(sw) * sh * 4u);
-+    p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
++    const size_t bytes = static_cast<size_t>(sw) * sh * 4u;
++
++    // Start reading this frame into the next slot.
++    HiresSlot &cur = m_hires[m_hiresNext];
++    if (cur.fence)
++    {
++        p_glClientWaitSync(cur.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 5000000000ull);
++        p_glDeleteSync(cur.fence);
++        cur.fence = nullptr;
++    }
++    if (cur.bytes < bytes)
++    {
++        if (cur.pbo)
++            p_glDeleteBuffers(1, &cur.pbo);
++        p_glCreateBuffers(1, &cur.pbo);
++        const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
++        p_glNamedBufferStorage(cur.pbo, static_cast<GLsizeiptr>(bytes), nullptr, flags | GL_CLIENT_STORAGE_BIT);
++        cur.map = static_cast<const uint8_t *>(p_glMapNamedBufferRange(cur.pbo, 0, static_cast<GLsizeiptr>(bytes), flags));
++        cur.bytes = cur.map ? bytes : 0;
++        if (!cur.map)
++            return hiresSkip("pixel buffer");
++    }
++    p_glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT);
++    p_glBindBuffer(GL_PIXEL_PACK_BUFFER, cur.pbo);
 +    p_glGetTextureSubImage(t.tex, 0, dbx * kScaleX, dby * kScaleY, 0, sw, sh, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
-+                           static_cast<GLsizei>(frame.hiresPixels.size()), frame.hiresPixels.data());
++                           static_cast<GLsizei>(bytes), nullptr);
++    p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    cur.fence = p_glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    cur.w = static_cast<uint32_t>(sw);
++    cur.h = static_cast<uint32_t>(sh);
++    cur.valid = true;
++
++    // Show the previous frame's picture (done by now); the first frame, or
++    // after a size change, waits for this one instead.
++    HiresSlot &prev = m_hires[m_hiresNext ^ 1];
++    HiresSlot &use = (prev.valid && prev.w == cur.w && prev.h == cur.h) ? prev : cur;
++    if (use.fence)
++    {
++        p_glClientWaitSync(use.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 5000000000ull);
++        p_glDeleteSync(use.fence);
++        use.fence = nullptr;
++    }
++    if (&use == &prev)
++        prev.valid = false;
++    m_hiresNext ^= 1;
++
++    frame.hiresPixels.resize(bytes);
++    const uint32_t *in = reinterpret_cast<const uint32_t *>(use.map);
 +    uint32_t *px = reinterpret_cast<uint32_t *>(frame.hiresPixels.data());
 +    for (size_t i = 0, n = static_cast<size_t>(sw) * sh; i < n; ++i)
-+        px[i] |= 0xFF000000u;
++        px[i] = in[i] | 0xFF000000u;
 +    frame.hiresWidth = static_cast<uint32_t>(sw);
 +    frame.hiresHeight = static_cast<uint32_t>(sh);
 +}
@@ -8718,6 +8818,64 @@ index c0507c7..0ad96a5 100644
      std::stable_sort(m_queue.begin(), m_queue.end(),
                       [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                       {
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+index a8f9fa8..0331214 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+@@ -255,6 +255,53 @@ namespace GSMem
+         }
+     }
+ 
++    namespace
++    {
++        // One texture rectangle with the format fixed at compile time: same
++        // texels as ReadTexture, without its per-texel dispatch.
++        template <PixelStorageMode psm, typename OutT, typename TableT>
++        void readRect(const TableT& table, const u8* data, u32 bp, u32 bw, u32 x0, u32 y0, u32 w, u32 h, OutT* out)
++        {
++            for (u32 y = y0; y < y0 + h; ++y)
++                for (u32 x = x0; x < x0 + w; ++x)
++                    *out++ = static_cast<OutT>(PixelStorageTraits<psm>::Read(table, data, bp, bw, x, y));
++        }
++
++        template <typename OutT>
++        void readRectAny(const u8* data, u32 psm, u32 bp, u32 bw, u32 x0, u32 y0, u32 w, u32 h, OutT* out)
++        {
++            switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
++            {
++            case C32: return readRect<C32>(PageTableC32, data, bp, bw, x0, y0, w, h, out);
++            case C24: return readRect<C24>(PageTableC32, data, bp, bw, x0, y0, w, h, out);
++            case C16: return readRect<C16>(PageTableC16, data, bp, bw, x0, y0, w, h, out);
++            case C16S: return readRect<C16S>(PageTableC16S, data, bp, bw, x0, y0, w, h, out);
++            case P8: return readRect<P8>(PageTableP8, data, bp, bw, x0, y0, w, h, out);
++            case P4: return readRect<P4>(PageTableP4, data, bp, bw, x0, y0, w, h, out);
++            case P8H: return readRect<P8H>(PageTableC32, data, bp, bw, x0, y0, w, h, out);
++            case P4HL: return readRect<P4HL>(PageTableC32, data, bp, bw, x0, y0, w, h, out);
++            case P4HH: return readRect<P4HH>(PageTableC32, data, bp, bw, x0, y0, w, h, out);
++            case Z32: return readRect<Z32>(PageTableZ32, data, bp, bw, x0, y0, w, h, out);
++            case Z24: return readRect<Z24>(PageTableZ32, data, bp, bw, x0, y0, w, h, out);
++            case Z16: return readRect<Z16>(PageTableZ16, data, bp, bw, x0, y0, w, h, out);
++            case Z16S: return readRect<Z16S>(PageTableZ16S, data, bp, bw, x0, y0, w, h, out);
++            default:
++                for (u32 i = 0; i < w * h; ++i)
++                    out[i] = 0;
++            }
++        }
++    }
++
++    void ReadTextureRect(const u8* data, u32 psm, u32 bp, u32 bw, u32 x0, u32 y0, u32 w, u32 h, u32* out)
++    {
++        readRectAny(data, psm, bp, bw, x0, y0, w, h, out);
++    }
++
++    void ReadTextureRect(const u8* data, u32 psm, u32 bp, u32 bw, u32 x0, u32 y0, u32 w, u32 h, u8* out)
++    {
++        readRectAny(data, psm, bp, bw, x0, y0, w, h, out);
++    }
++
+     void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
+     {
+         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
 diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
 index 8d46e03..8d750b7 100644
 --- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
@@ -10531,7 +10689,7 @@ index 8590f14..36de95f 100644
      return true;
  }
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..2c9ee9e 100644
+index 45cb9d2..af32375 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,7 @@
@@ -10558,7 +10716,7 @@ index 45cb9d2..2c9ee9e 100644
  
  #include <iostream>
  #include <stdexcept>
-@@ -26,6 +32,110 @@
+@@ -26,6 +32,122 @@
  #include <thread>
  #include <unordered_map>
  #include <sstream>
@@ -10583,16 +10741,26 @@ index 45cb9d2..2c9ee9e 100644
 +        if (!enabled)
 +            return;
 +        static const uint64_t skip = [] { const char *v = std::getenv("PS2X_VU_CAPTURE_SKIP"); return v ? std::strtoull(v, nullptr, 10) : ~0ull; }();
++        // PS2X_VU_CAPTURE_FILES=N: keep capturing each time the heartbeat
++        // arms again, up to N files (vu1_capture.bin, vu1_capture_1.bin, ...).
++        static const uint32_t maxFiles = [] { const char *v = std::getenv("PS2X_VU_CAPTURE_FILES"); return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 1u; }();
 +        static uint64_t calls = 0;
 +        static uint32_t recorded = 0;
++        static uint32_t files = 0;
 +        static std::ofstream out;
-+        if (recorded >= 300u)
-+            return;
-+        if (++calls <= skip && (skip != ~0ull || !g_vu1CaptureArmed.load(std::memory_order_relaxed)))
-+            return;
 +        if (!out.is_open())
 +        {
-+            out.open("vu1_capture.bin", std::ios::binary);
++            if (files >= maxFiles)
++                return;
++            if (skip != ~0ull && files == 0)
++            {
++                if (++calls <= skip)
++                    return;
++            }
++            else if (!g_vu1CaptureArmed.exchange(false, std::memory_order_relaxed))
++                return;
++            const std::string name = files == 0 ? std::string("vu1_capture.bin") : "vu1_capture_" + std::to_string(files) + ".bin";
++            out.open(name, std::ios::binary);
 +            const uint32_t header[4] = {0x31555658u /* XVU1 */, 1u, static_cast<uint32_t>(sizeof(VU1State)), 0u};
 +            out.write(reinterpret_cast<const char *>(header), sizeof(header));
 +        }
@@ -10604,7 +10772,9 @@ index 45cb9d2..2c9ee9e 100644
 +        if (++recorded == 300u)
 +        {
 +            out.close();
-+            std::printf("[vu-capture] wrote 300 VU1 calls to vu1_capture.bin\n");
++            std::printf("[vu-capture] wrote 300 VU1 calls to capture file %u\n", files);
++            ++files;
++            recorded = 0;
 +        }
 +    }
 +
@@ -10669,7 +10839,7 @@ index 45cb9d2..2c9ee9e 100644
  
  namespace ps2_stubs
  {
-@@ -49,6 +159,798 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
+@@ -49,6 +171,798 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
  static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
  static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
  #endif
@@ -11468,7 +11638,7 @@ index 45cb9d2..2c9ee9e 100644
  struct ElfHeader
  {
      uint32_t magic;
-@@ -373,6 +1275,65 @@ namespace
+@@ -373,6 +1287,65 @@ namespace
      }
  }
  
@@ -11534,7 +11704,7 @@ index 45cb9d2..2c9ee9e 100644
  static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
  {
      static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-@@ -537,6 +1498,7 @@ PS2Runtime::~PS2Runtime()
+@@ -537,6 +1510,7 @@ PS2Runtime::~PS2Runtime()
  #else
          if (IsAudioDeviceReady())
          {
@@ -11542,7 +11712,7 @@ index 45cb9d2..2c9ee9e 100644
              CloseAudioDevice();
              m_audioBackend.setAudioReady(false);
          }
-@@ -610,6 +1572,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+@@ -610,6 +1584,12 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
      m_iopSubsystem->runEeCycles(eeCycles);
  }
  
@@ -11555,7 +11725,7 @@ index 45cb9d2..2c9ee9e 100644
  void PS2Runtime::resetIop()
  {
      m_iopSubsystem->reset();
-@@ -661,6 +1629,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -661,6 +1641,8 @@ bool PS2Runtime::syncCoreSubsystems()
  
      if (m_boundRdram == rdram && m_boundGSVram == gsVram)
      {
@@ -11564,7 +11734,7 @@ index 45cb9d2..2c9ee9e 100644
          return true;
      }
  
-@@ -668,42 +1638,103 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +1650,103 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -11687,7 +11857,7 @@ index 45cb9d2..2c9ee9e 100644
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,12 +1762,57 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,12 +1774,57 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -11747,7 +11917,7 @@ index 45cb9d2..2c9ee9e 100644
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -1134,6 +2210,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1134,6 +2222,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -11755,7 +11925,7 @@ index 45cb9d2..2c9ee9e 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -1358,6 +2435,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1358,6 +2447,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      // this charge bounds straight-line call chains that have no local loop.
      if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
      {
@@ -11763,7 +11933,7 @@ index 45cb9d2..2c9ee9e 100644
          return false;
      }
  
-@@ -1403,6 +2481,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,6 +2493,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -11778,7 +11948,7 @@ index 45cb9d2..2c9ee9e 100644
      if (ctx->pc == entryPc)
      {
          ctx->pc = fallthroughPc;
-@@ -1411,6 +2497,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1411,6 +2509,43 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      return ctx->pc == fallthroughPc;
  }
  
@@ -11822,7 +11992,7 @@ index 45cb9d2..2c9ee9e 100644
  void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
  {
      if (exception == EXCEPTION_INTEGER_OVERFLOW)
-@@ -2211,7 +3334,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+@@ -2211,7 +3346,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
  
  bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
  {
@@ -11834,7 +12004,7 @@ index 45cb9d2..2c9ee9e 100644
  }
  
  [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
-@@ -2423,23 +3549,54 @@ void PS2Runtime::run()
+@@ -2423,23 +3561,54 @@ void PS2Runtime::run()
          uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -11903,7 +12073,7 @@ index 45cb9d2..2c9ee9e 100644
          if (m_debugUiInitialized && m_debugUiDrawCallback)
          {
              m_debugUiDrawCallback(*this, m_debugUiUserData);
-@@ -2465,6 +3622,7 @@ void PS2Runtime::run()
+@@ -2465,6 +3634,7 @@ void PS2Runtime::run()
          m_debugUiShutdownCallback(*this, m_debugUiUserData);
          m_debugUiInitialized = false;
      }
@@ -13978,10 +14148,10 @@ index 6974254..5e30791 100644
              applyDest(vtDest, result, dest);
 diff --git a/ps2xRuntime/tools/gs_replay.cpp b/ps2xRuntime/tools/gs_replay.cpp
 new file mode 100644
-index 0000000..3ae36b8
+index 0000000..8669dc5
 --- /dev/null
 +++ b/ps2xRuntime/tools/gs_replay.cpp
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,345 @@
 +// Replays a GS capture recorded with PS2X_GS_CAPTURE=seconds,frames
 +// (gs_capture.bin) through the runtime's GS frontend and CPU backend, for
 +// profiling and for checking that renderer optimizations don't change a pixel.
@@ -14104,6 +14274,8 @@ index 0000000..3ae36b8
 +    save("diff", d);
 +}
 +
++void ps2x_glSetResolution(int upscale, bool widescreen);
++
 +int main(int argc, char **argv)
 +{
 +    if (argc < 2)
@@ -14200,8 +14372,14 @@ index 0000000..3ae36b8
 +        GS gs;
 +        gs.init(vram, vramSize, &memory.gs());
 +        if (std::getenv("GS_REPLAY_GL"))
++        {
++            // GS_REPLAY_UPSCALE=N[w]: internal resolution like the game's
++            // settings (N = 1-4, trailing w = 16:9).
++            if (const char *up = std::getenv("GS_REPLAY_UPSCALE"))
++                ps2x_glSetResolution(std::atoi(up), std::strchr(up, 'w') != nullptr);
 +            if (auto gl = ps2x_createGlBackend())
 +                gs.setRasterBackend(std::move(gl));
++        }
 +        std::memcpy(vram, vramStart.data(), vramSize);
 +        for (const auto &r : regs)
 +            if (isPreludeSafe(r.first))
@@ -14302,6 +14480,19 @@ index 0000000..3ae36b8
 +                    std::fprintf(f, "%llx %u\n", static_cast<unsigned long long>(kv.first - exeBase), kv.second);
 +            std::fclose(f);
 +        }
++        // Samples outside the exe, by module (GL driver, system DLLs).
++        std::map<std::string, unsigned> modules;
++        for (const auto &kv : counts)
++        {
++            HMODULE mod = nullptr;
++            char name[MAX_PATH] = "?";
++            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                   reinterpret_cast<LPCSTR>(kv.first), &mod) && mod)
++                GetModuleFileNameA(mod, name, MAX_PATH);
++            modules[name] += kv.second;
++        }
++        for (const auto &kv : modules)
++            std::printf("samples in %s: %u\n", kv.first.c_str(), kv.second);
 +    }
 +#endif
 +    return 0;

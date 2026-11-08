@@ -15,6 +15,7 @@ extern "C" void __gcov_dump(void);
 #include "ps2x/iop/iop_types.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -94,6 +95,11 @@ namespace
         std::map<uint64_t, unsigned> pcs;
         std::map<DWORD, unsigned> perThread;
         std::map<std::pair<DWORD, uint64_t>, unsigned> threadPcs;
+        std::map<std::pair<DWORD, std::array<uint64_t, 3>>, unsigned> chains;
+        MODULEINFO exeInfo{};
+        GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(nullptr), &exeInfo, sizeof(exeInfo));
+        const uint64_t exeLo = reinterpret_cast<uint64_t>(exeInfo.lpBaseOfDll);
+        const uint64_t exeHi = exeLo + exeInfo.SizeOfImage;
         timeBeginPeriod(1);
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         for (unsigned tick = 0; std::chrono::steady_clock::now() < end; ++tick)
@@ -115,12 +121,34 @@ namespace
                 if (SuspendThread(t.second) == static_cast<DWORD>(-1))
                     continue;
                 CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_CONTROL;
+                ctx.ContextFlags = CONTEXT_FULL;
                 if (GetThreadContext(t.second, &ctx))
                 {
                     ++pcs[ctx.Rip];
                     ++threadPcs[{t.first, ctx.Rip}];
                     ++perThread[t.first];
+                    // The first three frames inside the exe (walking out of
+                    // waits in system DLLs and the driver): who is waiting.
+                    CONTEXT walk = ctx;
+                    std::array<uint64_t, 3> chain{};
+                    unsigned found = 0;
+                    for (int depth = 0; depth < 48 && found < chain.size() && walk.Rip; ++depth)
+                    {
+                        if (walk.Rip >= exeLo && walk.Rip < exeHi)
+                            chain[found++] = walk.Rip - exeLo;
+                        DWORD64 imageBase = 0;
+                        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(walk.Rip, &imageBase, nullptr);
+                        if (!fe)
+                        {
+                            walk.Rip = *reinterpret_cast<const DWORD64 *>(walk.Rsp);
+                            walk.Rsp += 8;
+                            continue;
+                        }
+                        PVOID handlerData = nullptr;
+                        DWORD64 establisher = 0;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, walk.Rip, fe, &walk, &handlerData, &establisher, nullptr);
+                    }
+                    ++chains[{t.first, chain}];
                 }
                 ResumeThread(t.second);
             }
@@ -131,6 +159,7 @@ namespace
         const uint64_t exeBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
         std::map<std::string, unsigned> modules;
         std::map<uint64_t, unsigned> exeOffsets;
+        std::map<uint64_t, std::string> modOf;
         for (const auto &kv : pcs)
         {
             HMODULE mod = nullptr;
@@ -142,7 +171,12 @@ namespace
             modules[name] += kv.second;
             if (reinterpret_cast<uint64_t>(mod) == exeBase)
                 exeOffsets[kv.first - exeBase] += kv.second;
+            modOf[kv.first] = name;
         }
+        // Per thread and module: "tmod <thread> <count> <module>".
+        std::map<std::pair<DWORD, std::string>, unsigned> threadModules;
+        for (const auto &kv : threadPcs)
+            threadModules[{kv.first.first, modOf[kv.first.second]}] += kv.second;
         const std::filesystem::path out = PS2Runtime::getIoPaths().elfDirectory / "xs_profile.txt";
         if (FILE *f = std::fopen(out.string().c_str(), "w"))
         {
@@ -150,6 +184,14 @@ namespace
                 std::fprintf(f, "thread %lu %u\n", static_cast<unsigned long>(kv.first), kv.second);
             for (const auto &kv : modules)
                 std::fprintf(f, "module %u %s\n", kv.second, kv.first.c_str());
+            // "chain <thread> <count> <exe offset> <caller> <caller's caller>".
+            for (const auto &kv : chains)
+                std::fprintf(f, "chain %lu %u %llx %llx %llx\n", static_cast<unsigned long>(kv.first.first), kv.second,
+                             static_cast<unsigned long long>(kv.first.second[0]), static_cast<unsigned long long>(kv.first.second[1]),
+                             static_cast<unsigned long long>(kv.first.second[2]));
+            for (const auto &kv : threadModules)
+                std::fprintf(f, "tmod %lu %u %s\n", static_cast<unsigned long>(kv.first.first), kv.second,
+                             kv.first.second.c_str());
             for (const auto &kv : exeOffsets)
                 std::fprintf(f, "exe %llx %u\n", static_cast<unsigned long long>(kv.first), kv.second);
             // Per thread, exe samples only: "texe <thread> <offset> <count>".
@@ -309,6 +351,17 @@ namespace
                                : runtime.gs().copyLatchedHostPresentationFrame(rgba, w, h, nullptr, nullptr, nullptr);
         if (!got || !w || !h)
             return false;
+        // Upscaled GPU rendering: the native picture isn't copied back every
+        // frame, so take the upscaled one at native size (nearest pixel).
+        std::vector<uint8_t> hi;
+        uint32_t hw = 0, hh = 0;
+        if (!hires && runtime.gs().copyLatchedHiresFrame(hi, hw, hh) && hw >= w && hh >= h)
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                {
+                    const uint32_t sx = (x * hw + hw / 2u) / w, sy = (y * hh + hh / 2u) / h;
+                    std::memcpy(&rgba[(size_t(y) * w + x) * 4u], &hi[(size_t(sy) * hw + sx) * 4u], 4u);
+                }
         const uint32_t rowBytes = w * 3u, pad = (4u - rowBytes % 4u) % 4u;
         const uint32_t dataSize = (rowBytes + pad) * h;
         std::ofstream out(path, std::ios::binary);
