@@ -1,4 +1,42 @@
 
+## Session 2026-11-07 evening: movie audio fixed, where the slowdowns are (runs/session-1830, mv1-4)
+
+Movie audio (all PSS story movies were silent): the sceMpeg stub numbered the
+stream types PCM 1 / ADPCM 2; libmpeg is M2V 0, IPU 1, PCM 2, ADPCM 3 (the
+decomp's xgl_1.c registers its audio callback as 3). No audio callback ever
+ran, so xglMpeg2Play started the movie's audio stream with sample rate 0 and
+fed it nothing. Fixed in Stubs/MPEG.cpp; stream callbacks also run inline in
+sceMpegDemuxPss now (were queued to run later, with a pointer into the ring
+that could already hold newer data), with the audio payload copied to a
+scratch buffer and refused packets (callback returns 0) retried in order.
+Checked by recording the prologue (`PS2X_SPU2_WAV`): sound throughout,
+"[movie] audio header ready at the first frame: 48000 Hz". The 48 kHz
+fallback in the port (xglMpeg2Play hook) stays as a safety net.
+Note: a table hook only sees the first part of a function that sleeps (the
+runtime resumes a waiting guest thread at its saved pc, not through the hook).
+
+Landmarks: `[landmark] <s> file|movie|ipu-movie|overlay <name>` log lines
+(port/src/xenosaga_overlays.cpp) give a timeline of a session. Debug toggles
+`[debug] one_hit_kill`, `no_encounters` (F1 menu); use one-hit kills in test
+runs that hit battles.
+
+Beyond's session (runs/session-1830/xenosaga.log): every frame drop and every
+"voices ahead" stretch is VU1 at 78-85% host time with the EE waiting:
+- story cutscenes SCE01003B1 (15-20 fps), SCE01004 (17), SCE01007A1/A3 (16-19),
+  SCE01007B (12), SCE01011 (16-23);
+- Woglinde field ST0010 (17-21 fps in plain play; VU1 program 0x8438 appears);
+- battles 25-29 fps with audio catch-up/hold swinging +-600 ms.
+The IOP keeps real time (by design, see the audio section), so voices run
+1-2.5 s ahead of the animation in those cutscenes.
+
+VU1 cost: vu1_replay on captures = 5.2-7.6 ns host per VU cycle (real VU1 is
+6.7), i.e. ~1x real time; the heavy scenes need ~1.75x. Profile of bplay2
+(main 3D program 0x8188): ~65% in native blocks, ~30% cycle-accurate
+bookkeeping (run loop 12%, finishStaticBlock 9%, commitFlagsUpTo 6%).
+Trimming bookkeeping is worth 10-15% at most. The real fix is native
+(high-level) versions of programs 0x8188/0x8170 (~90% of VU1 time in those
+scenes), written from the microcode with the decomp as the map.
+
 ## Internal resolution upscaling (2026-11-07, runs/up3, up4)
 
 `settings.ini` `[display] upscale = 1-4` (default 3; env `PS2X_UPSCALE` overrides
