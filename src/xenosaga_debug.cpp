@@ -5,6 +5,7 @@
 // symbol tables in the user's own SLUS_204.69 and OVnn.OVL files.
 
 #include "ps2_runtime.h"
+#include "ps2_recompiled_functions.h"
 #ifdef PS2X_PGO_GENERATE
 extern "C" void __gcov_dump(void);
 #endif
@@ -120,17 +121,18 @@ namespace
             {
                 if (SuspendThread(t.second) == static_cast<DWORD>(-1))
                     continue;
+                // Nothing that allocates while the thread is suspended: it
+                // may hold the heap lock (that deadlocked the game once).
                 CONTEXT ctx{};
                 ctx.ContextFlags = CONTEXT_FULL;
+                bool got = false;
+                std::array<uint64_t, 3> chain{};
                 if (GetThreadContext(t.second, &ctx))
                 {
-                    ++pcs[ctx.Rip];
-                    ++threadPcs[{t.first, ctx.Rip}];
-                    ++perThread[t.first];
+                    got = true;
                     // The first three frames inside the exe (walking out of
                     // waits in system DLLs and the driver): who is waiting.
                     CONTEXT walk = ctx;
-                    std::array<uint64_t, 3> chain{};
                     unsigned found = 0;
                     for (int depth = 0; depth < 48 && found < chain.size() && walk.Rip; ++depth)
                     {
@@ -148,9 +150,15 @@ namespace
                         DWORD64 establisher = 0;
                         RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, walk.Rip, fe, &walk, &handlerData, &establisher, nullptr);
                     }
-                    ++chains[{t.first, chain}];
                 }
                 ResumeThread(t.second);
+                if (got)
+                {
+                    ++pcs[ctx.Rip];
+                    ++threadPcs[{t.first, ctx.Rip}];
+                    ++perThread[t.first];
+                    ++chains[{t.first, chain}];
+                }
             }
             Sleep(1);
         }
@@ -385,6 +393,75 @@ namespace
     }
 }
 
+namespace
+{
+    // XS_JNITRACE=obj[,obj...]: log every Java native (Java_xeno_* symbols
+    // of the game's own ELF) called with one of these objects as its first
+    // argument word (instance methods: arguments->object). Natives take
+    // (thread, arguments, result). XS_JNITRACE=all logs every call.
+    constexpr int kJniTraceMax = 512;
+    PS2Runtime::RecompiledFunction g_jniOriginal[kJniTraceMax];
+    std::string g_jniName[kJniTraceMax];
+    std::vector<uint32_t> g_jniObjects;
+    bool g_jniAll = false;
+
+    template <int I>
+    void jniThunk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t args = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+        uint32_t w[4] = {};
+        std::memcpy(w, rdram + (args & 0x01FFFFFFu), sizeof(w));
+        const bool hit = g_jniAll || std::find(g_jniObjects.begin(), g_jniObjects.end(), w[0]) != g_jniObjects.end();
+        const uint32_t resultAddr = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[6]));
+        g_jniOriginal[I](rdram, ctx, runtime);
+        if (hit)
+        {
+            uint32_t result = 0;
+            if (resultAddr)
+                std::memcpy(&result, rdram + (resultAddr & 0x01FFFFFFu), 4);
+            std::printf("[jni] %s obj=%08x args=%x %x %x result=%x\n", g_jniName[I].c_str(), w[0], w[1], w[2], w[3], result);
+        }
+    }
+
+    template <int... I>
+    constexpr std::array<PS2Runtime::RecompiledFunction, sizeof...(I)> jniThunks(std::integer_sequence<int, I...>)
+    {
+        return {{&jniThunk<I>...}};
+    }
+
+    void installJniTrace()
+    {
+        const char *env = std::getenv("XS_JNITRACE");
+        if (!env)
+            return;
+        g_jniAll = std::string(env) == "all";
+        for (const char *p = env; *p;)
+        {
+            char *end = nullptr;
+            const unsigned long v = std::strtoul(p, &end, 16);
+            if (end == p)
+                break;
+            g_jniObjects.push_back(static_cast<uint32_t>(v));
+            p = *end == ',' ? end + 1 : end;
+        }
+        static const auto thunks = jniThunks(std::make_integer_sequence<int, kJniTraceMax>{});
+        int n = 0;
+        for (const Symbol &s : g_mainSymbols)
+        {
+            if (n >= kJniTraceMax || s.name.rfind("Java_xeno_", 0) != 0)
+                continue;
+            const uint32_t slot = (s.addr - g_ps2RecompiledFunctionTableBase) >> 2;
+            if (slot >= g_ps2RecompiledFunctionTableSlotCount || !g_ps2RecompiledFunctionTable[slot])
+                continue;
+            g_jniOriginal[n] = g_ps2RecompiledFunctionTable[slot];
+            g_jniName[n] = s.name;
+            g_ps2RecompiledFunctionTable[slot] = thunks[n];
+            ++n;
+        }
+        std::printf("[jni] tracing %d natives\n", n);
+    }
+}
+
 void xs_startHeartbeat(PS2Runtime &runtime)
 {
     const char *env = std::getenv("XS_HEARTBEAT_SECONDS");
@@ -397,6 +474,7 @@ void xs_startHeartbeat(PS2Runtime &runtime)
         std::vector<uint8_t> elf((std::istreambuf_iterator<char>(in)), {});
         g_mainSymbols = readFunctionSymbols(elf);
     }
+    installJniTrace();
     std::cout << "[xenosaga] heartbeat every " << seconds << "s (" << g_mainSymbols.size() << " symbols)" << std::endl;
 #ifdef _WIN32
     if (const char *prof = std::getenv("XS_PROFILE"))

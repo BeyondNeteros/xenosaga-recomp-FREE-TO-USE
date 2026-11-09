@@ -1,13 +1,16 @@
 @echo off
 rem Xenosaga Episode I: Recompiled (work in progress)
-rem Runs the PC port against your own disc image. Edit DISC if your ISO moves.
+rem Runs the PC port against your own disc image: set DISC below, or set
+rem XS_DISC and XS_ELF_SOURCE in the environment before starting this.
 rem Display, sound and controls are set in settings.ini (made on first start).
 rem Note: paths here contain parentheses, so they are only used outside ( ) blocks.
 setlocal
 cd /d "%~dp0"
 
-set "DISC=<your disc image>"
-set "ELF_SOURCE=<game files>\SLUS_204.69"
+set "DISC=%XS_DISC%"
+if "%DISC%"=="" set "DISC=%~dp0game.iso"
+set "ELF_SOURCE=%XS_ELF_SOURCE%"
+if "%ELF_SOURCE%"=="" set "ELF_SOURCE=%~dp0game-files\SLUS_204.69"
 
 if exist "%DISC%" goto disc_ok
 echo Disc image not found:

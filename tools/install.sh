@@ -7,7 +7,7 @@
 #   bash port/tools/install.sh [install dir]
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-DEST="${1:-<install folder>}"
+DEST="${1:-${XS_GAME_DIR:?give the install folder as an argument or set XS_GAME_DIR}}"
 BUILD="${PS2X_BUILD_DIR:-$ROOT/PS2Recomp/build-runtime/ps2xRuntime}"
 MINGW_BIN="${MINGW_BIN:-/c/msys64/mingw64/bin}"
 export PATH="$MINGW_BIN:$PATH"

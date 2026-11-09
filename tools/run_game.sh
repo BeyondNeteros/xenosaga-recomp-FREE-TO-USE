@@ -9,8 +9,9 @@
 # input as such a script. With <seconds> = 0 the game runs until closed.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GAME="${XS_GAME_DIR:-<install folder>}"
-DISC="${XS_DISC:-<your disc image>}"
+# Where the game is installed and your own disc image (Windows path):
+GAME="${XS_GAME_DIR:?set XS_GAME_DIR to the install folder}"
+DISC="${XS_DISC:?set XS_DISC to your disc image, as a Windows path}"
 name="$1"; seconds="$2"; shift 2
 input=""; record=""; extra_env=()
 while [ $# -gt 0 ]; do

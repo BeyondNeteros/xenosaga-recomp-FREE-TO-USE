@@ -1,3 +1,75 @@
+## Woglinde Lab frame-rate work (2026-11-08, runs/wog-*)
+
+Test scene: `inputs/woglinde-lab-run.txt` (load save No.04 "Woglinde Lab", the
+newest on Beyond's card, then run in 8 directions turning the camera, ~2.5
+min). Replays identically run to run. Baseline (runs/wog-run2): avg 27.6 fps,
+30 in corridors, 21.6-23 fps facing the main lab floor.
+
+What limits the dips: the VIF1/VU1 worker thread. The game double-buffers
+(xglRenderMove: build frame N+1, `sceGsSyncPath` waits for N, kick N+1), so
+the EE waits on VU1 (vifwait 40-55%), VU1 ~80-90% busy, GS 30-35%. A deeper
+EE/VIF1 pipeline would not help. XS_PROFILE (tools: port/tools/profsym.py
+symbolizes `texe`/`chain` lines) on the VIF1 thread: native VU1 programs
+~1/3, VIF unpack ~5%, the rest handing GIF packets to the GS and waiting.
+
+Changes and effect (Lab dips / avg):
+- GS queue (gs_frontend.cpp AsyncQueue): the worker took the whole queue
+  (up to 8 MB) and returned the space only after all of it, so producers
+  and worker took turns; now space comes back every 256 KB, packet buffers
+  are recycled, the worker is woken only when asleep, and GIF packets are
+  appended to one command as [size][bytes] records (one lock per packet).
+  Dips 21.6-23 -> 23.6-25 fps, avg 27.6 -> 28.4 (runs/wog-opt2, opt3).
+- GifArbiter::submitAndDrain: XGKICK/DIRECT packets with nothing queued go
+  straight to the GS (no per-packet heap copy).
+- GS thread: texture uploads write whole rows (GSMem::WriteRow32), the native
+  frame is built from local memory in place on the GS thread (no 4 MB VRAM
+  snapshot per frame). Lighter GS thread (35% -> 28%), no fps change alone.
+  gs_replay VRAM hashes unchanged (native, 3w, CPU renderer).
+- IOP on the EE thread: one pass over IOP threads per scheduling step
+  (wake + pick + next wake-up), dead-thread sweep only when one died, and an
+  idle fast path (no ready thread: calls before the next event, capped at
+  2048 IOP cycles, only move the clock; cleared by any outside call).
+- Shared-context presentation (GS texture drawn by the window directly, no
+  11 MB readback/copy/upload per frame) works but made the dips worse
+  (20-21 fps): the driver serializes the two contexts. Off by default,
+  `PS2X_GL_SHARED_PRESENT=1` turns it on. xs_frame.bmp then comes from an
+  occasional readback (ps2x_glRequestHiresSnapshot).
+- Correction: the hangar "13.7 ms/frame" was native resolution. At 3x
+  gs_replay's extra 12 ms is its own end-of-pass write-back
+  (`PS2X_GL_STATS=2` lists each readback with its reason).
+
+VU1 programs (the rest of the dips):
+- Instruction-level profile of `vu1_replay` (VU_REPLAY_PROFILE writes exe
+  offsets; objdump the program) showed two `vmulps` sites holding 40% of
+  p_0188: denormal microcode assists. The vector paths compute all four lanes
+  and unused lanes often hold integer bit patterns. VU1Interpreter::run now
+  sets DAZ (MXCSR 0x40) with round-toward-zero; operands that matter are
+  normalised first (a denormal is 0 on the VU), no FTZ (underflowed results
+  must stay visible for the U flag). `PS2X_VU1_DAZ=0` turns it off. p_0188
+  samples in replay 29.5k -> 15.9k. Same outputs: all 345 captures match the
+  frozen reference (built without DAZ).
+- vu1prog.py now generates: VF registers and ACC in locals (loaded at entry,
+  written ones stored at exits, registers spilled only around interpreter-run
+  lowers and the cold upper slow path, which takes and returns values so no
+  local's address escapes); lazy MAC/status (VU1FastOps::LazyFlags, nFlush
+  before anything that reads/writes them and at exits; sticky bits OR-ed);
+  operand cleanliness (forward must-analysis per lane: VU results are normal
+  or zero except FTOI, vf0 too, MOVE/MR32 copy it, loads/MFIR/MFP don't;
+  clean operands skip normalize4). Each alone did not change the replay time
+  (the assists dominated); together with DAZ they keep the program lean.
+  VU_REPLAY_NATIVE_CMP: 0 differing calls over all 345 captures.
+- Result (runs/wog-opt6, no profiler): Woglinde Lab locked 30 fps after
+  loading (30.0-30.2 every sample, avg 29.85 incl. the load), VU1 peaks
+  ~62% host time (was 82%).
+- XS_PROFILE could deadlock the game: it updated std::maps (heap) while the
+  sampled thread was suspended, possibly holding the heap lock (runs/wog-opt5
+  froze 5 s after the profiler started). Now it only reads context/unwinds
+  while suspended and records after ResumeThread.
+- Patch hygiene: generate ps2recomp-runtime.patch with Git for Windows' git
+  (core.autocrlf=true); MSYS2's git on PATH first turns it into a 32 MB
+  line-ending diff.
+
+
 ## Native VU1 programs (2026-11-07 night, runs/native-on, last-on/off)
 
 `tools/vu1prog.py` compiles whole VU1 calls into C++ (recomp/xenosaga_vu1_programs.cpp,
@@ -55,6 +127,85 @@ with `cp -rp`). Replays with `--env PS2X_VU1_PROGRAMS=0` (ab-off) and default
   the battle-effect image (first 300 calls), so they don't cover the slow scenes.
 
 
+### Streaky NPC clothing in the Woglinde Lab: older bug (2026-11-08, runs/beyond-glitch, gl-*)
+
+Beyond saw the blue-haired NPC at the lab console with streaky, blotchy
+clothes (inputs: runs/beyond-glitch/inputs-last.txt, save No.04). Not caused
+by the 2026-11-08 speed work: identical with PS2X_VU1_DAZ=0,
+PS2X_VU1_PROGRAMS=0, PS2X_IOP_IDLE=0, PS2X_GS_PACK=0, PS2X_GIF_DIRECT=0,
+PS2X_GS_ROWWRITE=0 (all new switches), and the 018aeba build (rebuilt in
+runs/tmp/wt-018) shows it too. GS capture runs/gl-cap: CPU and GL renderers
+draw the same, so the texture in local memory is already wrong. The clothes
+come from a PSMT8 page TBP 0x3800 TBW 16 (1024x256, one CT32 CSM1 palette per
+character, CBP 14900-15304), uploaded each frame as CT32 256x128 at rec 24533
+(left half of the page in T8 terms). Dumped with `GS_REPLAY_STOP=24800
+GS_REPLAY_TEX=tbp,tbw,cbp,w,h,out.ppm` (new gs_replay options): some areas
+are clean (uniform panel, face, eyes), others comb-like stripes, which end up
+on the NPC. port/tools/vram2png.py renders a CT32 buffer from a VRAM dump.
+
+Traced further (runs/gl-cap: gscap_tex.py, gscap_draws.py, swz.py):
+- The NPC is a "ProReal" model (TEX0 = base | 0x29340000, nmlModelSetProreal),
+  textures uploaded by nmlPacketTextureTrans as one DIRECT + REF of the
+  texture entry (80-byte descriptor + pixels).
+- The entry is ARX-compressed on disc (xglArxExtract, main/xgl_timer0.c).
+  port/tools/arx.py decodes it (MIPS shift semantics): the decoded block at
+  ISO 0xa849a40 equals the game's 128 KB upload word for word, so the EE
+  decompression and the data are right.
+- The draws' palettes (CBP 14900-15304) lie inside that same upload (pages
+  24-27 of the T8 page): the comb areas are packed CT32 palettes.
+- REGION_REPEAT (mode 3, `(u & UMSK) | UFIX`) is used; both renderers do it
+  per the GS manual.
+- A Python model of GS memory with PCSX2's tables (CT32 write, T8 read, CSM1
+  palette) renders the same image as the port.
+Everything checked offline matches what a PS2 would do with the same data;
+not yet checked: the ProReal texture coordinates (VU1 input) and how the NPC
+looks in PCSX2 (ground truth).
+
+PCSX2 ground truth (runs/beyond-glitch/pcsx2-reference.jpg, Beyond played to
+the spot): the NPC SITS at the console working, uniform clean. In the port he
+STANDS on the chair (default pose) and the stretched mesh smears the texture.
+So it is an animation/pose bug, not textures. Other seated NPCs in the Lab sit
+correctly in the port (runs/wog/frames2/f40.bmp).
+- `disc file not found: \DATA\MTNPACK\ST0010.FPK/.ARC` after ST0010.evt is
+  loadScriptCD2 -> RES_loadFile("mtnpack\ST0010.fpk"): the archive TOCs
+  (XENOSAGA.00/.10/.20, all found) list mtnpack packs only for cutscenes
+  (SCE*), none for ST0010, so this fails on a PS2 too. Not the cause.
+- Traced with XS_MOTIONLOG / XS_JNITRACE / XS_MOTIONACTORS / XS_MOTIONDUMP: his
+  motion evaluates and loops correctly and is a clean standing pose (hips at
+  y 0.90, knees straight; seated NPCs: hips 0.58, knees forward). The scene
+  script reads story flag 0x1b8a (= 1) just before creating him, spawns
+  character resource 0x107 and only enables his talk event, with no idle motion.
+- Open: the PCSX2 reference was a new game, the port used a save from about
+  12:40 of play, so story flags may differ. Test: make a save in PCSX2 at the
+  Lab, import it into the port's mc0 and compare. If he sits, the port is
+  right; if he stands, the Java scripts diverge. Not done.
+
+
+### Input replays sync on loads (2026-11-08, runs/sync1-4)
+
+Why prof-slow2 went wrong: not slow drift but the load menu. The game reads
+no files between boot and the save load (pad frames 0-343), and the menu's
+presses race the memory card reads (dir/open), whose pad-read count depends
+on host speed; prof-slow2 loaded a different save (cf0010/ST0010 instead of
+ST0241). The other five runs of the same script were fine.
+
+- Scripts take `@ frame key` lines: the game reached landmark `key` before pad
+  read `frame` when recorded. Replay holds the inputs (repeats the current
+  report) at that frame until the landmark comes, or jumps ahead when it comes
+  early; it looks 8 sync points ahead for reordered loads and gives up after
+  `PS2X_INPUT_SYNC_HOLD` reads (default 600).
+- Landmarks: file loads, movies, overlays (port) plus memory card `mc dir` /
+  `mc open` (runtime MemoryCard.cpp). Log lines now carry the pad frame:
+  `[landmark] 8.4s f577 file data\font1.tex`.
+- Recording (`--record`) writes the sync lines itself. Older scripts:
+  `python port/tools/addsync.py script.txt <log of a good run> -o out.txt`.
+  ab-scene.txt has none yet: runs/sync2/ab-scene-sync.txt covers its first
+  90 s; the next full replay's log can sync the rest.
+- Checked: synced replay = plain replay (88 landmarks, same frames); a script
+  with the first load 15 frames early and a later one 60 late (sync4) held 15
+  reads, jumped 60 and reached every landmark in order at the expected frames.
+
+
 ### Slow stretches after native programs (2026-11-08)
 
 - The 18-19 fps stretch at the end of ab-scene (hangar, 505-565 s) is GS-bound,
@@ -75,7 +226,10 @@ with `cp -rp`). Replays with `--env PS2X_VU1_PROGRAMS=0` (ab-off) and default
   buffer (only when the native picture has to be shown) and reads the upscaled
   picture through two persistent PBOs with fences, showing the previous
   frame's (one frame of display delay). gs_replay hangar: 18.5 -> 13.7 ms per
-  frame (decoder; Present isn't in gs_replay), VRAM hash unchanged.
+  frame at native resolution (decoder; Present isn't in gs_replay), VRAM hash
+  unchanged. At 3x/16:9 gs_replay shows 24.5 ms, but 12 ms of that is the
+  replay's own end-of-pass write-back (`PS2X_GL_STATS=2` names each readback:
+  all three were `Sync`); the game's hangar frames need ~13 ms of GS time at 3x.
   xs_frame.bmp now samples the upscaled picture down to native size.
 - XS_PROFILE also writes `tmod` (per thread and module) and `chain` lines
   (first three exe frames under each sample, by stack unwinding).

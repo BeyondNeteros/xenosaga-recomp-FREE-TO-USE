@@ -10,6 +10,7 @@
 #include "game_overrides.h"
 #include "ps2_stubs.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,6 +36,8 @@ bool ps2x_hostWidescreen(); // ps2_runtime.cpp (settings.ini aspect = 16:9)
 bool ps2x_hostSettingBool(const char *key, bool fallback); // ps2_runtime.cpp (settings.ini)
 bool ps2x_debugOneHitKill();   // ps2_runtime.cpp (debug toggles, menu)
 bool ps2x_debugNoEncounters();
+void ps2x_padLandmark(const char *key); // ps2_pad.cpp (input replay sync points)
+uint32_t ps2x_padFrame();
 void ps2x_setHostBadge(const char *text);                  // ps2_runtime.cpp (top-left label)
 bool xs_readDiscFile(const std::string &path, std::vector<uint8_t> &out);
 void xs_sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -458,8 +462,10 @@ namespace
     // its one-vsync path (mode byte gp-0x37B4 = 1), so the game's full 30fps
     // step runs as often as the port can manage, up to every 60Hz frame.
     // Nothing is skipped. Also the once-per-frame place for the button swap.
+    void sampleMotionPoses(uint8_t *rdram);
     void renderSyncMove_options(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        sampleMotionPoses(rdram);
         const GameOptions &opt = gameOptions();
         const bool battle = inBattle(rdram);
 
@@ -822,6 +828,247 @@ namespace
     PS2Runtime::RecompiledFunction g_calcHpOriginal = nullptr;
     PS2Runtime::RecompiledFunction g_checkEncountOriginal = nullptr;
 
+    // XS_MOTIONLOG=1: actor motion changes (ACT_setMotion / ACT_setMotion2,
+    // decomp src/main/act_2.c) and motion bank loads (ACT_loadMotion), with
+    // the actor's position and whether the bank's pack table is loaded
+    // (Actor +0x10 position, +0x8dc animPackTables[8]; act_1.h).
+    PS2Runtime::RecompiledFunction g_setMotionOriginal = nullptr;
+    PS2Runtime::RecompiledFunction g_setMotion2Original = nullptr;
+    PS2Runtime::RecompiledFunction g_loadMotionOriginal = nullptr;
+
+    bool motionLogOn()
+    {
+        static const bool on = std::getenv("XS_MOTIONLOG") != nullptr;
+        return on;
+    }
+
+    void logMotion(uint8_t *rdram, const char *what, uint32_t actor, uint32_t a1, uint32_t a2)
+    {
+        float pos[3];
+        std::memcpy(pos, rdram + ((actor + 0x10u) & kRdramMask), sizeof(pos));
+        const uint32_t bank = (a1 >> 8) & 7u;
+        uint32_t pack = 0;
+        std::memcpy(&pack, rdram + ((actor + 0x8dcu + 4u * bank) & kRdramMask), 4);
+        uint32_t cur = 0;
+        std::memcpy(&cur, rdram + ((actor + 0x6f0u) & kRdramMask), 4);
+        std::printf("[motion] %s actor=%08x pos=(%.1f,%.1f,%.1f) id=%x arg2=%x bank%u=%08x\n", what, actor, pos[0], pos[1],
+                    pos[2], a1, a2, bank, pack);
+        (void)cur;
+    }
+
+    void setMotion_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (motionLogOn())
+        {
+            static std::unordered_map<uint32_t, uint32_t> last;
+            const uint32_t actor = GPR_U32(ctx, 4), id = GPR_U32(ctx, 5);
+            auto it = last.find(actor);
+            if (it == last.end() || it->second != id)
+            {
+                last[actor] = id;
+                logMotion(rdram, "set", actor, id, 0);
+            }
+        }
+        g_setMotionOriginal(rdram, ctx, runtime);
+    }
+
+    void setMotion2_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (motionLogOn())
+        {
+            static std::unordered_map<uint32_t, uint32_t> last;
+            const uint32_t actor = GPR_U32(ctx, 4), id = GPR_U32(ctx, 5);
+            auto it = last.find(actor);
+            if (it == last.end() || it->second != id)
+            {
+                last[actor] = id;
+                logMotion(rdram, "set2", actor, id, GPR_U32(ctx, 6));
+            }
+        }
+        g_setMotion2Original(rdram, ctx, runtime);
+    }
+
+    // Chr.setArgs(offset, value, size) (decomp src/main/chr.c): copies `size`
+    // bytes of value into ACTOR_ARGS(peer) + offset (actor + 0xc0); the
+    // default motion table is actor + 0x130 = args + 0x70.
+    PS2Runtime::RecompiledFunction g_setArgsOriginal = nullptr;
+    void setArgs_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (motionLogOn())
+        {
+            const uint32_t a = GPR_U32(ctx, 5);
+            uint32_t w[4];
+            std::memcpy(w, rdram + (a & kRdramMask), sizeof(w));
+            std::printf("[motion] setArgs object=%08x offset=%x value=%x size=%u\n", w[0], w[1], w[2], w[3]);
+        }
+        g_setArgsOriginal(rdram, ctx, runtime);
+    }
+
+    // CHR_motion(mode, thread, arguments, failure) behind Chr.mtn (chr.c).
+    PS2Runtime::RecompiledFunction g_chrMotionOriginal = nullptr;
+    void chrMotion_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t mode = GPR_U32(ctx, 4), a = GPR_U32(ctx, 6), fail = GPR_U32(ctx, 7);
+        uint32_t w[7];
+        std::memcpy(w, rdram + (a & kRdramMask), sizeof(w));
+        g_chrMotionOriginal(rdram, ctx, runtime);
+        if (motionLogOn())
+        {
+            uint32_t f = 0;
+            if (fail)
+                std::memcpy(&f, rdram + (fail & kRdramMask), 4);
+            std::printf("[motion] mtn mode=%u object=%08x args=%x %x %x %x %x %x fail=%x\n", mode, w[0], w[1], w[2], w[3], w[4],
+                        w[5], w[6], f);
+        }
+    }
+
+    // ANM_reset(clock, pack) -> entry (decomp src/main/anm.c): pack magic /
+    // format, the entry's format and frame range, the clock it set up.
+    PS2Runtime::RecompiledFunction g_anmResetOriginal = nullptr;
+    void anmReset_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t clock = GPR_U32(ctx, 4), pack = GPR_U32(ctx, 5);
+        g_anmResetOriginal(rdram, ctx, runtime);
+        if (!motionLogOn())
+            return;
+        static std::set<uint64_t> seen;
+        uint32_t cdata[4] = {};
+        std::memcpy(cdata, rdram + (clock & kRdramMask), sizeof(cdata));
+        const uint64_t key = (static_cast<uint64_t>(clock) << 32) ^ pack ^ (static_cast<uint64_t>(cdata[0] & 0xFFFFu) << 20);
+        if (!seen.insert(key).second)
+            return;
+        const uint32_t entry = GPR_U32(ctx, 2);
+        uint32_t ph[4] = {}, eh[4] = {};
+        if (pack)
+            std::memcpy(ph, rdram + (pack & kRdramMask), sizeof(ph));
+        if (entry)
+            std::memcpy(eh, rdram + (entry & kRdramMask), sizeof(eh));
+        std::printf("[motion] anm clock=%08x pack=%08x [%08x %08x %08x %08x] entry=%08x [%08x fmt=%u first=%u last=%u] clock=[%08x %08x %08x %08x]\n",
+                    clock, pack, ph[0], ph[1], ph[2], ph[3], entry, eh[0], eh[1] & 0xFFFFu, eh[2] & 0xFFFFu, eh[2] >> 16,
+                    cdata[0], cdata[1], cdata[2], cdata[3]);
+    }
+
+    // ANM_update(clock): every 30th update of each traced clock
+    // (XS_MOTIONCLOCKS=hex,hex...) logs flags / frame / speed / limits.
+    PS2Runtime::RecompiledFunction g_anmUpdateOriginal = nullptr;
+    void anmUpdate_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t clock = GPR_U32(ctx, 4);
+        g_anmUpdateOriginal(rdram, ctx, runtime);
+        static const std::vector<uint32_t> clocks = [] {
+            std::vector<uint32_t> out;
+            if (const char *e = std::getenv("XS_MOTIONCLOCKS"))
+                for (const char *p = e; *p;)
+                {
+                    char *end = nullptr;
+                    out.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+                    if (end == p)
+                        break;
+                    p = *end == ',' ? end + 1 : end;
+                }
+            return out;
+        }();
+        if (std::find(clocks.begin(), clocks.end(), clock) == clocks.end())
+            return;
+        static std::unordered_map<uint32_t, uint32_t> counts;
+        if ((counts[clock]++ % 30u) != 0u)
+            return;
+        uint32_t flags;
+        float f[4];
+        std::memcpy(&flags, rdram + (clock & kRdramMask), 4);
+        std::memcpy(f, rdram + ((clock + 4u) & kRdramMask), sizeof(f));
+        std::printf("[motion] clock %08x flags=%08x frame=%.2f speed=%.4f range=%.1f..%.1f\n", clock, flags, f[0], f[1], f[2], f[3]);
+    }
+
+    // ACT_updateMotion(actor) (act_2.c): what ACT_updateMotionSub's early
+    // returns read (flags & 0x408, model 'lex', move 'JNT', joint matrices),
+    // logged once per actor.
+    PS2Runtime::RecompiledFunction g_actUpdateMotionOriginal = nullptr;
+    void actUpdateMotion_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (motionLogOn())
+        {
+            const uint32_t actor = GPR_U32(ctx, 4);
+            static std::set<uint32_t> seen;
+            if (seen.insert(actor).second)
+            {
+                auto rd = [&](uint32_t a) { uint32_t v = 0; std::memcpy(&v, rdram + (a & kRdramMask), 4); return v; };
+                const uint32_t model = rd(actor + 0x8d0u), move = rd(actor + 0x8d8u), mats = rd(actor + 0x824u);
+                std::printf("[motion] update actor=%08x flags=%08x model=%08x[%08x] move=%08x[%08x] mats=%08x\n", actor,
+                            rd(actor), model, model ? rd(model) : 0u, move, move ? rd(move) : 0u, mats);
+            }
+        }
+        g_actUpdateMotionOriginal(rdram, ctx, runtime);
+    }
+
+    // Called once per frame (xglRenderSyncMove hook).
+    void sampleMotionPoses(uint8_t *rdram)
+    {
+        if (motionLogOn())
+        {
+            // XS_MOTIONACTORS=hex,...: every 30th update, a hash of the first
+            // 32 joint matrices and the clock frame (is the motion moving?).
+            static const std::vector<uint32_t> actors = [] {
+                std::vector<uint32_t> out;
+                if (const char *e = std::getenv("XS_MOTIONACTORS"))
+                    for (const char *p = e; *p;)
+                    {
+                        char *end = nullptr;
+                        out.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+                        if (end == p)
+                            break;
+                        p = *end == ',' ? end + 1 : end;
+                    }
+                return out;
+            }();
+            for (const uint32_t actor : actors)
+            {
+                static std::unordered_map<uint32_t, uint32_t> counts;
+                if ((counts[actor]++ % 30u) == 0u)
+                {
+                    uint32_t mats = 0;
+                    std::memcpy(&mats, rdram + ((actor + 0x824u) & kRdramMask), 4);
+                    uint64_t h = 1469598103934665603ull;
+                    for (uint32_t i = 0; i < 32u * 64u; ++i)
+                        h = (h ^ rdram[(mats + i) & kRdramMask]) * 1099511628211ull;
+                    float frame = 0.0f;
+                    std::memcpy(&frame, rdram + ((actor + 0x6f0u + 4u) & kRdramMask), 4);
+                    float m[8];
+                    std::memcpy(m, rdram + ((mats + 64u * 2u) & kRdramMask), sizeof(m));
+                    std::printf("[motion] pose actor=%08x frame=%.2f mats=%016llx j2=[%.3f %.3f %.3f %.3f %.3f %.3f]\n", actor, frame,
+                                static_cast<unsigned long long>(h), m[0], m[1], m[2], m[4], m[5], m[6]);
+                    // XS_MOTIONDUMP=1: the 10th sample's 64 joint matrices to xs_joints_<actor>.bin.
+                    if (std::getenv("XS_MOTIONDUMP") && counts[actor] == 301u)
+                    {
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "xs_joints_%08x.bin", actor);
+                        if (FILE *f = std::fopen(name, "wb"))
+                        {
+                            for (uint32_t i = 0; i < 64u * 64u; ++i)
+                                std::fputc(rdram[(mats + i) & kRdramMask], f);
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void loadMotion_log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t actor = GPR_U32(ctx, 4), id = GPR_U32(ctx, 5), bank = GPR_U32(ctx, 6);
+        g_loadMotionOriginal(rdram, ctx, runtime);
+        if (motionLogOn())
+        {
+            uint32_t pack = 0;
+            std::memcpy(&pack, rdram + ((actor + 0x8dcu + 4u * (bank & 7u)) & kRdramMask), 4);
+            float pos[3];
+            std::memcpy(pos, rdram + ((actor + 0x10u) & kRdramMask), sizeof(pos));
+            std::printf("[motion] load actor=%08x pos=(%.1f,%.1f,%.1f) id=%x bank=%u -> pack=%08x\n", actor, pos[0], pos[1],
+                        pos[2], id, bank, pack);
+        }
+    }
+
     void calcHp_debug(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         if (ps2x_debugOneHitKill())
@@ -877,7 +1124,10 @@ namespace
         if (key == last)
             return;
         last = key;
-        std::printf("[landmark] %.1fs %s %s\n", landmarkSeconds(), kind, what.c_str());
+        const std::string sync = std::string(kind) + " " + what;
+        const uint32_t frame = ps2x_padFrame();
+        ps2x_padLandmark(sync.c_str()); // input recording/replay sync point
+        std::printf("[landmark] %.1fs f%u %s %s\n", landmarkSeconds(), frame, kind, what.c_str());
         std::fflush(stdout);
     }
 
@@ -918,6 +1168,17 @@ namespace
         wrapSlot(0x002507C8u, gameMpeg2Play_landmark, g_gameMpeg2PlayOriginal);   // GameMpeg2Play
         wrapSlot(0x002210F0u, movieOpen_landmark, g_movieOpenOriginal);           // xglMovieOpen
         wrapSlot(0x002D11D8u, checkEncount_debug, g_checkEncountOriginal); // Check_Encount
+        if (motionLogOn())
+        {
+            wrapSlot(0x00307E50u, setMotion_log, g_setMotionOriginal);   // ACT_setMotion
+            wrapSlot(0x00307F70u, setMotion2_log, g_setMotion2Original); // ACT_setMotion2
+            wrapSlot(0x00308228u, loadMotion_log, g_loadMotionOriginal); // ACT_loadMotion
+            wrapSlot(0x002FEFF0u, setArgs_log, g_setArgsOriginal);       // Java_xeno_Chr_setArgs__III
+            wrapSlot(0x002FE5F8u, chrMotion_log, g_chrMotionOriginal);   // CHR_motion
+            wrapSlot(0x0030E6D8u, anmReset_log, g_anmResetOriginal);     // ANM_reset
+            wrapSlot(0x0030E8C8u, anmUpdate_log, g_anmUpdateOriginal);   // ANM_update
+            wrapSlot(0x00306E70u, actUpdateMotion_log, g_actUpdateMotionOriginal); // ACT_updateMotion
+        }
         wrapSlot(0x0022CC08u, renderSyncMove_options, g_renderSyncMoveOriginal); // xglRenderSyncMove
         wrapSlot(0x002E7830u, createEffect_options, g_createEffectOriginal);     // sefCreateEffectCf2
         wrapSlot(0x002E7A18u, isFinishEffect_options, g_isFinishEffectOriginal); // sefIsFinishEffect

@@ -5,10 +5,31 @@ built by statically recompiling the original game code with [PS2Recomp](https://
 
 **This repository contains no game code or data.** You must own the game and supply your own disc files.
 
+## Picking this up
+
+The original author has stopped working on this and it is free for someone else to
+continue. Start with `CLAUDE.md` (setup, build, tools), then `NOTES.md` (newest
+findings first). The port targets PS2Recomp commit `e563698` plus
+`patches/ps2recomp-runtime.patch`.
+
+Where it was left:
+
+- **Speed:** the Woglinde Lab holds 30 fps in the last test. Story cutscenes and
+  battles were not retested on the latest build. 60 fps needs roughly twice the
+  current VU1 headroom; the next ideas are in `NOTES.md`.
+- **Open bug:** one NPC at the Lab console stands with streaky clothing where a
+  new game in PCSX2 shows him seated. It may be story-dependent; the next test is
+  in `NOTES.md` under "Streaky NPC clothing".
+- **Known gaps:** the widescreen HUD and menus are stretched, the menu screen runs
+  at about 24 fps, and the launcher's build from a disc cannot generate the native
+  VU1 programs yet (they need captures; see `NOTES.md`).
+- **Test scripts:** `tools/run_game.sh` and `tools/install.sh` need `XS_GAME_DIR`
+  and `XS_DISC` set to your own install folder and disc image.
+
 ## Status
 
 Playable from the start through the Virtual Tutorial and into the first field
-areas, at a locked 30 fps in the tutorial.
+areas.
 
 | Part | State |
 |---|---|

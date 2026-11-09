@@ -2,8 +2,8 @@
 
 This is Beyond's unofficial native PC port of *Xenosaga Episode I* (PS2, USA,
 SLUS-20469). It is built by statically recompiling the original game with
-[PS2Recomp](https://github.com/ran-j/PS2Recomp). It was started in a cloud
-session and moved here so builds, runs, and logs all happen on this PC.
+[PS2Recomp](https://github.com/ran-j/PS2Recomp). The original author has stopped
+working on it; see "Picking this up" in README.md for where it stands.
 
 Read `NOTES.md` for the current investigation before changing anything.
 
@@ -12,12 +12,9 @@ Read `NOTES.md` for the current investigation before changing anything.
 - **Never commit or distribute game files or anything derived from them**: the
   ISO, `SLUS_204.69`, `OV*.OVL`, IRX modules, generated C++ (`recomp/`), VU
   captures, frame dumps. `.gitignore` covers the usual names.
-- Don't permanently delete Beyond's files. Use the Recycle Bin or move to a
+- Don't permanently delete a user's files. Use the Recycle Bin or move to a
   `_to_delete` folder.
-- End commit messages with the attribution lines Claude Code normally adds.
-- After each commit, push to the private GitHub repo: `git push github`
-  (https://github.com/BeyondNeteros/xenosaga-recomp; `origin` is the old
-  bundle). Only this repo goes up, never game data.
+- Only this repo goes up to any remote, never game data.
 
 ## Layout (project root = the folder containing `port/`)
 
@@ -29,11 +26,10 @@ Read `NOTES.md` for the current investigation before changing anything.
   runs/          logs/captures from test runs - never commit
 ```
 
-The playable install lives at `<install folder>`
+The playable install is any folder you choose (set `XS_GAME_DIR` to it)
 (`Launch Xenosaga.bat`, `XenosagaRecomp.exe`, `SLUS_204.69`, `xenosaga.log`,
-`xs_frame.bmp`). The ISO is
-`<your disc image>`
-(Redump, DVD9 dual layer).
+`xs_frame.bmp`). Your disc image is any path (set `XS_DISC` to it,
+as a Windows path); a Redump DVD9 dual-layer dump is what was tested.
 
 ## Setup (once)
 
@@ -60,7 +56,7 @@ The playable install lives at `<install folder>`
 6. Copy `ps2EntryRunner.exe` to the install folder as `XenosagaRecomp.exe`
    (plus any MinGW/FFmpeg DLLs it needs if not linked statically).
 
-### Windows build on Beyond's PC (works as of 2026-10-31)
+### Windows build (works as of 2026-10-31)
 
 MSYS2 is at `C:\msys64` (installed with `winget install MSYS2.MSYS2`). From Git
 Bash, put `/c/msys64/mingw64/bin:/c/msys64/usr/bin` first on `PATH` (Git for
@@ -101,13 +97,15 @@ source file rebuilds everything; editing one runtime `.cpp` is quick.
 
 Port code lives in `port/src` and is copied by `assemble.py`. After editing a
 port file, copy it to `PS2Recomp/ps2xRuntime/src/runner` (or rerun assemble.py).
-Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
+Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch (with
+Git for Windows' git, not MSYS2's: it lacks core.autocrlf and makes a 32 MB
+line-ending diff) with
 `git -C PS2Recomp diff -- . ":(exclude)ps2xRuntime/src/runner" > port/patches/ps2recomp-runtime.patch`
 (new files need `git -C PS2Recomp add -N <file>` first or they are left out).
 
 ## Running and debugging
 
-- `Launch Xenosaga.bat` sets `XS_NO_SOUND=1` (sound driver RPC not working yet),
+- `Launch Xenosaga.bat` sets `XS_NO_SOUND=0` (=1 skips the sound driver),
   `XS_DISC_IMAGE` (the ISO), `PS2X_VU_CAPTURE=1`, and logs to `xenosaga.log`.
 - Every 5 s the heartbeat (`src/xenosaga_debug.cpp`) logs EE cycles, host time
   for VU1/GS/VIF1, the top VU1 programs (`vu1 prog 0x...`; 0x8xxx = resumed at
@@ -129,6 +127,12 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
   `python port/tools/vu1prog.py runs/*/vu1_capture.bin --min-calls 50`, then
   rebuild; check with `VU_REPLAY_NATIVE_CMP=1 vu1_replay <capture> 1` and
   vu1_check.sh. `PS2X_VU1_PROGRAMS=0` disables them. Never commit the output.
+  The generated code keeps VF/ACC in locals, commits MAC/status lazily and
+  skips operand normalisation where the generator proves it a no-op; VU code
+  runs with DAZ (`PS2X_VU1_DAZ=0` to compare). Check every change with
+  `VU_REPLAY_NATIVE_CMP=1` over all captures (0 differing calls) and vu1_check.sh.
+- `XS_PROFILE=start,seconds` (game) writes xs_profile.txt; symbolize with
+  `python port/tools/profsym.py <exe> xs_profile.txt [thread]` (MSYS2 nm on PATH).
 - PGO: `bash port/tools/pgo.sh` profiles the hot VU1/VIF1/GS code on the
   captures and rebuilds build-runtime with it (~11% faster VU1). Rerun it
   after VU1/GS changes or regenerating native blocks, then vu1_check.sh.
@@ -141,7 +145,7 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
   port/inputs/newgame-to-tutorial.txt` boots the installed exe with the launcher's
   env, replays a pad script and copies log/frame/VRAM dump to `runs/<name>/`.
   `--env PS2X_WINDOW_MONITOR=1` puts the window on the second monitor.
-  run_game.sh force-closes any running game: tell Beyond before runs.
+  It needs `XS_GAME_DIR` and `XS_DISC` set, and force-closes any running game.
   That script reaches the "Virtual Tutorial" 3D scene in about 3 minutes with
   nobody at the PC. `--record file.txt` writes live controller input as a new
   script. Replay/record live in the runtime's `ps2_pad.cpp` (code adapted from the
@@ -149,6 +153,10 @@ Runtime changes go straight into `PS2Recomp`; afterwards refresh the patch with
   `frame buttons [lx ly rx ry]` where frame = port-0 pad reads, and
   `padmap.py check --script` (console-controller skill) validates them.
   The game reads only the controller while one is connected (keyboard ignored).
+  Scripts may hold `@ frame key` sync lines (file loads, movies, memory card
+  dir/open): replay waits for or jumps to each, so load times can't shift the
+  inputs. Recordings write them; `tools/addsync.py script log -o out` adds them
+  to an older script from the log of a run that went right (see NOTES.md).
 - Screen capture of the game window shows black (GL); read `xs_frame.bmp`.
 
 ## Key game facts

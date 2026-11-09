@@ -9,8 +9,16 @@ recomp/
 output/
 xs_vram.bin
 *.bmp
-vu1_capture.bin
+vu1_capture*.bin
+gs_capture.bin
 xs_ram.bin
+xs_joints_*.bin
+xs_profile.txt
+inputs-last.txt
+inputs-prev.txt
+*.vbl
+mc0/
+runs/
 
 # Launcher: the build workspace, the finished game, and personal files
 work/
