@@ -2441,7 +2441,7 @@ index 509fd07..16775c0 100644
  
  }
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..564eced 100644
+index 589d768..bfd8845 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -253,7 +253,7 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
@@ -2469,10 +2469,13 @@ index 589d768..564eced 100644
      src/lib/games_database.cpp
  )
  
-@@ -441,6 +443,11 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+@@ -441,6 +443,14 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
  )
  
++# Whole-program regions are restricted to the opt-in offline replayer.
++list(FILTER RUNNER_SRC_FILES EXCLUDE REGEX "/xenosaga_vu1_programs[.]cpp$")
++
 +# Hand-written port code changes often; keep it out of unity batches so an edit
 +# does not recompile the generated files batched with it.
 +file(GLOB PS2X_PORT_SRC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_*.cpp")
@@ -2481,7 +2484,7 @@ index 589d768..564eced 100644
  set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
  set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
  
-@@ -506,7 +513,7 @@ target_include_directories(ps2_runtime PUBLIC
+@@ -506,7 +516,7 @@ target_include_directories(ps2_runtime PUBLIC
      ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
  )
  
@@ -2490,7 +2493,7 @@ index 589d768..564eced 100644
  target_link_libraries(ps2EntryRunner
      PRIVATE
      ps2_runtime
-@@ -577,6 +584,27 @@ if(MSVC)
+@@ -577,6 +587,27 @@ if(MSVC)
      target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
  endif()
  
@@ -2518,7 +2521,7 @@ index 589d768..564eced 100644
  # Vita: Work around for GCC 10's LTO plugin
  if(PS2X_IS_VITA)
      target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
-@@ -597,7 +625,7 @@ install(TARGETS ps2_runtime ps2EntryRunner
+@@ -597,7 +628,7 @@ install(TARGETS ps2_runtime ps2EntryRunner
      ARCHIVE DESTINATION lib
  )
  
@@ -2527,7 +2530,7 @@ index 589d768..564eced 100644
      install(DIRECTORY "${FFMPEG_BIN_DIR}/"
          DESTINATION bin
          FILES_MATCHING
-@@ -608,3 +636,65 @@ endif()
+@@ -608,3 +639,62 @@ endif()
  install(DIRECTORY include/
      DESTINATION include
  )
@@ -2540,6 +2543,7 @@ index 589d768..564eced 100644
 +endif()
 +
 +option(PS2X_BUILD_VU_REPLAY "Build the vu1_replay profiling tool" OFF)
++option(PS2X_VU_REPLAY_REGIONS "Link experimental scheduled regions into vu1_replay" OFF)
 +if(PS2X_BUILD_VU_REPLAY)
 +    add_executable(vu1_replay tools/vu1_replay.cpp)
 +    target_link_libraries(vu1_replay PRIVATE ps2_runtime $<$<BOOL:${WIN32}>:winmm>)
@@ -2548,9 +2552,8 @@ index 589d768..564eced 100644
 +    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_vu1_blocks.cpp")
 +        target_sources(vu1_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_vu1_blocks.cpp")
 +    endif()
-+    # Native VU1 programs (port/tools/vu1prog.py).
-+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_vu1_programs.cpp")
-+        target_sources(vu1_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_vu1_programs.cpp")
++    if(PS2X_VU_REPLAY_REGIONS)
++        target_sources(vu1_replay PRIVATE tools/xenosaga_vu1_programs.cpp)
 +    endif()
 +    add_executable(gs_replay tools/gs_replay.cpp)
 +    target_link_libraries(gs_replay PRIVATE ps2_runtime $<$<BOOL:${WIN32}>:winmm>)
@@ -2571,9 +2574,6 @@ index 589d768..564eced 100644
 +        src/lib/gs/gs_frontend.cpp src/lib/gs/gs_cpu_backend.cpp src/lib/gs/ps2_gs_memory.cpp src/lib/gs/ps2_gif_arbiter.cpp)
 +    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_vu1_blocks.cpp")
 +        list(APPEND PS2X_PGO_SOURCES src/runner/xenosaga_vu1_blocks.cpp)
-+    endif()
-+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/xenosaga_vu1_programs.cpp")
-+        list(APPEND PS2X_PGO_SOURCES src/runner/xenosaga_vu1_programs.cpp)
 +    endif()
 +    if(PS2X_PGO_GENERATE)
 +        # Single (non-atomic) counters: a little noise across threads, which
@@ -3193,7 +3193,7 @@ index 0000000..5dc4984
 +    };
 +}
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
-index 67c8184..dda50e7 100644
+index 67c8184..90278a3 100644
 --- a/ps2xRuntime/include/runtime/ps2_vu1.h
 +++ b/ps2xRuntime/include/runtime/ps2_vu1.h
 @@ -2,7 +2,10 @@
@@ -3207,7 +3207,7 @@ index 67c8184..dda50e7 100644
  
  class GS;
  class PS2Memory;
-@@ -62,7 +65,58 @@ public:
+@@ -62,7 +65,83 @@ public:
      VU1State &state() { return m_state; }
      const VU1State &state() const { return m_state; }
  
@@ -3258,15 +3258,40 @@ index 67c8184..dda50e7 100644
 +        CompiledBlockFn fn;
 +    };
 +    // Called from the generated file's static initialiser.
-+    static void registerCompiledBlocks(const CompiledBlockEntry *entries, size_t count);
++    static void registerCompatibleBlocks(const CompiledBlockEntry *entries, size_t count);
++    static size_t compiledBlockCount();
++
++    // Offline replay restores the architectural snapshot with empty pipelines.
++    // Dispatch selection and counters belong to the call, outside the VU ABI.
++    struct ReplayDispatch
++    {
++        uint64_t blocks = 0;
++        uint64_t blockPairs = 0;
++        uint64_t programs = 0;
++        uint64_t completedPrograms = 0;
++        bool allowNative = true;
++    };
++    void restoreReplayState(const VU1State &state);
++    void execute(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
++                 GS &gs, PS2Memory *memory, uint32_t startPC, uint32_t top, uint32_t itop,
++                 uint32_t maxCycles, ReplayDispatch *replay);
++    void resume(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
++                GS &gs, PS2Memory *memory, uint32_t top, uint32_t itop, uint32_t maxCycles,
++                ReplayDispatch *replay);
 +
  private:
 +    friend struct VU1FastOps;
++    template <size_t... Layout>
++    struct BlockAbi {};
++
++    static constexpr auto blockAbi();
++    template <size_t... Layout>
++    static void registerBlocksForAbi(const CompiledBlockEntry *entries, size_t count, BlockAbi<Layout...>);
 +
      enum Pipeline : uint8_t
      {
          PipelineNone = 0,
-@@ -193,7 +247,7 @@ private:
+@@ -193,7 +272,7 @@ private:
  
      static constexpr uint32_t kFmacLatency = 4u;
      static constexpr uint32_t kAccForwardLatency = 1u;
@@ -3275,7 +3300,7 @@ index 67c8184..dda50e7 100644
      static constexpr uint32_t kMaxPendingStores = 8u;
      static constexpr uint32_t kMaxPendingVfWrites = 16u;
      static constexpr uint32_t kMaxPendingViWrites = 8u;
-@@ -209,17 +263,53 @@ private:
+@@ -209,17 +288,53 @@ private:
      uint64_t m_cachedCodeGeneration = 0;
      bool m_decodedCodeCacheValid = false;
  
@@ -3329,7 +3354,20 @@ index 67c8184..dda50e7 100644
      std::array<std::array<uint64_t, 4>, 32> m_vfLatestWrite{};
      std::array<uint64_t, 16> m_viLatestWrite{};
      std::array<uint64_t, 4> m_accLatestWrite{};
-@@ -250,10 +340,29 @@ private:
+@@ -242,7 +357,11 @@ private:
+
+     void run(uint8_t *vuCode, uint32_t codeSize,
+              uint8_t *vuData, uint32_t dataSize,
+-             GS &gs, PS2Memory *memory, uint32_t maxCycles);
++             GS &gs, PS2Memory *memory, uint32_t maxCycles, ReplayDispatch *replay);
++
++    bool runScheduled(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
++                      GS &gs, PS2Memory *memory, uint64_t budgetEnd, bool decodeCacheReady,
++                      bool fastWrites, bool staticBlocks, ReplayDispatch *replay, const uint16_t *regionEnds = nullptr);
+
+     InstructionUsage decodeUpperUsage(uint32_t upper) const;
+     InstructionUsage decodeLowerUsage(uint32_t lower) const;
+@@ -250,10 +369,29 @@ private:
      static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
      static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
      DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
@@ -3352,7 +3390,7 @@ index 67c8184..dda50e7 100644
 +    void buildStaticBlock(StaticBlock &block, const uint8_t *vuCode, uint32_t codeSize, uint32_t startIndex);
 +    bool staticEntryOk(const StaticBlock &block) const;
 +    bool runStaticBlock(const StaticBlock &block, uint32_t startIndex, uint32_t codeSize, uint8_t *vuData,
-+                        uint32_t dataSize, GS &gs, PS2Memory *memory);
++                        uint32_t dataSize, GS &gs, PS2Memory *memory, ReplayDispatch *replay);
 +    bool finishStaticBlock(const StaticBlock &block, uint64_t entry, bool ended);
 +
      void execUpper(uint32_t instr);
@@ -3360,7 +3398,7 @@ index 67c8184..dda50e7 100644
      void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
  
      void applyDest(float *dst, const float *result, uint8_t dest);
-@@ -278,22 +387,36 @@ private:
+@@ -278,22 +416,53 @@ private:
  
      void resetScheduler();
      void commitReadyPipelines();
@@ -3399,13 +3437,30 @@ index 67c8184..dda50e7 100644
 +    float broadcast(const float *vf, uint8_t bc) { return normalizeOperand(vf[bc & 3u]); }
  };
  
++// Native fast ops inline accesses to private interpreter state. Encode layout
++// in the registration symbol so an incompatible object fails at link time.
++constexpr auto VU1Interpreter::blockAbi()
++{
++    return BlockAbi<sizeof(VU1Interpreter), alignof(VU1Interpreter),
++                    sizeof(StaticBlock), sizeof(DecodedInstructionPair), sizeof(FlagPipelineEntry),
++                    offsetof(VU1Interpreter, m_state), offsetof(VU1Interpreter, m_decodedCodeCache),
++                    offsetof(VU1Interpreter, m_flagPipeline), offsetof(VU1Interpreter, m_flagHead),
++                    offsetof(VU1Interpreter, m_nextCommit), offsetof(VU1Interpreter, m_xgkick),
++                    offsetof(VU1Interpreter, m_cycle), offsetof(VU1Interpreter, m_activeMemory)>{};
++}
++
++inline void VU1Interpreter::registerCompatibleBlocks(const CompiledBlockEntry *entries, size_t count)
++{
++    registerBlocksForAbi(entries, count, blockAbi());
++}
++
  #endif
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1_fastops.h b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
 new file mode 100644
-index 0000000..76c1069
+index 0000000..2ec54d6
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/ps2_vu1_fastops.h
-@@ -0,0 +1,1364 @@
+@@ -0,0 +1,1366 @@
 +#ifndef PS2_VU1_FASTOPS_H
 +#define PS2_VU1_FASTOPS_H
 +
@@ -4747,10 +4802,12 @@ index 0000000..76c1069
 +        uint32_t pc;             // entry pc
 +        const uint16_t *ranges;  // [start, end) byte pairs
 +        uint32_t rangeCount;
-+        ProgramFn fn;
++        ProgramFn fn;            // sequential code, for diagnostic replay
++        bool scheduled = false; // use the shared scheduler over the hashed ranges
 +    };
 +    void registerPrograms(const ProgramEntry *entries, size_t count);
-+    // PS2X_VU1_PROGRAMS=0 disables native programs; tools may switch them.
++    size_t programCount();
++    // PS2X_VU1_PROGRAMS=1 opts the offline replayer into scheduled regions.
 +    void setEnabled(bool on);
 +    bool enabled();
 +
@@ -13391,7 +13448,7 @@ index f872edd..d31be32 100644
              }
  
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index f19e281..a648a0c 100644
+index f19e281..29c6d38 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -1,16 +1,25 @@
@@ -13465,12 +13522,13 @@ index f19e281..a648a0c 100644
      m_vfLatestWrite = {};
      m_viLatestWrite = {};
      m_accLatestWrite = {};
-@@ -101,28 +134,6 @@ void VU1Interpreter::reset()
+@@ -101,26 +134,11 @@ void VU1Interpreter::reset()
      resetScheduler();
  }
  
 -float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
--{
++void VU1Interpreter::restoreReplayState(const VU1State &state)
+ {
 -    return normalizeOperand(vf[bc & 3u]);
 -}
 -
@@ -13489,12 +13547,13 @@ index f19e281..a648a0c 100644
 -    }
 -    std::memcpy(&value, &bits, sizeof(value));
 -    return value;
--}
--
++    m_state = state;
++    m_cycle = state.cycles;
++    resetScheduler();
+ }
+
  float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
- {
-     uint32_t bits = 0;
-@@ -194,15 +205,84 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+@@ -194,15 +212,84 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
      applyDest(m_state.acc, result, dest);
  }
  
@@ -13579,7 +13638,7 @@ index f19e281..a648a0c 100644
          long double exactResult = 0.0L;
          if (calculateFmacExactResult(component, exactResult))
          {
-@@ -435,14 +515,7 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+@@ -435,14 +522,7 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
      const uint32_t upper = m_currentUpperInstruction;
      const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
      const uint8_t special = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : 0xFFu;
@@ -13595,7 +13654,7 @@ index f19e281..a648a0c 100644
          return 0u;
  
      const uint8_t fs = FS(upper);
-@@ -478,6 +551,14 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+@@ -478,6 +558,14 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
          }
  
          float product = left * right;
@@ -13610,7 +13669,7 @@ index f19e281..a648a0c 100644
          const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
          const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
          // Product-sum instructions report Z/S/U/O from the add/subtract result
-@@ -514,28 +595,19 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -514,28 +602,19 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
          status |= flags;
      }
  
@@ -13642,7 +13701,7 @@ index f19e281..a648a0c 100644
      entry->writesMac = true;
      entry->writesStatus = true;
  }
-@@ -564,18 +636,13 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+@@ -564,18 +643,13 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
              entry.writesStatus = false;
      }
  
@@ -13667,7 +13726,7 @@ index f19e281..a648a0c 100644
      }
      reportReservedInstruction(false, 0xFFFFFFFEu);
  }
-@@ -583,18 +650,13 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+@@ -583,18 +657,13 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
  void VU1Interpreter::queueClip(uint32_t clip)
  {
      m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
@@ -13692,7 +13751,7 @@ index f19e281..a648a0c 100644
      }
      reportReservedInstruction(true, 0xFFFFFFFDu);
  }
-@@ -607,18 +669,13 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+@@ -607,18 +676,13 @@ void VU1Interpreter::queueFcset(uint32_t clip)
          if (entry.valid && entry.issueCycle == m_cycle)
              entry.writesClip = false;
      }
@@ -13717,7 +13776,7 @@ index f19e281..a648a0c 100644
      }
      reportReservedInstruction(false, 0xFFFFFFFAu);
  }
-@@ -629,6 +686,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+@@ -629,6 +693,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
      value = normalizeResult(value, ignoredFlags);
      m_fdiv.valid = true;
      m_fdiv.readyCycle = m_cycle + latency;
@@ -13725,7 +13784,7 @@ index f19e281..a648a0c 100644
      m_fdiv.value = value;
      m_fdiv.statusDi = statusDi & 0x30u;
  }
-@@ -643,6 +701,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -643,6 +708,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
          {
              entry.valid = true;
              entry.readyCycle = m_cycle + latency;
@@ -13733,7 +13792,7 @@ index f19e281..a648a0c 100644
              entry.value = value;
              // EFU throughput is one cycle shorter than result visibility.
              m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
-@@ -660,6 +719,8 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+@@ -660,6 +726,8 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
          {
              store.valid = true;
              store.readyCycle = m_cycle + 1u;
@@ -13742,7 +13801,7 @@ index f19e281..a648a0c 100644
              store.address = address;
              store.laneMask = laneMask;
              std::copy(words, words + 4, store.words.begin());
-@@ -681,6 +742,8 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -681,6 +749,8 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
@@ -13751,7 +13810,7 @@ index f19e281..a648a0c 100644
              write.sequence = ++m_nextWriteSequence;
              write.reg = reg;
              write.laneMask = laneMask;
-@@ -707,6 +770,8 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -707,6 +777,8 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
@@ -13760,7 +13819,7 @@ index f19e281..a648a0c 100644
              write.sequence = ++m_nextWriteSequence;
              write.reg = reg;
              write.value = value;
-@@ -728,6 +793,8 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -728,6 +800,8 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
@@ -13769,7 +13828,7 @@ index f19e281..a648a0c 100644
              write.sequence = ++m_nextWriteSequence;
              write.laneMask = laneMask;
              std::copy(value, value + 4, write.value.begin());
-@@ -742,13 +809,17 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -742,13 +816,17 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
      reportReservedInstruction(true, 0xFFFFFFF5u);
  }
  
@@ -13792,7 +13851,7 @@ index f19e281..a648a0c 100644
          if (entry.writesMac)
              m_state.mac = entry.mac;
          if (entry.writesStatus)
-@@ -762,90 +833,158 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -762,90 +840,158 @@ void VU1Interpreter::commitReadyPipelines()
          }
          if (entry.writesClip)
              m_state.clip = entry.clip;
@@ -13807,9 +13866,9 @@ index f19e281..a648a0c 100644
 +    // (this runs almost every VU cycle, so a second scan was a large cost).
 +    uint64_t next = ~0ull;
 +    const uint64_t now = m_cycle;
-+
  
 -    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++
 +    if (m_fdiv.valid)
      {
 -        m_state.q = m_fdiv.value;
@@ -13993,7 +14052,7 @@ index f19e281..a648a0c 100644
      while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
      {
          m_xgkick.cycleCredit -= 2u;
-@@ -857,11 +996,12 @@ void VU1Interpreter::progressXgkick()
+@@ -857,11 +1003,12 @@ void VU1Interpreter::progressXgkick()
          }
  
          const uint32_t qwordOffset = m_xgkick.copiedBytes;
@@ -14011,7 +14070,7 @@ index f19e281..a648a0c 100644
          m_xgkick.copiedBytes += 16u;
  
          if (m_xgkick.currentTagEnd == 0u)
-@@ -932,7 +1072,10 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+@@ -932,7 +1079,10 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
          return;
  
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
@@ -14023,7 +14082,7 @@ index f19e281..a648a0c 100644
      m_xgkick.active = true;
      m_xgkick.sourceAddress = sourceAddress;
      m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
-@@ -945,14 +1088,30 @@ void VU1Interpreter::advanceOneCycle()
+@@ -945,14 +1095,30 @@ void VU1Interpreter::advanceOneCycle()
      m_state.cycles = m_cycle;
      // LSU commits become visible at the cycle boundary before PATH1 consumes
      // its next qword from VU memory.
@@ -14058,7 +14117,7 @@ index f19e281..a648a0c 100644
  }
  
  bool VU1Interpreter::pipelinesPending() const
-@@ -982,96 +1141,142 @@ bool VU1Interpreter::pipelinesPending() const
+@@ -982,96 +1148,142 @@ bool VU1Interpreter::pipelinesPending() const
  
  void VU1Interpreter::flushPipelines()
  {
@@ -14129,23 +14188,23 @@ index f19e281..a648a0c 100644
 -                if ((access.lanes & laneForComponent(component)) != 0u)
 -                    ready = std::max(ready, m_vfReady[access.reg][component]);
 -            }
--        }
--        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
--        {
--            if ((usage->viRead & (1u << reg)) != 0u)
--                ready = std::max(ready, m_viReady[reg]);
 +            const std::array<uint64_t, 4> &lanes = m_vfReady[access.reg];
 +            // Branch-free: a lane outside the mask contributes 0.
-+            ready = std::max(ready, lanes[0] & (0ull - ((access.lanes >> 3) & 1u)));
-+            ready = std::max(ready, lanes[1] & (0ull - ((access.lanes >> 2) & 1u)));
-+            ready = std::max(ready, lanes[2] & (0ull - ((access.lanes >> 1) & 1u)));
-+            ready = std::max(ready, lanes[3] & (0ull - (access.lanes & 1u)));
++            ready = std::max<uint64_t>(ready, lanes[0] & (0ull - ((access.lanes >> 3) & 1u)));
++            ready = std::max<uint64_t>(ready, lanes[1] & (0ull - ((access.lanes >> 2) & 1u)));
++            ready = std::max<uint64_t>(ready, lanes[2] & (0ull - ((access.lanes >> 1) & 1u)));
++            ready = std::max<uint64_t>(ready, lanes[3] & (0ull - (access.lanes & 1u)));
          }
--        for (uint32_t component = 0; component < 4u; ++component)
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
 +        for (uint32_t mask = usage->viRead & 0xFFFEu; mask != 0u; mask &= mask - 1u)
 +            ready = std::max(ready, m_viReady[__builtin_ctz(mask)]);
 +        if (usage->accRead != 0u)
          {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
+-        }
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
 -            if ((usage->accRead & laneForComponent(component)) != 0u)
 -                ready = std::max(ready, m_accReady[component]);
 +            if (usage->accRead & 0x8u)
@@ -14257,7 +14316,7 @@ index f19e281..a648a0c 100644
      }
  }
  
-@@ -1534,9 +1739,11 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
+@@ -1534,9 +1746,11 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
  void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
                                               const PS2Memory *memory, uint64_t generation)
  {
@@ -14272,7 +14331,7 @@ index f19e281..a648a0c 100644
  
      m_cachedVuCode = vuCode;
      m_cachedMemory = memory;
-@@ -1545,17 +1752,17 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+@@ -1545,17 +1759,17 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
      m_decodedCodeCacheValid = true;
  }
  
@@ -14293,7 +14352,7 @@ index f19e281..a648a0c 100644
  
      const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
      if (!m_decodedCodeCacheValid ||
-@@ -1567,8 +1774,13 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
+@@ -1567,8 +1781,13 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
          rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
      }
      const uint32_t pairIndex = pc / 8u;
@@ -14309,10 +14368,51 @@ index f19e281..a648a0c 100644
      return m_decodedCodeCache[pairIndex];
  }
  
-@@ -1620,6 +1832,646 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
-     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+@@ -1589,6 +1808,15 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                              GS &gs, PS2Memory *memory,
+                              uint32_t startPC, uint32_t top, uint32_t itop,
+                              uint32_t maxCycles)
++{
++    execute(vuCode, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, maxCycles, nullptr);
++}
++
++void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
++                             uint8_t *vuData, uint32_t dataSize,
++                             GS &gs, PS2Memory *memory,
++                             uint32_t startPC, uint32_t top, uint32_t itop,
++                             uint32_t maxCycles, ReplayDispatch *replay)
+ {
+     resetScheduler();
+     m_state.pc = startPC & microAddressMask();
+@@ -1605,46 +1833,865 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+     m_state.vf[0][1] = 0.0f;
+     m_state.vf[0][2] = 0.0f;
+     m_state.vf[0][3] = 1.0f;
+-    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, replay);
  }
  
+ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+                             uint8_t *vuData, uint32_t dataSize,
+                             GS &gs, PS2Memory *memory,
+                             uint32_t top, uint32_t itop, uint32_t maxCycles)
++{
++    resume(vuCode, codeSize, vuData, dataSize, gs, memory, top, itop, maxCycles, nullptr);
++}
++
++void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
++                            uint8_t *vuData, uint32_t dataSize,
++                            GS &gs, PS2Memory *memory,
++                            uint32_t top, uint32_t itop, uint32_t maxCycles, ReplayDispatch *replay)
+ {
+     m_state.top = top;
+     m_state.itop = itop;
+     m_state.stoppedByD = false;
+     m_state.stoppedByT = false;
+-    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, replay);
++}
++
 +// Executes one pair with results written straight into the registers: every
 +// reader is held back (calculatePairReadyCycle or a static block's schedule)
 +// until the value would have landed, so the delayed-write queues give the
@@ -14455,11 +14555,17 @@ index f19e281..a648a0c 100644
 +    }
 +}
 +
-+void VU1Interpreter::registerCompiledBlocks(const CompiledBlockEntry *entries, size_t count)
++template <size_t... Layout>
++void VU1Interpreter::registerBlocksForAbi(const CompiledBlockEntry *entries, size_t count, BlockAbi<Layout...>)
 +{
 +    for (size_t i = 0; i < count; ++i)
 +        compiledBlocks()[entries[i].key] = entries[i].fn;
 +}
++
++template void VU1Interpreter::registerBlocksForAbi(const CompiledBlockEntry *, size_t,
++                                                 decltype(VU1Interpreter::blockAbi()));
++
++size_t VU1Interpreter::compiledBlockCount() { return compiledBlocks().size(); }
 +
 +const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::lazyDecodedPair(const uint8_t *vuCode, uint32_t pairIndex)
 +{
@@ -14759,10 +14865,17 @@ index f19e281..a648a0c 100644
 +// cycle, which only flags/FDIV could observe and they are ordered by their
 +// own ready cycles).
 +bool VU1Interpreter::runStaticBlock(const StaticBlock &block, uint32_t startIndex, uint32_t codeSize, uint8_t *vuData,
-+                                    uint32_t dataSize, GS &gs, PS2Memory *memory)
++                                    uint32_t dataSize, GS &gs, PS2Memory *memory, ReplayDispatch *replay)
 +{
-+    if (block.compiled)
++    if (block.compiled && (!replay || replay->allowNative))
++    {
++        if (replay)
++        {
++            ++replay->blocks;
++            replay->blockPairs += block.pairCount;
++        }
 +        return block.compiled(*this, block, startIndex, codeSize, vuData, dataSize, gs, memory);
++    }
 +    const uint64_t entry = m_cycle;
 +    bool ended = false;
 +    for (uint32_t i = 0; i < block.pairCount; ++i)
@@ -14888,13 +15001,20 @@ index f19e281..a648a0c 100644
 +            }
 +        }
 +    } g_vu1Stats;
-+}
-+
+ }
+
 +namespace
 +{
++    struct RegisteredProgram
++    {
++        vu1native::ProgramEntry entry;
++        // For each pair in the region, the exclusive end index of its range.
++        // Zero means the next pair belongs to the interpreter.
++        std::array<uint16_t, 0x4000u / 8u> regionEnds{};
++    };
 +    struct NativeRegistry
 +    {
-+        std::vector<vu1native::ProgramEntry> entries;
++        std::vector<RegisteredProgram> entries;
 +        std::unordered_map<uint32_t, std::vector<uint32_t>> byPc; // entry pc -> indices
 +    };
 +    NativeRegistry &nativeRegistry()
@@ -14904,12 +15024,12 @@ index f19e281..a648a0c 100644
 +    }
 +    bool g_nativeEnabled = [] {
 +        const char *env = std::getenv("PS2X_VU1_PROGRAMS");
-+        return !(env && env[0] == '0');
++        return env && std::strcmp(env, "1") == 0;
 +    }();
 +
 +    // The program registered for pc whose code pairs match the current
 +    // microcode; per entry the match is checked once per code generation.
-+    vu1native::ProgramFn findNativeProgram(uint64_t generation, const uint8_t *code, uint32_t codeSize, uint32_t pc)
++    const RegisteredProgram *findNativeProgram(uint64_t generation, const uint8_t *code, uint32_t codeSize, uint32_t pc)
 +    {
 +        NativeRegistry &registry = nativeRegistry();
 +        const auto it = registry.byPc.find(pc);
@@ -14928,11 +15048,11 @@ index f19e281..a648a0c 100644
 +        {
 +            if (match[index] < 0)
 +            {
-+                const vu1native::ProgramEntry &e = registry.entries[index];
++                const vu1native::ProgramEntry &e = registry.entries[index].entry;
 +                match[index] = vu1native::codeHash(code, e.ranges, e.rangeCount) == e.codeHash ? 1 : 0;
 +            }
 +            if (match[index] == 1)
-+                return registry.entries[index].fn;
++                return &registry.entries[index];
 +        }
 +        return nullptr;
 +    }
@@ -14943,20 +15063,34 @@ index f19e281..a648a0c 100644
 +    NativeRegistry &registry = nativeRegistry();
 +    for (size_t i = 0; i < count; ++i)
 +    {
-+        if (!entries[i].fn)
++        const ProgramEntry &entry = entries[i];
++        if (!entry.scheduled || entry.fn)
 +            continue;
-+        registry.byPc[entries[i].pc].push_back(static_cast<uint32_t>(registry.entries.size()));
-+        registry.entries.push_back(entries[i]);
++        RegisteredProgram program{entry};
++        for (uint32_t r = 0; r < entry.rangeCount; ++r)
++        {
++            const uint32_t begin = entry.ranges[2 * r] / 8u;
++            const uint32_t end = entry.ranges[2 * r + 1] / 8u;
++            std::fill(program.regionEnds.begin() + begin, program.regionEnds.begin() + end,
++                      static_cast<uint16_t>(end));
++        }
++        registry.byPc[entry.pc].push_back(static_cast<uint32_t>(registry.entries.size()));
++        registry.entries.push_back(std::move(program));
 +    }
 +}
++
++size_t vu1native::programCount() { return nativeRegistry().entries.size(); }
 +
 +void vu1native::setEnabled(bool on) { g_nativeEnabled = on; }
 +bool vu1native::enabled() { return g_nativeEnabled; }
 +
  void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                           uint8_t *vuData, uint32_t dataSize,
-                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
-@@ -1629,22 +2481,124 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+-                         GS &gs, PS2Memory *memory, uint32_t maxCycles)
++                         GS &gs, PS2Memory *memory, uint32_t maxCycles, ReplayDispatch *replay)
+ {
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
      m_activeGs = &gs;
      m_activeMemory = memory;
  
@@ -14983,8 +15117,7 @@ index f19e281..a648a0c 100644
 +    const uint16_t vuX87 = static_cast<uint16_t>(previousX87 | 0x0C00u);
 +    __asm__ volatile("fldcw %0" : : "m"(vuX87));
      const uint64_t budgetEnd = m_cycle + maxCycles;
-     bool programEnded = false;
--    while (m_cycle < budgetEnd && !m_stopRequested)
++    bool programEnded = false;
 +    // PS2X_VU1_FAST=0 restores the original delayed-write path (for comparisons).
 +    static const bool fastWrites = [] {
 +        const char *env = std::getenv("PS2X_VU1_FAST");
@@ -15007,8 +15140,7 @@ index f19e281..a648a0c 100644
 +    bool decodeCacheReady = false;
 +    if (memory != nullptr && codeSize <= kMaxDecodedPairs * 8u &&
 +        vuCode == (m_unit == Unit::VU1 ? memory->getVU1Code() : memory->getVU0Code()))
-     {
--        commitReadyPipelines();
++    {
 +        const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
 +        if (!m_decodedCodeCacheValid || m_cachedVuCode != vuCode || m_cachedMemory != memory ||
 +            m_cachedCodeSize != codeSize || m_cachedCodeGeneration != generation)
@@ -15017,21 +15149,60 @@ index f19e281..a648a0c 100644
 +    }
 +    // Native program for this microcode image and pc (port/tools/vu1prog.py):
 +    // only at a clean start (nothing in flight), as the generator assumes.
-+    if (m_unit == Unit::VU1 && decodeCacheReady && vu1native::enabled() && !m_state.branchPending &&
-+        !m_state.ebit && !m_state.haltAfterDelaySlot)
++    if (m_unit == Unit::VU1 && decodeCacheReady && replay && replay->allowNative && vu1native::enabled() &&
++        m_cycle < budgetEnd && !m_stopRequested && !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot)
 +    {
-+        if (const vu1native::ProgramFn fn = findNativeProgram(memory->getVU1CodeGeneration(), vuCode, codeSize, m_state.pc))
++        if (const RegisteredProgram *program = findNativeProgram(memory->getVU1CodeGeneration(), vuCode, codeSize, m_state.pc))
 +        {
 +            if (!pipelinesPending())
 +            {
-+                // CLIP shifts on from m_workingClip, as the interpreter does.
-+                programEnded = fn(*this, vuData, dataSize, maxCycles);
-+                m_nextCommit = 0;
++                programEnded = runScheduled(vuCode, codeSize, vuData, dataSize, gs, memory, budgetEnd,
++                                            decodeCacheReady, fastWrites, staticBlocks, replay, program->regionEnds.data());
++                ++replay->programs;
++                replay->completedPrograms += programEnded;
 +            }
 +        }
 +    }
-+    while (!programEnded && m_cycle < budgetEnd && !m_stopRequested)
++    if (!programEnded)
++        programEnded = runScheduled(vuCode, codeSize, vuData, dataSize, gs, memory, budgetEnd,
++                                    decodeCacheReady, fastWrites, staticBlocks, replay);
++
++    if (m_deadSticky != 0u)
 +    {
++        // Not expected (the generator only skips an entry when a later one
++        // in the same block writes status), but never lose sticky bits.
++        commitFlagsUpTo(~0ull);
++        m_state.status |= (m_deadSticky & 0xFu) << 6;
++        m_deadSticky = 0u;
++    }
++    if (programEnded)
++    {
++        flushPipelines();
++        m_state.ebit = false;
++        m_state.haltAfterDelaySlot = false;
++        m_pendingHaltD = false;
++        m_pendingHaltT = false;
++    }
++    m_state.cycles = m_cycle;
++    _mm_setcsr(previousCsr);
++    __asm__ volatile("fldcw %0" : : "m"(previousX87));
++}
++
++
++// The interpreter and scheduled regions execute the same timed pairs. A
++// region exit preserves all in-flight work for the interpreter to continue.
++bool VU1Interpreter::runScheduled(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
++                                 GS &gs, PS2Memory *memory, uint64_t budgetEnd, bool decodeCacheReady,
++                                 bool fastWrites, bool staticBlocks, ReplayDispatch *replay,
++                                 const uint16_t *regionEnds)
++{
+     bool programEnded = false;
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+-        commitReadyPipelines();
++        const uint32_t pairIndex = m_state.pc >> 3;
++        if (regionEnds && (m_state.pc >= 0x4000u || (m_state.pc & 7u) != 0u || !regionEnds[pairIndex]))
++            break;
 +        if (m_cycle >= m_nextCommit)
 +            commitReadyPipelines();
          if (m_state.pc + 8u > codeSize)
@@ -15040,7 +15211,6 @@ index f19e281..a648a0c 100644
 -        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
 +        // Microcode cannot change while VU1 runs, so the cache was validated
 +        // once above; only the lazy per-pair decode is checked here.
-+        const uint32_t pairIndex = m_state.pc >> 3;
 +        const bool cachedPair = decodeCacheReady && (m_state.pc & 7u) == 0u && pairIndex < kMaxDecodedPairs;
 +        if (cachedPair && m_pairEpoch[pairIndex] != m_decodeEpoch)
 +        {
@@ -15058,10 +15228,11 @@ index f19e281..a648a0c 100644
 +            StaticBlock &block = m_staticBlocks[pairIndex];
 +            if (block.epoch != m_decodeEpoch)
 +                buildStaticBlock(block, vuCode, codeSize, pairIndex);
-+            if (block.usable && m_cycle + block.lastOffset + 1u <= budgetEnd && staticEntryOk(block))
++            if (block.usable && (!regionEnds || pairIndex + block.pairCount <= regionEnds[pairIndex]) &&
++                m_cycle + block.lastOffset + 1u <= budgetEnd && staticEntryOk(block))
 +            {
 +                g_vu1Stats.note(0, m_state.pc);
-+                programEnded = runStaticBlock(block, pairIndex, codeSize, vuData, dataSize, gs, memory);
++                programEnded = runStaticBlock(block, pairIndex, codeSize, vuData, dataSize, gs, memory, replay);
 +                if (programEnded)
 +                    break;
 +                continue;
@@ -15086,7 +15257,7 @@ index f19e281..a648a0c 100644
  
          uint64_t readyCycle = calculatePairReadyCycle(decoded);
          while (readyCycle > m_cycle)
-@@ -1660,6 +2614,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1660,6 +2707,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          if (m_cycle >= budgetEnd)
              break;
  
@@ -15099,7 +15270,7 @@ index f19e281..a648a0c 100644
          uint8_t writtenVi = 0u;
          int32_t oldVi = 0;
          for (uint32_t reg = 1; reg < 16u; ++reg)
-@@ -1766,64 +2726,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1766,73 +2819,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          markPairWrites(decoded);
          if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
              recordViWriteForBranch(writtenVi, oldVi);
@@ -15162,25 +15333,18 @@ index f19e281..a648a0c 100644
              break;
      }
  
-+    if (m_deadSticky != 0u)
-+    {
-+        // Not expected (the generator only skips an entry when a later one
-+        // in the same block writes status), but never lose sticky bits.
-+        commitFlagsUpTo(~0ull);
-+        m_state.status |= (m_deadSticky & 0xFu) << 6;
-+        m_deadSticky = 0u;
-+    }
-     if (programEnded)
-     {
-         flushPipelines();
-@@ -1833,6 +2752,6 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
-         m_pendingHaltT = false;
-     }
-     m_state.cycles = m_cycle;
+-    if (programEnded)
+-    {
+-        flushPipelines();
+-        m_state.ebit = false;
+-        m_state.haltAfterDelaySlot = false;
+-        m_pendingHaltD = false;
+-        m_pendingHaltT = false;
+-    }
+-    m_state.cycles = m_cycle;
 -    if (useVuRounding && previousRoundingMode != -1)
 -        std::fesetround(previousRoundingMode);
-+    _mm_setcsr(previousCsr);
-+    __asm__ volatile("fldcw %0" : : "m"(previousX87));
++    return programEnded;
  }
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
 index 94be789..165e032 100644
@@ -15866,15 +16030,15 @@ index 0000000..94c29a5
 +}
 diff --git a/ps2xRuntime/tools/vu1_replay.cpp b/ps2xRuntime/tools/vu1_replay.cpp
 new file mode 100644
-index 0000000..1a6e614
+index 0000000..9af84db
 --- /dev/null
 +++ b/ps2xRuntime/tools/vu1_replay.cpp
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,526 @@
 +// Replays VU1 calls recorded with PS2X_VU_CAPTURE=1 (vu1_capture.bin) through
 +// the runtime's VU1 interpreter, for profiling and for checking that
 +// optimizations don't change results.
 +//
-+//   vu1_replay vu1_capture.bin [repeat] [--dump-out out.bin]
++//   vu1_replay vu1_capture.bin [repeat]
 +
 +#include "ps2_runtime.h"
 +#include "runtime/ps2_memory.h"
@@ -15883,21 +16047,35 @@ index 0000000..1a6e614
 +#include "runtime/gs/gs_frontend.h"
 +#include "runtime/gs/ps2_gif_arbiter.h"
 +
++#include <algorithm>
 +#include <chrono>
 +#include <cstdlib>
 +#include <cstdio>
 +#include <cstring>
 +#include <fstream>
++#include <map>
++#include <tuple>
 +#include <string>
 +#include <vector>
 +
 +namespace
 +{
++    struct EntryStats
++    {
++        size_t calls = 0, compared = 0, differences = 0, cycleDifferences = 0;
++        uint64_t timedCalls = 0, ns = 0, blockCalls = 0, gifBytes = 0, gifPackets = 0;
++        int64_t minCycleDelta = 0, maxCycleDelta = 0;
++        VU1Interpreter::ReplayDispatch dispatch;
++    };
++    using Entry = std::tuple<uint32_t, uint32_t, uint64_t>;
++
 +    struct Record
 +    {
 +        uint32_t kind, startPC, top, itop;
 +        VU1State state;
 +        std::vector<uint8_t> code, data;
++        EntryStats *stats;
++        Entry entry;
 +    };
 +
 +    uint64_t fnv1a(const uint8_t *p, size_t n, uint64_t h = 1469598103934665603ull)
@@ -15911,7 +16089,6 @@ index 0000000..1a6e614
 +#ifdef _WIN32
 +#include <windows.h>
 +#include <atomic>
-+#include <map>
 +#include <thread>
 +namespace
 +{
@@ -16003,23 +16180,35 @@ index 0000000..1a6e614
 +        std::fprintf(stderr, "usage: %s vu1_capture.bin [repeat]\n", argv[0]);
 +        return 1;
 +    }
-+    const int repeat = argc > 2 ? std::atoi(argv[2]) : 20;
++    char *end = nullptr;
++    const long repeat = argc > 2 ? std::strtol(argv[2], &end, 10) : 20;
++    if (argc > 3 || (end && (end == argv[2] || *end)) || repeat < 1 || repeat > 100000)
++    {
++        std::fprintf(stderr, "invalid repeat count\n");
++        return 1;
++    }
 +
 +    std::ifstream in(argv[1], std::ios::binary);
-+    uint32_t header[4];
++    uint32_t header[4]{};
 +    in.read(reinterpret_cast<char *>(header), sizeof(header));
-+    if (!in || header[0] != 0x31555658u || header[2] != sizeof(VU1State))
++    if (!in || header[0] != 0x31555658u || header[1] != 1 || header[2] != sizeof(VU1State) || header[3] != 0)
 +    {
-+        std::fprintf(stderr, "bad capture (state size %u, expected %zu)\n", header[2], sizeof(VU1State));
++        std::fprintf(stderr, "bad XVU1 capture header (state size %u, expected %zu)\n", header[2], sizeof(VU1State));
 +        return 1;
 +    }
 +    std::vector<Record> records;
++    std::map<Entry, EntryStats> entries;
 +    for (;;)
 +    {
 +        Record r;
 +        uint32_t rec[4];
 +        if (!in.read(reinterpret_cast<char *>(rec), sizeof(rec)))
-+            break;
++        {
++            if (in.eof() && !in.bad() && in.gcount() == 0)
++                break;
++            std::fprintf(stderr, "incomplete capture record header\n");
++            return 1;
++        }
 +        r.kind = rec[0]; r.startPC = rec[1]; r.top = rec[2]; r.itop = rec[3];
 +        in.read(reinterpret_cast<char *>(&r.state), sizeof(VU1State));
 +        r.code.resize(PS2_VU1_CODE_SIZE);
@@ -16027,10 +16216,30 @@ index 0000000..1a6e614
 +        in.read(reinterpret_cast<char *>(r.code.data()), PS2_VU1_CODE_SIZE);
 +        in.read(reinterpret_cast<char *>(r.data.data()), PS2_VU1_DATA_SIZE);
 +        if (!in)
-+            break;
++        {
++            std::fprintf(stderr, "incomplete capture record payload\n");
++            return 1;
++        }
++        const uint32_t pc = r.kind ? r.state.pc : r.startPC;
++        if (r.kind > 1 || pc >= PS2_VU1_CODE_SIZE || (pc & 7u))
++        {
++            std::fprintf(stderr, "invalid capture entry at record %zu\n", records.size());
++            return 1;
++        }
++        const uint16_t fullRange[] = {0, PS2_VU1_CODE_SIZE};
++        const uint64_t hash = vu1native::codeHash(r.code.data(), fullRange, 1);
++        r.entry = {r.kind, pc, hash};
++        r.stats = &entries[r.entry];
++        ++r.stats->calls;
 +        records.push_back(std::move(r));
 +    }
++    if (records.empty())
++    {
++        std::fprintf(stderr, "capture contains no calls\n");
++        return 1;
++    }
 +    std::printf("loaded %zu VU1 calls\n", records.size());
++    std::printf("registered programs=%zu blocks=%zu\n", vu1native::programCount(), VU1Interpreter::compiledBlockCount());
 +
 +    PS2Memory memory;
 +    if (!memory.initialize())
@@ -16041,7 +16250,14 @@ index 0000000..1a6e614
 +    uint64_t gifBytes = 0, gifPackets = 0;
 +    std::ofstream gifDump;
 +    if (const char *path = std::getenv("VU_REPLAY_GIFDUMP"))
++    {
 +        gifDump.open(path, std::ios::binary);
++        if (!gifDump)
++        {
++            std::fprintf(stderr, "cannot open GIF dump\n");
++            return 1;
++        }
++    }
 +    arbiter.setProcessPacketFn([&](const uint8_t *d, uint32_t size) {
 +        if (gifDump.is_open())
 +        {
@@ -16059,105 +16275,49 @@ index 0000000..1a6e614
 +    VU1Interpreter vu(VU1Interpreter::Unit::VU1);
 +    vu.reset();
 +
-+    uint64_t checksum = 0;
-+    double totalNs = 0;
-+    uint64_t totalCycles = 0;
 +    const bool forceInvalidate = std::getenv("VU_REPLAY_INVALIDATE") != nullptr;
-+    for (int pass = 0; pass < repeat; ++pass)
-+    {
-+        gifBytes = gifPackets = 0;
-+        uint64_t cycles = 0;
-+        double callNs = 0;
-+        const auto t0 = std::chrono::steady_clock::now();
-+        for (const Record &r : records)
++    auto prepare = [&](const Record &r) {
++        if (std::memcmp(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE) != 0 || forceInvalidate)
 +        {
-+            if (std::memcmp(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE) != 0)
-+            {
-+                std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
-+                memory.markVU1CodeModified();
-+            }
-+            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
-+            const uint64_t before = vu.state().cycles; // interpreter's running cycle count
-+            vu.state() = r.state;
-+            vu.state().cycles = before;
-+            if (forceInvalidate)
-+                memory.markVU1CodeModified(); // the game re-uploads microcode (MPG) before its calls
-+            const auto c0 = std::chrono::steady_clock::now();
-+            if (r.kind == 0)
-+                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-+                           gs, &memory, r.startPC, r.top, r.itop, 65536);
-+            else
-+                vu.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-+                          gs, &memory, r.top, r.itop, 65536);
-+            arbiter.drain();
-+            callNs += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - c0).count();
-+            cycles += vu.state().cycles - before;
-+            if (pass == 0)
-+            {
-+                checksum = fnv1a(memory.getVU1Data(), PS2_VU1_DATA_SIZE, checksum);
-+                checksum = fnv1a(reinterpret_cast<const uint8_t *>(vu.state().vf), sizeof(vu.state().vf), checksum);
-+                checksum = fnv1a(reinterpret_cast<const uint8_t *>(vu.state().vi), sizeof(vu.state().vi), checksum);
-+                const uint32_t flags[3] = {vu.state().mac, vu.state().status, vu.state().clip};
-+                checksum = fnv1a(reinterpret_cast<const uint8_t *>(flags), sizeof(flags), checksum);
-+            }
-+        }
-+        const double ns = callNs; (void)t0;
-+        if (pass > 0) // first pass warms caches
-+        {
-+            totalNs += ns;
-+            totalCycles += cycles;
-+        }
-+    }
-+    if (std::getenv("VU_REPLAY_DETAIL"))
-+    {
-+        for (size_t i = 0; i < records.size(); ++i)
-+        {
-+            const Record &r = records[i];
 +            std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
 +            memory.markVU1CodeModified();
-+            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
-+            vu.state() = r.state;
-+            gifBytes = 0;
-+            if (r.kind == 0)
-+                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-+                           gs, &memory, r.startPC, r.top, r.itop, 65536);
-+            else
-+                vu.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-+                          gs, &memory, r.top, r.itop, 65536);
-+            arbiter.drain();
-+            const VU1State &st = vu.state();
-+            std::printf("call %3zu kind=%u start=0x%04x end_pc=0x%04x cycles=%6llu ebit=%d D=%d T=%d gif=%llu\n", i, r.kind,
-+                        r.startPC, st.pc, (unsigned long long)st.cycles, st.ebit, st.stoppedByD, st.stoppedByT,
-+                        (unsigned long long)gifBytes);
 +        }
-+    }
-+    // VU_REPLAY_NATIVE_CMP=1: run every call with native programs
-+    // (port/tools/vu1prog.py) and with the interpreter alone, and report the
-+    // calls whose results differ (VU memory, registers, flags, pc, GIF).
++        std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
++        vu.restoreReplayState(r.state);
++    };
++    auto execute = [&](const Record &r, VU1Interpreter::ReplayDispatch *replay = nullptr) {
++        if (r.kind == 0)
++            vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                       gs, &memory, r.startPC, r.top, r.itop, 65536, replay);
++        else
++            vu.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                      gs, &memory, r.top, r.itop, 65536, replay);
++        arbiter.drain();
++    };
++
++    // Compare the selected dispatch mode against interpreter-only execution.
++    // GIF bytes include the length of each packet at the arbiter boundary.
 +    if (std::getenv("VU_REPLAY_NATIVE_CMP"))
 +    {
 +        std::vector<uint8_t> gifBuf;
-+        arbiter.setProcessPacketFn([&](const uint8_t *d, uint32_t size) { gifBuf.insert(gifBuf.end(), d, d + size); });
++        arbiter.setProcessPacketFn([&](const uint8_t *d, uint32_t size) {
++            const auto *length = reinterpret_cast<const uint8_t *>(&size);
++            gifBuf.insert(gifBuf.end(), length, length + sizeof(size));
++            gifBuf.insert(gifBuf.end(), d, d + size);
++            gifBytes += size;
++            ++gifPackets;
++        });
 +        struct Result
 +        {
 +            std::vector<uint8_t> data, gif;
 +            VU1State st;
 +        };
-+        auto runOne = [&](const Record &r, bool native, Result &out) {
-+            vu1native::setEnabled(native);
-+            std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
-+            memory.markVU1CodeModified();
-+            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
-+            vu.reset(); // same hidden state (working CLIP) for both runs
-+            vu.state() = r.state;
++        auto runOne = [&](const Record &r, bool native, Result &out, VU1Interpreter::ReplayDispatch &dispatch) {
++            dispatch.allowNative = native;
++            prepare(r);
 +            gifBuf.clear();
-+            if (r.kind == 0)
-+                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-+                           gs, &memory, r.startPC, r.top, r.itop, 65536);
-+            else
-+                vu.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-+                          gs, &memory, r.top, r.itop, 65536);
-+            arbiter.drain();
++            gifBytes = gifPackets = 0;
++            execute(r, &dispatch);
 +            out.data.assign(memory.getVU1Data(), memory.getVU1Data() + PS2_VU1_DATA_SIZE);
 +            out.gif = gifBuf;
 +            out.st = vu.state();
@@ -16165,9 +16325,25 @@ index 0000000..1a6e614
 +        size_t bad = 0;
 +        for (size_t i = 0; i < records.size(); ++i)
 +        {
++            const Record &r = records[i];
++            EntryStats &stats = *r.stats;
 +            Result a, b;
-+            runOne(records[i], true, a);
-+            runOne(records[i], false, b);
++            VU1Interpreter::ReplayDispatch selected, reference;
++            runOne(r, true, a, selected);
++            stats.gifBytes += gifBytes;
++            stats.gifPackets += gifPackets;
++            runOne(r, false, b, reference);
++            if (reference.programs || reference.blocks)
++            {
++                std::fprintf(stderr, "interpreter reference dispatched native code\n");
++                return 1;
++            }
++            ++stats.compared;
++            stats.blockCalls += selected.blocks != 0;
++            stats.dispatch.blocks += selected.blocks;
++            stats.dispatch.blockPairs += selected.blockPairs;
++            stats.dispatch.programs += selected.programs;
++            stats.dispatch.completedPrograms += selected.completedPrograms;
 +            std::string why;
 +            char tmp[160];
 +            for (size_t q = 0; q < PS2_VU1_DATA_SIZE / 16 && why.size() < 300; ++q)
@@ -16191,10 +16367,10 @@ index 0000000..1a6e614
 +                }
 +            if (std::memcmp(a.st.acc, b.st.acc, 16))
 +                why += " acc";
-+            const uint32_t fa[7] = {a.st.mac, a.st.status, a.st.clip, a.st.pc, 0, 0, 0};
-+            const uint32_t fb[7] = {b.st.mac, b.st.status, b.st.clip, b.st.pc, 0, 0, 0};
-+            const char *names[4] = {"mac", "status", "clip", "pc"};
-+            for (int k = 0; k < 4; ++k)
++            const uint32_t fa[] = {a.st.mac, a.st.status, a.st.clip, a.st.pc, a.st.r};
++            const uint32_t fb[] = {b.st.mac, b.st.status, b.st.clip, b.st.pc, b.st.r};
++            const char *names[] = {"mac", "status", "clip", "pc", "r"};
++            for (int k = 0; k < 5; ++k)
 +                if (fa[k] != fb[k])
 +                {
 +                    std::snprintf(tmp, sizeof(tmp), " %s(%x/%x)", names[k], fa[k], fb[k]);
@@ -16202,6 +16378,29 @@ index 0000000..1a6e614
 +                }
 +            if (std::memcmp(&a.st.q, &b.st.q, 4) || std::memcmp(&a.st.p, &b.st.p, 4) || std::memcmp(&a.st.i, &b.st.i, 4))
 +                why += " q/p/i";
++            if (a.st.ebit != b.st.ebit || a.st.haltAfterDelaySlot != b.st.haltAfterDelaySlot ||
++                a.st.stoppedByD != b.st.stoppedByD || a.st.stoppedByT != b.st.stoppedByT ||
++                a.st.top != b.st.top || a.st.itop != b.st.itop ||
++                a.st.dBitEnabled != b.st.dBitEnabled || a.st.tBitEnabled != b.st.tBitEnabled ||
++                a.st.branchPending != b.st.branchPending ||
++                (a.st.branchPending && (a.st.branchTarget != b.st.branchTarget || a.st.branchDelay != b.st.branchDelay)))
++                why += " control";
++            if (a.st.cycles != b.st.cycles)
++            {
++                const int64_t delta = static_cast<int64_t>(a.st.cycles - r.state.cycles)
++                                    - static_cast<int64_t>(b.st.cycles - r.state.cycles);
++                if (stats.cycleDifferences++ == 0)
++                    stats.minCycleDelta = stats.maxCycleDelta = delta;
++                else
++                {
++                    stats.minCycleDelta = std::min(stats.minCycleDelta, delta);
++                    stats.maxCycleDelta = std::max(stats.maxCycleDelta, delta);
++                }
++                // The existing whole-program generator counts issued pairs.
++                // Native blocks must preserve the interpreter scheduler's cycles.
++                if (!selected.programs)
++                    why += " cycles";
++            }
 +            if (a.gif != b.gif)
 +            {
 +                std::snprintf(tmp, sizeof(tmp), " gif(%zu/%zu bytes)", a.gif.size(), b.gif.size());
@@ -16209,14 +16408,79 @@ index 0000000..1a6e614
 +            }
 +            if (!why.empty())
 +            {
-+                if (bad < 10)
-+                    std::printf("call %zu kind=%u pc=0x%04x differs:%s\n", i, records[i].kind,
-+                                records[i].kind ? records[i].state.pc : records[i].startPC, why.c_str());
++                if (stats.differences < 3)
++                    std::printf("call %zu kind=%u pc=0x%04x differs:%s\n", i, r.kind, std::get<1>(r.entry), why.c_str());
++                ++stats.differences;
 +                ++bad;
 +            }
 +        }
++        for (const auto &[entry, stats] : entries)
++        {
++            const auto [kind, pc, hash] = entry;
++            std::printf("compare kind=%u pc=%04x code=%016llx calls=%zu differences=%zu cycle_differences=%zu"
++                        " cycle_delta_min=%lld cycle_delta_max=%lld"
++                        " programs=%llu completed=%llu block_calls=%llu blocks=%llu block_pairs=%llu"
++                        " gif_packets=%llu gif_bytes=%llu\n",
++                        kind, pc, (unsigned long long)hash, stats.compared, stats.differences, stats.cycleDifferences,
++                        (long long)stats.minCycleDelta, (long long)stats.maxCycleDelta,
++                        (unsigned long long)stats.dispatch.programs, (unsigned long long)stats.dispatch.completedPrograms,
++                        (unsigned long long)stats.blockCalls, (unsigned long long)stats.dispatch.blocks,
++                        (unsigned long long)stats.dispatch.blockPairs, (unsigned long long)stats.gifPackets,
++                        (unsigned long long)stats.gifBytes);
++        }
 +        std::printf("native compare: %zu of %zu calls differ\n", bad, records.size());
 +        return bad != 0;
++    }
++    uint64_t checksum = 0;
++    uint64_t totalNs = 0, totalCycles = 0;
++    for (long pass = 0; pass < repeat; ++pass)
++    {
++        gifBytes = gifPackets = 0;
++        for (const Record &r : records)
++        {
++            prepare(r);
++            const auto c0 = std::chrono::steady_clock::now();
++            execute(r);
++            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c0).count();
++            if (pass > 0)
++            {
++                totalNs += ns;
++                totalCycles += vu.state().cycles - r.state.cycles;
++                r.stats->ns += ns;
++                ++r.stats->timedCalls;
++            }
++            else
++            {
++                checksum = fnv1a(memory.getVU1Data(), PS2_VU1_DATA_SIZE, checksum);
++                checksum = fnv1a(reinterpret_cast<const uint8_t *>(vu.state().vf), sizeof(vu.state().vf), checksum);
++                checksum = fnv1a(reinterpret_cast<const uint8_t *>(vu.state().vi), sizeof(vu.state().vi), checksum);
++                const uint32_t flags[3] = {vu.state().mac, vu.state().status, vu.state().clip};
++                checksum = fnv1a(reinterpret_cast<const uint8_t *>(flags), sizeof(flags), checksum);
++            }
++        }
++    }
++    if (std::getenv("VU_REPLAY_DETAIL"))
++    {
++        for (size_t i = 0; i < records.size(); ++i)
++        {
++            const Record &r = records[i];
++            std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
++            memory.markVU1CodeModified();
++            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
++            vu.restoreReplayState(r.state);
++            gifBytes = 0;
++            if (r.kind == 0)
++                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                           gs, &memory, r.startPC, r.top, r.itop, 65536);
++            else
++                vu.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                          gs, &memory, r.top, r.itop, 65536);
++            arbiter.drain();
++            const VU1State &st = vu.state();
++            std::printf("call %3zu kind=%u start=0x%04x end_pc=0x%04x cycles=%6llu ebit=%d D=%d T=%d gif=%llu\n", i, r.kind,
++                        r.startPC, st.pc, (unsigned long long)st.cycles, st.ebit, st.stoppedByD, st.stoppedByT,
++                        (unsigned long long)gifBytes);
++        }
 +    }
 +    // VU_REPLAY_STALE=1: would call i give the same result if it started from
 +    // call i-1's registers (its own memory and pc)? Tests whether calls depend
@@ -16229,7 +16493,7 @@ index 0000000..1a6e614
 +            std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
 +            memory.markVU1CodeModified();
 +            std::memcpy(memory.getVU1Data(), r.data.data(), PS2_VU1_DATA_SIZE);
-+            vu.state() = start;
++            vu.restoreReplayState(start);
 +            gifHash = 0;
 +            if (r.kind == 0)
 +                vu.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
@@ -16271,9 +16535,25 @@ index 0000000..1a6e614
 +                    differ, regsChanged);
 +        return 0;
 +    }
-+    const int timed = repeat > 1 ? repeat - 1 : 1;
++    if (gifDump.is_open())
++    {
++        gifDump.close();
++        if (!gifDump)
++        {
++            std::fprintf(stderr, "could not write GIF dump\n");
++            return 1;
++        }
++    }
++    for (const auto &[entry, stats] : entries)
++    {
++        const auto [kind, pc, hash] = entry;
++        std::printf("timing kind=%u pc=%04x code=%016llx calls=%zu timed=%llu ns=%llu\n",
++                    kind, pc, (unsigned long long)hash, stats.calls, (unsigned long long)stats.timedCalls,
++                    (unsigned long long)stats.ns);
++    }
++    const long timed = repeat > 1 ? repeat - 1 : 1;
 +    std::printf("per call: %.1f us   per VU cycle: %.1f ns   VU cycles/call: %.0f\n",
-+                totalNs / timed / records.size() / 1000.0, totalNs / (totalCycles ? totalCycles : 1),
++                double(totalNs) / timed / records.size() / 1000.0, double(totalNs) / (totalCycles ? totalCycles : 1),
 +                double(totalCycles) / timed / records.size());
 +    std::printf("gif packets/pass: %llu  gif bytes/pass: %llu\n", (unsigned long long)gifPackets,
 +                (unsigned long long)gifBytes);

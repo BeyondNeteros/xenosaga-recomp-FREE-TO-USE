@@ -12,16 +12,16 @@
 #   every runs/*/vu1_capture.bin, copies the .gcda files next to the matching
 #   objects in build-runtime and rebuilds there with PS2X_PGO_USE=ON.
 # Same output either way (check with tools/vu1_check.sh). Rerun after VU1/GS
-# code changes or regenerating the native blocks or programs.
+# code changes or regenerating the native blocks.
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export PATH="/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH"
 RECOMP="$ROOT/PS2Recomp"
 USE="$RECOMP/build-runtime"
 FLAGS="-msse4.2 -mavx2 -Wa,-mbig-obj"
-# Generated native VU1 code (vu1gen.py blocks, vu1prog.py programs) is built
+# Generated native VU1 code (vu1gen.py blocks) is built
 # into both targets; their profiles are shared.
-GENERATED="xenosaga_vu1_blocks xenosaga_vu1_programs"
+GENERATED="xenosaga_vu1_blocks"
 GEN_GCDA="ps2xRuntime/CMakeFiles/%s.dir/src/runner/%s.cpp.gcda"
 
 pgo_objects() # objects of the PGO sources in build-runtime
@@ -34,15 +34,16 @@ pgo_objects() # objects of the PGO sources in build-runtime
 }
 
 if [ "${1:-}" = "game" ]; then
+    : "${PGO_INPUT:?set PGO_INPUT to a local input script}"
     find "$USE" -name '*.gcda' -delete # old profiles (build output)
     cmake "$USE" -DPS2X_PGO_GENERATE=ON -DPS2X_PGO_USE=OFF > /dev/null
     cmake --build "$USE" --target ps2EntryRunner | tail -1
     bash "$ROOT/port/tools/install.sh" | tail -1
     # PGO_INPUT / PGO_SECONDS / PGO_DUMP pick another script (e.g. a recorded
     # session with battles), how long it runs and when the profile is written.
-    echo "training: playing ${PGO_INPUT:-the tutorial script} (instrumented build)..."
+    echo "training: playing $PGO_INPUT (instrumented build)..."
     bash "$ROOT/port/tools/run_game.sh" pgo-train "${PGO_SECONDS:-300}" \
-        --input "${PGO_INPUT:-$ROOT/port/inputs/newgame-to-tutorial.txt}" \
+        --input "$PGO_INPUT" \
         --env XS_PGO_DUMP="${PGO_DUMP:-160}" > /dev/null 2>&1 || true
     grep -q "PGO profile written" "$ROOT/runs/pgo-train/xenosaga.log" || { echo "no profile written"; exit 1; }
     for g in $GENERATED; do

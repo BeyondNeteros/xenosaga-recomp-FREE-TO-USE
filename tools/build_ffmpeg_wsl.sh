@@ -15,6 +15,9 @@ if [[ ! -x "$source_dir/configure" || ! -f "$source_dir/RELEASE" ]] ||
     exit 2
 fi
 
+jobs=${JOBS:-4}
+[[ $jobs =~ ^([1-9]|1[0-6])$ ]] || { echo "JOBS must be between 1 and 16" >&2; exit 2; }
+
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/xenosaga-ffmpeg.XXXXXX")
 printf 'FFmpeg build directory (retained for inspection): %s\n' "$build_dir"
 cd "$build_dir"
@@ -25,7 +28,7 @@ cd "$build_dir"
     --cross-prefix=x86_64-w64-mingw32- --cc=x86_64-w64-mingw32-gcc-posix \
     --enable-shared --disable-static --disable-programs --disable-doc \
     --disable-debug --disable-autodetect
-make -j "${JOBS:-$(nproc)}"
+make -j "$jobs"
 make install
 
 env -u PKG_CONFIG_SYSROOT_DIR PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" \

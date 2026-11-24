@@ -7,40 +7,17 @@ built by statically recompiling the original game code with [PS2Recomp](https://
 
 ## Picking this up
 
-The original author has stopped working on this and it is free for someone else to
-continue. Start with `CLAUDE.md` (setup, build, tools), then `NOTES.md` (newest
-findings first). The port targets PS2Recomp commit `e563698` plus
-`patches/ps2recomp-runtime.patch`.
-
-Where it was left:
-
-- **Speed:** the Woglinde Lab holds 30 fps in the last test. Story cutscenes and
-  battles were not retested on the latest build. 60 fps needs roughly twice the
-  current VU1 headroom; the next ideas are in `NOTES.md`.
-- **Open bug:** one NPC at the Lab console stands with streaky clothing where a
-  new game in PCSX2 shows him seated. It may be story-dependent; the next test is
-  in `NOTES.md` under "Streaky NPC clothing".
-- **Known gaps:** the widescreen HUD and menus are stretched, the menu screen runs
-  at about 24 fps, and the launcher's build from a disc cannot generate the native
-  VU1 programs yet (they need captures; see `NOTES.md`).
-- **Test scripts:** `tools/run_game.sh` and `tools/install.sh` need `XS_GAME_DIR`
-  and `XS_DISC` set to your own install folder and disc image.
+The port targets PS2Recomp commit `e563698` plus
+`patches/ps2recomp-runtime.patch`. See [Build with Debian 13 WSL2](docs/BUILD_WSL.md)
+and [developer notes](CLAUDE.md) for setup. See [VU1 validation](docs/VU1_PERFORMANCE.md)
+for the recorded-route comparison and replay procedure.
 
 ## Status
 
-Playable from the start through the Virtual Tutorial and into the first field
-areas.
-
-| Part | State |
-|---|---|
-| Main executable (`SLUS_204.69`) | Recompiles cleanly |
-| Overlays (`OV01/02/10/11/12.OVL`) | Recompile cleanly; swapped in at runtime |
-| Boot, disc access (dual-layer ISO) | Working |
-| Menus, text, FMVs, 3D scenes | Rendering |
-| Battles | Tutorial and first field battles play through |
-| Sound and music | Working (game's own sound driver on an emulated SPU2) |
-| Speed | Locked 30 fps in the tutorial, field and battles tested so far (GPU renderer) |
-| Display | 4:3 / 16:9 (experimental), fullscreen, sharp scaling, screenshots |
+This is a work in progress. The upstream port reached the Virtual Tutorial
+and early field areas. The native VU1 block baseline was validated on one
+recorded Woglinde route. Scene coverage, rendering, audio synchronization and
+support across other systems remain open.
 
 ## Getting the game running (players)
 
@@ -112,7 +89,7 @@ the exe; the launcher's **Settings** opens it.
 
 ## Building (developer notes)
 
-See `CLAUDE.md` for the full setup or [Build with Debian 13 WSL2](docs/BUILD_WSL.md)
+See [developer notes](CLAUDE.md) for setup or [Build with Debian 13 WSL2](docs/BUILD_WSL.md)
 for cross-compilation. In short:
 
 1. Dump your own disc. Copy `SYSTEM.CNF`, `SLUS_204.69`, and `OV*.OVL` from its root into a folder.
