@@ -158,6 +158,10 @@ It currently targets PS2Recomp commit `e563698` with the modifications in `patch
 
 Contributions and bug reports are welcome.
 
+- [Contribution Guide](CONTRIBUTING.md)
+- [Development Issues](https://github.com/gwencrow/xenosaga-recomp/issues)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+
 When reporting an issue, please include your hardware specifications, operating system, graphics settings, build version, and steps to reproduce it.
 
 Do not upload game files, generated game code, memory dumps, or other proprietary game data.
