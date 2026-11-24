@@ -124,7 +124,11 @@ It currently targets PS2Recomp commit `e563698` with the modifications in `patch
 | `launcher/` | Windows launcher |
 | `dist/` | Runtime launch scripts |
 
-See [CLAUDE.md](CLAUDE.md) for build instructions and developer setup.
+### Developer Documentation
+
+- [Developer Setup](CLAUDE.md)
+- [WSL2 Build Guide](docs/BUILD_WSL.md)
+- [VU1 Performance and Validation](docs/VU1_PERFORMANCE.md)
 
 ## Contributing
 

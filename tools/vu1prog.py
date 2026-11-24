@@ -1,42 +1,17 @@
 #!/usr/bin/env python3
-"""Compile whole VU1 microprogram calls into native C++ (native programs).
+"""Generate scheduler-backed VU1 regions from private capture data.
 
-vu1gen.py makes native versions of single static blocks, but the runtime still
-does cycle-accurate bookkeeping between and around them (~30% of VU1 time),
-and every instruction still updates the delayed-write pipelines. This tool
-compiles a whole call path instead: from an entry pc (where the game starts or
-resumes VU1, taken from VU1 captures) through every branch and subroutine to
-the E-bit end, as one C++ function with gotos and *sequential* semantics:
-every result lands at once and MAC/status/CLIP/Q/P commit immediately.
+This offline replay experiment shares the block/interpreter cycle scheduler.
+Use vu1_validate.py to compare state, GIF packets, dispatch and cycles.
 
-That equals the interpreter whenever every read sees the newest value. VF and
-VI reads are interlocked on the VU (they stall), so they always do. For the
-rest the tool proves it per read, along every path of the control-flow graph:
+    python port/tools/vu1prog.py <capture> [--min-calls N]
 
-- Q (DIV 7, SQRT 7, RSQRT 13 cycles), P (EFU ops, 11-54), status/MAC flags
-  (FMAC 4, FDIV D/I bits), CLIP (4): the newest writer before the reader must
-  be at least its latency in pairs earlier (pairs issue at least one cycle
-  apart, stalls only add distance). A writer in the reader's own pair is never
-  seen: the lower half runs first when it reads flags.
-- A branch reading a VI that the previous pair wrote with an integer op sees
-  the old value (as the interpreter's readBranchVi): handled with a backup.
-- XGKICK sends the whole packet at once: no store may follow it before the
-  program ends.
-
-Anything it cannot prove is reported and the program is not generated (fix the
-analysis or leave that entry to the interpreter). Unknown jump targets hand
-off to the interpreter at that pc. Check with tools/vu1_check.sh: the
-captures replay through native programs and must match the reference.
-
-    python port/tools/vu1prog.py runs/*/vu1_capture.bin [--min-calls N]
-
-Writes recomp/xenosaga_vu1_programs.cpp and copies it into
-PS2Recomp/ps2xRuntime/src/runner. The output is derived from game code: never
-commit it.
+Writes recomp/xenosaga_vu1_programs.cpp. Keep the game-derived output private.
+An experimental replayer can compile it from ps2xRuntime/tools with the
+PS2X_VU_REPLAY_REGIONS CMake option. Gameplay assembly never copies it.
 """
 import argparse
 import os
-import shutil
 import re
 import struct
 import sys
@@ -49,7 +24,6 @@ import vudis  # noqa: E402
 
 ROOT = Path(os.environ.get("XS_ROOT", Path(__file__).resolve().parents[2]))
 OUT = ROOT / "recomp" / "xenosaga_vu1_programs.cpp"
-RUNNER = Path(os.environ.get("PS2RECOMP", ROOT / "PS2Recomp")) / "ps2xRuntime" / "src" / "runner"
 MASK64 = (1 << 64) - 1
 CODE_SIZE = 0x4000
 
@@ -85,7 +59,6 @@ def imm11(i):
     return v - 0x800 if v & 0x400 else v
 
 
-REV4 = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]  # DEST bits -> component bits
 FMAC_FLAG_OPS = set(range(0x00, 0x10)) | set(range(0x18, 0x1C)) | {0x1C, 0x1E} | set(range(0x20, 0x2B)) | {0x2C, 0x2D, 0x2E}
 Q_READ_OPS = {0x1C, 0x20, 0x21, 0x24, 0x25}  # mulq addq maddq subq msubq (and the ACC forms)
 EFU_LAT = {0x70: 11, 0x71: 18, 0x72: 18, 0x73: 24, 0x74: 54, 0x75: 54, 0x76: 12, 0x77: 18, 0x78: 12,
@@ -258,116 +231,6 @@ class Lower:
             self.vi_write = None
         if self.vf_write == 0:
             self.vf_write = None
-
-    def generic(self):
-        """The interpreter runs it: the VF registers it reads (and the one it
-        writes, for its other lanes) go to VU state first; the written one
-        comes back."""
-        regs = sorted(r for r in self.vf_reads | ({self.vf_write} if self.vf_write else set()) if r)
-        out = [f"_mm_storeu_ps(s.vf[{r}], v{r});" for r in regs]
-        out.append(f"F::nLowerGeneric<0x{self.w:08x}u>(vu, D, ds);")
-        if self.vf_write:
-            out.append(f"v{self.vf_write} = _mm_loadu_ps(s.vf[{self.vf_write}]);")
-        return out
-
-    # C++ for the instruction (branches/jumps are emitted by the caller).
-    def cpp(self, bk_regs=()):
-        w = self.w
-        if self.kind == "nop":
-            return []
-        op = self.op
-        it, is_, id_ = (w >> 16) & 15, (w >> 11) & 15, (w >> 6) & 15
-        ft, fs = (w >> 16) & 31, (w >> 11) & 31
-        d = (w >> 21) & 0xF
-        m = REV4[d]
-        imm = imm11(w)
-        if op == 0x00:
-            return [f"v{ft} = F_lqR<{m}>(v{ft}, D, s.vi[{is_}] + ({imm}));"] if ft else []
-        if op == 0x01:
-            return [f"F_sqR(D, s.vi[{it}] + ({imm}), v{fs}, {m});"]
-        if op == 0x04:
-            comp = 0 if d & 8 else 1 if d & 4 else 2 if d & 2 else 3
-            return [f"s.vi[{it}] = F_ilw(D, s.vi[{is_}] + ({imm}), {comp});"] if it else []
-        if op == 0x05:
-            return [f"F_isw(D, s.vi[{is_}] + ({imm}), s.vi[{it}], {m});"]
-        if op in (0x08, 0x09):
-            imm15 = (w & 0x7FF) | ((w >> 10) & 0x7800)
-            sign = "+" if op == 0x08 else "-"
-            return [f"s.vi[{it}] = static_cast<int16_t>(s.vi[{is_}] {sign} {imm15});"] if it else []
-        if op in (0x10, 0x12, 0x13, 0x1C):
-            imm24 = w & 0xFFFFFF
-            if op == 0x10:
-                return [f"s.vi[1] = (s.clip & 0xFFFFFFu) == 0x{imm24:x}u ? 1 : 0;"]
-            if op == 0x12:
-                return [f"s.vi[1] = (s.clip & 0x{imm24:x}u) != 0u ? 1 : 0;"]
-            if op == 0x13:
-                return [f"s.vi[1] = (s.clip | 0x{imm24:x}u) == 0xFFFFFFu ? 1 : 0;"]
-            return [f"s.vi[{it}] = static_cast<int32_t>(s.clip & 0x0FFFu);"] if it else []
-        if op in (0x14, 0x16, 0x17):
-            imm12 = (((w >> 21) & 1) << 11) | (w & 0x7FF)
-            if not it:
-                return []
-            if op == 0x14:
-                return [f"s.vi[{it}] = (s.status & 0xFFFu) == 0x{imm12:x}u ? 1 : 0;"]
-            if op == 0x16:
-                return [f"s.vi[{it}] = static_cast<int32_t>(s.status & 0x{imm12:x}u);"]
-            return [f"s.vi[{it}] = static_cast<int32_t>((s.status & 0xFFFu) | 0x{imm12:x}u);"]
-        if op in (0x11, 0x15, 0x18, 0x1A, 0x1B):
-            return self.generic()
-        if op == 0x40:
-            f = w & 0x3F
-            if f in (0x30, 0x31):
-                sign = "+" if f == 0x30 else "-"
-                return [f"s.vi[{id_}] = static_cast<int16_t>(s.vi[{is_}] {sign} s.vi[{it}]);"] if id_ else []
-            if f in (0x34, 0x35):
-                o = "&" if f == 0x34 else "|"
-                return [f"s.vi[{id_}] = s.vi[{is_}] {o} s.vi[{it}];"] if id_ else []
-            if f == 0x32:
-                v = (w >> 6) & 31
-                v = v - 32 if v & 16 else v
-                return [f"s.vi[{it}] = static_cast<int16_t>(s.vi[{is_}] + ({v}));"] if it else []
-            s_ = self.special
-            if s_ == 0x30:
-                return [f"v{ft} = F_blend<{m}>(v{ft}, v{fs});"] if ft else []
-            if s_ == 0x31:
-                return [f"v{ft} = F_blend<{m}>(v{ft}, F_rot(v{fs}));"] if ft else []
-            if s_ == 0x34:
-                out = [f"v{ft} = F_lqR<{m}>(v{ft}, D, static_cast<uint16_t>(s.vi[{is_}]));"] if ft else []
-                if is_:
-                    out.append(f"s.vi[{is_}] = static_cast<int16_t>(s.vi[{is_}] + 1);")
-                return out
-            if s_ == 0x35:
-                out = [f"F_sqR(D, static_cast<uint16_t>(s.vi[{it}]), v{fs}, {m});"]
-                if it:
-                    out.append(f"s.vi[{it}] = static_cast<int16_t>(s.vi[{it}] + 1);")
-                return out
-            if s_ == 0x36:
-                out = [f"s.vi[{is_}] = static_cast<int16_t>(s.vi[{is_}] - 1);"] if is_ else []
-                if ft:
-                    out.append(f"v{ft} = F_lqR<{m}>(v{ft}, D, static_cast<uint16_t>(s.vi[{is_}]));")
-                return out
-            if s_ == 0x37:
-                out = [f"s.vi[{it}] = static_cast<int16_t>(s.vi[{it}] - 1);"] if it else []
-                out.append(f"F_sqR(D, static_cast<uint16_t>(s.vi[{it}]), v{fs}, {m});")
-                return out
-            if s_ in (0x3B, 0x7B):
-                return []
-            if s_ == 0x3C:
-                comp = (w >> 21) & 3
-                return [f"s.vi[{it}] = F_mtirR<{comp}>(v{fs});"] if it else []
-            if s_ == 0x3D:
-                return [f"v{ft} = F_blend<{m}>(v{ft}, F_mfir(s.vi[{is_}]));"] if ft else []
-            if s_ == 0x64:
-                return [f"v{ft} = F_blend<{m}>(v{ft}, _mm_set1_ps(s.p));"] if ft else []
-            if s_ == 0x68:
-                return [f"s.vi[{it}] = static_cast<int32_t>(s.top & 0x3FFu);"] if it else []
-            if s_ == 0x69:
-                return [f"s.vi[{it}] = static_cast<int32_t>(s.itop & 0x3FFu);"] if it else []
-            if s_ == 0x6C:
-                return [f"F::nKick(vu, s.vi[{is_}]);"]
-            # DIV/SQRT/RSQRT, EFU, ILWR/ISWR, R*: the interpreter's own code.
-            return self.generic()
-        raise GenError(f"no C++ for lower {w:08x}")
 
 
 class Pair:
@@ -633,362 +496,6 @@ class Program:
                     continue  # the next kick waits for this one anyway
                 work.append(n)
 
-    # ------------------------------------------------- operand cleanliness
-    #
-    # A lane is "clean" when it holds a normal number or a zero, so the
-    # interpreter's operand normalisation (denormal -> 0, Inf/NaN -> max) does
-    # nothing to it. Every upper result is clean (results are normalised;
-    # MAX/MINI/ABS see normalised operands; ITOF makes floats from integers)
-    # except FTOI (integer bits). vf0 is clean. MOVE/MR32 copy cleanliness;
-    # loads, MFIR, MFP and R moves bring unknown bits. Forward "must"
-    # analysis over the pair graph (meet = AND); masks use component bits
-    # x=1, y=2, z=4, w=8 like kReverse4. Results: self.clean_in[pc] = state
-    # before the pair: {reg: mask, 'acc': mask}.
-
-    REV4 = (0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15)
-
-    def _clean_step(self, pc, st):
-        p = self.pairs[pc]
-        up, lo = p.upper, p.lower
-        out = dict(st)
-        uw = up.write
-        if not up.nop:
-            lanes = self.REV4[(p.up_w >> 21) & 15]
-            op = p.up_w & 0x3F
-            special = (p.up_w & 3) | ((p.up_w >> 4) & 0x7C)
-            ftoi = op >= 0x3C and 0x14 <= special <= 0x17
-            if uw is not None:
-                old = st.get(uw, 0)
-                out[uw] = (old & ~lanes) | (0 if ftoi else lanes)
-            if up.acc_write:
-                out["acc"] = (st.get("acc", 0) & ~lanes) | lanes
-            if uw == 0:
-                out[0] = 15
-        if lo is not None and lo.vf_write is not None and lo.vf_write != uw:
-            r = lo.vf_write
-            lanes = self.REV4[(lo.w >> 21) & 15]
-            src = None
-            if lo.op == 0x40 and getattr(lo, "special", None) == 0x30:  # MOVE
-                src = st.get((lo.w >> 11) & 31, 0)
-            elif lo.op == 0x40 and getattr(lo, "special", None) == 0x31:  # MR32: lane i <- lane i+1
-                m = st.get((lo.w >> 11) & 31, 0)
-                src = ((m >> 1) | (m << 3)) & 15
-            new = (src & lanes) if src is not None else 0
-            out[r] = (out.get(r, 0) & ~lanes) | new
-        out[0] = 15
-        return out
-
-    def clean_analysis(self):
-        top = None
-        inn = {pc: top for pc in self.pairs}
-        seed = {0: 15}
-        def meet(a, b):
-            if a is None:
-                return dict(b)
-            keys = set(a) | set(b)
-            return {k: a.get(k, 0) & b.get(k, 0) for k in keys}
-        inn[self.entry] = dict(seed)
-        work = [self.entry]
-        outs = {}
-        while work:
-            pc = work.pop()
-            st = inn[pc]
-            o = self._clean_step(pc, st)
-            if outs.get(pc) == o:
-                continue
-            outs[pc] = o
-            for n in self.succ.get(pc, ()):
-                if n not in self.pairs:
-                    continue
-                m = meet(inn[n], o)
-                if n == self.entry:
-                    m = meet(m, seed)
-                if m != inn[n]:
-                    inn[n] = m
-                    work.append(n)
-                elif n not in outs:
-                    work.append(n)
-        self.clean_in = {pc: (st if st is not None else {0: 15}) for pc, st in inn.items()}
-
-    def clean_bits(self, pc):
-        """Clean template argument for the upper op at pc (see fmacNow)."""
-        p = self.pairs[pc]
-        w = p.up_w
-        st = self.clean_in.get(pc, {0: 15})
-        lanes = self.REV4[(w >> 21) & 15]
-        if lanes == 0:
-            return 0
-        op = w & 0x3F
-        if op >= 0x3C:
-            op = (w & 3) | ((w >> 4) & 0x7C)  # ACC forms share the numbering
-        fs, ft = (w >> 11) & 31, (w >> 16) & 31
-        bc = 0x00 <= op <= 0x0F or 0x18 <= op <= 0x1B
-        vt = op in (0x28, 0x29, 0x2A, 0x2C, 0x2D)
-        qi = op in (0x1C, 0x1E, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27)
-        if not (bc or vt or qi):
-            return 0
-        bits = 0
-        if st.get(fs, 0) & lanes == lanes:
-            bits |= 1
-        if bc and st.get(ft, 0) & (1 << (op & 3)):
-            bits |= 2
-        if vt and st.get(ft, 0) & lanes == lanes:
-            bits |= 2
-        madd = (0x08 <= op <= 0x0F) or op in (0x21, 0x23, 0x25, 0x27, 0x29, 0x2D)
-        if madd and st.get("acc", 0) & lanes == lanes:
-            bits |= 4
-        return bits
-
-    # ------------------------------------------------------------ emission
-
-    def pair_cpp(self, pc, indent):
-        """C++ for one pair (not the branch transfer)."""
-        p = self.pairs[pc]
-        ind = " " * indent
-        out = [f"{ind}// {pc:04x}: {p.text}", f"{ind}++n;"]
-        for r in sorted(self.bk_save.get(pc, ())):
-            out.append(f"{ind}bk[{r}] = s.vi[{r}];")
-        clean = self.clean_bits(pc) if not p.upper.nop else 0
-        u = p.upper
-        ufs, uft = (p.up_w >> 11) & 31, (p.up_w >> 16) & 31
-        if u.write is not None:
-            dst, dreg = f"v{u.write}", u.write
-        else:
-            dst, dreg = ("va" if u.acc_write else "vz"), -1
-        up = [] if u.nop else [f"F::nUpperR<0x{p.up_w:08x}u, {clean}u, {dreg}>(vu, lf, v{ufs}, v{uft}, va, {dst});"]
-        if p.upper.write == 0:
-            up.append("v0 = F_vf0c();")
-        if p.upper.ibit:
-            out += [ind + x for x in up]
-            out.append(f"{ind}s.i = F_norm(0x{p.lo_w:08x}u);")
-            return out
-        lo = p.lower
-        low = [] if lo.kind in ("branch", "jump") else lo.cpp()
-        if lo.kind in ("branch", "jump") and lo.link:
-            low = [f"s.vi[{lo.link}] = {(pc + 16) // 8};"]
-        # Lazy flags (VU1FastOps::LazyFlags): write MAC/status out before a
-        # lower that reads or writes them or runs in the interpreter.
-        if lo.reads_flags in ("status", "mac") or "status" in lo.writes or any("nLowerGeneric" in x for x in low):
-            low = ["F::nFlush(vu, lf);"] + low
-        uw = p.upper.write
-        if lo.reads_flags and (p.upper.flags or p.upper.clip):
-            # The lower reads flags before this pair's upper result commits.
-            if (lo.vf_write is not None and lo.vf_write in p.upper.reads) or (uw is not None and uw in lo.vf_reads):
-                raise GenError(f"0x{pc:04x}: cannot order flag read before upper")
-            out += [ind + x for x in low + up]
-        elif uw is not None and uw != 0 and (uw in lo.vf_reads or lo.vf_write == uw):
-            # Shadow: the lower sees the register before the upper's write;
-            # the upper's write wins over the lower's.
-            out.append(f"{ind}{{ const __m128 o_ = v{uw};")
-            out += [ind + "  " + x for x in up]
-            out.append(f"{ind}  const __m128 u_ = v{uw}; v{uw} = o_;")
-            out += [ind + "  " + x for x in low]
-            out.append(f"{ind}  v{uw} = u_; }}")
-        else:
-            out += [ind + x for x in up + low]
-        return out
-
-    def vi_expr(self, pc, r):
-        if r == 0:
-            return "0"
-        if r in self.bk.get(pc, ()):
-            return f"static_cast<int16_t>(bk[{r}])"
-        return f"static_cast<int16_t>(s.vi[{r}])"
-
-    def goto(self, src, dst, ind):
-        if dst <= src:  # backward: loop, check the budget
-            return [f"{ind}if (n > maxPairs) return F::nHandoffL(vu, lf, 0x{dst:04x}u, n);", f"{ind}goto L_{dst:04x};"]
-        return [f"{ind}goto L_{dst:04x};"]
-
-    def emit(self, name):
-        self.clean_analysis()
-        order = sorted(pc for pc in self.pairs if pc not in self.delay_only and pc not in self.ends)
-        lines = [f"bool {name}(VU1Interpreter &vu, uint8_t *D, uint32_t ds, uint64_t maxPairs)", "{",
-                 "    VU1State &s = F::st(vu);", "    uint64_t n = 0;", "    int32_t bk[16];", "    (void)bk;",
-                 "    F::LazyFlags lf;"]
-        # VF registers and ACC live in locals; written ones go back at exits.
-        lines += [f"    __m128 v{r} = _mm_loadu_ps(s.vf[{r}]);" for r in range(32)]
-        lines += ["    __m128 va = _mm_loadu_ps(s.acc);", "    __m128 vz = _mm_setzero_ps();", "    (void)vz;"]
-        lines.append(f"    if (ds != 0x4000u) return F::nHandoffL(vu, lf, 0x{self.entry:04x}u, 0);")
-        written = set()
-        for q in self.pairs.values():
-            if q.upper.write:
-                written.add(q.upper.write)
-            if q.lower is not None and q.lower.vf_write:
-                written.add(q.lower.vf_write)
-        spill = " ".join(f"_mm_storeu_ps(s.vf[{r}], v{r});" for r in sorted(written)) + " _mm_storeu_ps(s.acc, va);"
-        if order[0] != self.entry:
-            lines.append(f"    goto L_{self.entry:04x};")
-        gotos = set()
-        body = []
-        for idx, pc in enumerate(order):
-            p = self.pairs[pc]
-            nxt_emitted = order[idx + 1] if idx + 1 < len(order) else None
-            body.append(f"L_{pc:04x}:")
-            body += self.pair_cpp(pc, 4)
-            if p.upper.ebit:
-                end = (pc + 8) % CODE_SIZE
-                body += self.pair_cpp(end, 4)
-                body.append(f"    return F::nEndL(vu, lf, 0x{(end + 8) % CODE_SIZE:04x}u, n);")
-                continue
-            if p.is_branch:
-                lo = p.lower
-                ds = (pc + 8) % CODE_SIZE
-                op = lo.op
-                body.append("    {")
-                if lo.kind == "branch":
-                    a, b = self.vi_expr(pc, (lo.w >> 11) & 15), self.vi_expr(pc, (lo.w >> 16) & 15)
-                    cond = {0x20: "true", 0x21: "true", 0x28: f"{a} == {b}", 0x29: f"{a} != {b}", 0x2C: f"{a} < 0",
-                            0x2D: f"{a} > 0", 0x2E: f"{a} <= 0", 0x2F: f"{a} >= 0"}[op]
-                    body.append(f"        const bool t_ = {cond};")
-                else:
-                    r = lo.jump_reg
-                    reg = self.vi_expr(pc, r).replace("int16_t", "uint16_t")
-                    body.append(f"        const uint32_t j_ = (static_cast<uint32_t>({reg}) * 8u) & 0x3FFFu;")
-                # The link (bal/jalr) was written by the branch pair above.
-                body += self.pair_cpp(ds, 8)
-                if lo.kind == "branch":
-                    if lo.cond == "true":
-                        body += self.goto(pc, lo.target, "        ")
-                        gotos.add(lo.target)
-                    else:
-                        body.append("        if (t_) {")
-                        body += self.goto(pc, lo.target, "            ")
-                        body.append("        }")
-                        gotos.add(lo.target)
-                else:
-                    body.append("        switch (j_) {")
-                    for t in self.jump_targets[pc]:
-                        body.append(f"        case 0x{t:04x}u:")
-                        body += self.goto(pc, t, "            ")
-                        gotos.add(t)
-                    body.append("        default: return F::nHandoffL(vu, lf, j_, n);")
-                    body.append("        }")
-                body.append("    }")
-                if lo.kind == "branch" and lo.cond != "true":
-                    ft = (pc + 16) % CODE_SIZE
-                    if ft != nxt_emitted:
-                        body += self.goto(pc, ft, "    ")
-                        gotos.add(ft)
-                continue
-            ft = (pc + 8) % CODE_SIZE
-            if ft != nxt_emitted:
-                body += self.goto(pc, ft, "    ")
-                gotos.add(ft)
-        missing = gotos - set(order)
-        if missing:
-            raise GenError("jump to pcs not emitted: " + ", ".join(f"0x{m:04x}" for m in sorted(missing)))
-        used = gotos | {self.entry}
-        for line in body:
-            if line.startswith("L_") and int(line[2:6], 16) not in used:
-                continue
-            lines.append(line)
-        exit_re = re.compile(r"return (F::n(?:EndL|HandoffL)\(vu, lf, [^;]*\);)")
-        for k, line in enumerate(lines):
-            if line.startswith("    if (ds != 0x4000u)"):
-                continue  # nothing ran yet
-            lines[k] = exit_re.sub(lambda m: "{ " + spill + " return " + m.group(1) + " }", line)
-        lines += ["}", ""]
-        return "\n".join(lines)
-
-
-PRELUDE = r"""// Generated by port/tools/vu1prog.py from VU1 microcode the game ran.
-// Derived from game code: never commit or distribute this file.
-#include "runtime/ps2_vu1_fastops.h"
-
-namespace
-{
-using F = VU1FastOps;
-using vu1fast::storeLanes;
-
-// VU data addresses as the interpreter forms them (VU1: 16 KB).
-PS2X_VU1_INLINE uint8_t *F_qw(uint8_t *D, int32_t qword) { return D + ((static_cast<uint32_t>(qword) * 16u) & 0x3FF0u); }
-PS2X_VU1_INLINE void F_lanes(float *dst, __m128 v, int mask)
-{
-    if (mask == 15)
-        _mm_storeu_ps(dst, v);
-    else
-        storeLanes(dst, v, mask);
-}
-PS2X_VU1_INLINE void F_lq(float *dst, uint8_t *D, int32_t qword, int mask)
-{
-    F_lanes(dst, _mm_loadu_ps(reinterpret_cast<const float *>(F_qw(D, qword))), mask);
-}
-PS2X_VU1_INLINE void F_sq(uint8_t *D, int32_t qword, const float *src, int mask)
-{
-    F_lanes(reinterpret_cast<float *>(F_qw(D, qword)), _mm_loadu_ps(src), mask);
-}
-PS2X_VU1_INLINE int32_t F_ilw(uint8_t *D, int32_t qword, int comp)
-{
-    uint32_t v;
-    std::memcpy(&v, F_qw(D, qword) + comp * 4, 4);
-    return static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFu));
-}
-PS2X_VU1_INLINE void F_isw(uint8_t *D, int32_t qword, int32_t vi, int mask)
-{
-    const uint32_t v = static_cast<uint16_t>(vi & 0xFFFF);
-    F_lanes(reinterpret_cast<float *>(F_qw(D, qword)), _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(v))), mask);
-}
-PS2X_VU1_INLINE __m128 F_mr32(const float *v)
-{
-    const __m128 x = _mm_loadu_ps(v);
-    return _mm_shuffle_ps(x, x, _MM_SHUFFLE(0, 3, 2, 1));
-}
-PS2X_VU1_INLINE int32_t F_mtir(float f)
-{
-    uint32_t b;
-    std::memcpy(&b, &f, 4);
-    return static_cast<int32_t>(static_cast<int16_t>(b & 0xFFFFu));
-}
-PS2X_VU1_INLINE __m128 F_mfir(int32_t vi)
-{
-    return _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(static_cast<int16_t>(vi & 0xFFFF))));
-}
-PS2X_VU1_INLINE float F_norm(uint32_t bits) // normalizeOperand
-{
-    const uint32_t e = bits & 0x7F800000u;
-    if (e == 0u)
-        bits &= 0x80000000u;
-    else if (e == 0x7F800000u)
-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-template <int M>
-PS2X_VU1_INLINE __m128 F_blend(__m128 a, __m128 b)
-{
-    if constexpr (M == 15)
-        return b;
-    else if constexpr (M == 0)
-        return a;
-    else
-        return _mm_blend_ps(a, b, M);
-}
-template <int M>
-PS2X_VU1_INLINE __m128 F_lqR(__m128 v, uint8_t *D, int32_t qword)
-{
-    return F_blend<M>(v, _mm_loadu_ps(reinterpret_cast<const float *>(F_qw(D, qword))));
-}
-PS2X_VU1_INLINE void F_sqR(uint8_t *D, int32_t qword, __m128 v, int mask)
-{
-    F_lanes(reinterpret_cast<float *>(F_qw(D, qword)), v, mask);
-}
-PS2X_VU1_INLINE __m128 F_rot(__m128 x) { return _mm_shuffle_ps(x, x, _MM_SHUFFLE(0, 3, 2, 1)); }
-template <int C>
-PS2X_VU1_INLINE int32_t F_mtirR(__m128 v)
-{
-    const int32_t b = _mm_extract_epi32(_mm_castps_si128(v), C);
-    return static_cast<int32_t>(static_cast<int16_t>(b & 0xFFFF));
-}
-PS2X_VU1_INLINE __m128 F_vf0c() { return _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f); }
-PS2X_VU1_INLINE void F_vf0(VU1State &s)
-{
-    s.vf[0][0] = s.vf[0][1] = s.vf[0][2] = 0.0f;
-    s.vf[0][3] = 1.0f;
-}
-
-"""
 
 
 def main():
@@ -1012,7 +519,7 @@ def main():
                 if len(regs[(h, pc)][k]) < 64:
                     regs[(h, pc)][k].add(vi[k] & 0xFFFF)
 
-    out = [PRELUDE]
+    out = ['#include "runtime/ps2_vu1_fastops.h"\n\nnamespace\n{']
     entries = []
     failed = 0
     for (h, pc), n in calls.most_common():
@@ -1024,14 +531,12 @@ def main():
             prog.analyse()
             if prog.problems:
                 raise GenError("\n    ".join(prog.problems))
-            text = prog.emit(name)
         except GenError as e:
             print(f"SKIP code {h:016x} pc 0x{pc:04x} ({n} calls):\n    {e}")
             failed += 1
             continue
         print(f"ok   code {h:016x} pc 0x{pc:04x} ({n} calls): {len(prog.pairs)} pairs, "
               f"{len(prog.jump_targets)} jumps, {sum(len(v) for v in prog.bk.values())} branch-VI backups")
-        out.append(text)
         ranges = merge_ranges(prog.pairs)
         rh = code_hash(codes[h], ranges)
         out.append(f"const uint16_t {name}_ranges[] = {{" + ", ".join(f"0x{a:04x}, 0x{b:04x}" for a, b in ranges) + "};")
@@ -1045,7 +550,7 @@ def main():
         if (rh, pc) in seen:
             continue  # same pairs in another image: one function is enough
         seen.add((rh, pc))
-        out.append(f"    {{0x{rh:016x}ull, 0x{pc:04x}u, {name}_ranges, {nr}u, {name}}},")
+        out.append(f"    {{0x{rh:016x}ull, 0x{pc:04x}u, {name}_ranges, {nr}u, nullptr, true}},")
     if not entries:
         out.append("    {0, 0, nullptr, 0, nullptr},")
     out += ["};", "",
@@ -1056,8 +561,6 @@ def main():
             "}", ""]
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text("\n".join(out))
-    if RUNNER.is_dir():
-        shutil.copy2(OUT, RUNNER / OUT.name)
     print(f"{len(entries)} programs ({failed} skipped) -> {OUT}")
 
 
