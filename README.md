@@ -120,3 +120,25 @@ See `CLAUDE.md` for the full setup. In short:
    executable's entry), then analyze and recompile it into `recomp/ovNN/output`.
 4. `python3 tools/assemble.py`, then build the `ps2EntryRunner` target of PS2Recomp.
 5. Run `ps2EntryRunner path/to/SLUS_204.69`.
+
+## License
+
+Copyright (C) 2026 BeyondNeteros and contributors.
+
+The code in this repository (the port code, launcher, tools and the
+PS2Recomp runtime patch) is free software: you can redistribute it and/or
+modify it under the terms of the **GNU General Public License, version 3**
+(see [`LICENSE`](LICENSE)), the same license as
+[PS2Recomp](https://github.com/ran-j/PS2Recomp), which this port builds on and
+patches. Parts of the movie decoder's MPEG tables come from FFmpeg
+(LGPL 2.1 or later), credited in that file.
+
+The license covers this project's own code only:
+
+- **Xenosaga Episode I is not included and not licensed here.** The game, its
+  code, data, movies and audio, and anything generated from them (such as the
+  recompiled C++ the launcher builds on your PC), belong to their owners
+  (Bandai Namco / Monolith Soft). You need your own copy of the game. Don't
+  share game files or builds that contain them.
+- The game decompilation used as a reference during development is not part
+  of this repository and is not covered by this license.
