@@ -1,0 +1,9 @@
+# Repository instructions
+
+- Follow [CONTRIBUTING.md](CONTRIBUTING.md) and the [development guide](docs/DEVELOPMENT.md). Keep one objective per branch and use separate Git worktrees for independent changes. Use current `origin/master` for new contributions unless the task requires an existing development branch.
+- Respect the GPLv3 scope and third-party notices. Keep disc images, extracted game files, generated code, game-containing binaries, saves, routes, raw logs, captures and dumps out of Git and out of publication. Keep private inputs, builds and evidence outside the public checkout.
+- Edit game-specific hooks in `src/`. Make runtime changes in an isolated PS2Recomp checkout at the documented revision and regenerate `patches/ps2recomp-runtime.patch`. Check that the patch applies to a clean checkout. Preserve unrelated worktrees and evidence.
+- Debug from reproducible evidence. Record the build, settings, reproducer and observed failure. Change the mechanism supported by the evidence. Keep original results and report failed, incomplete and unverified runs separately.
+- Run focused regression tests and relevant host tests for runtime changes. Report baseline failures separately and confirm Windows-specific behavior on Windows. Run `git diff --check` before committing.
+- Use the [strict VU1 replay gate](docs/VU1_PERFORMANCE.md) for VU1 changes. Require all sealed captures, per-entry counts, matching architectural state, ordered GIF output and guest cycles, and the required dispatch coverage. Keep experimental program dispatch out of gameplay. Use complete, matched gameplay trials for benchmark claims and preserve the validators' integrity checks.
+- Review staged changes for private content. Obtain explicit approval before pushing, opening or updating a pull request, or publishing any artifacts. Keep local commits focused and include test results in the handoff.

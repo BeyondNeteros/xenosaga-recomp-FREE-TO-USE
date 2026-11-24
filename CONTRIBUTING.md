@@ -11,7 +11,7 @@ Browse the [issue tracker](https://github.com/gwencrow/xenosaga-recomp/issues). 
 You need your own USA copy of Xenosaga Episode I (`SLUS-20469`). The game is recompiled locally; it is not distributed with this project.
 
 - [WSL2 build guide](docs/BUILD_WSL.md)
-- [Developer setup](CLAUDE.md)
+- [Development guide](docs/DEVELOPMENT.md)
 - [VU1 performance and validation](docs/VU1_PERFORMANCE.md)
 
 The runtime is based on PS2Recomp commit `e563698` with the project patch in `patches/ps2recomp-runtime.patch`. Follow the documented build process rather than committing changes to a generated runtime checkout.
