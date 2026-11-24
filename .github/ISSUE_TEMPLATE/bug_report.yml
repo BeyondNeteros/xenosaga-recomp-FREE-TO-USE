@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible game, runtime or launcher problem.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Search existing issues first. Do not attach game files, generated code, saves, raw captures or personal information.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe the actual and expected behavior, including the affected scene if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build commit or version
+      description: Use unknown if you cannot identify the build.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: System and game settings
+      description: OS, CPU, GPU, driver, renderer, internal resolution, native VU1 optimization and build method, where applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Additional information
+      description: Sanitized log excerpts, frequency of the problem, or screenshots where appropriate. Avoid unnecessary story spoilers.
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked existing issues and removed private information and proprietary game data from my report.
+          required: true
