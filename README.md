@@ -112,7 +112,8 @@ the exe; the launcher's **Settings** opens it.
 
 ## Building (developer notes)
 
-See `CLAUDE.md` for the full setup. In short:
+See `CLAUDE.md` for the full setup or [Build with Debian 13 WSL2](docs/BUILD_WSL.md)
+for cross-compilation. In short:
 
 1. Dump your own disc. Copy `SYSTEM.CNF`, `SLUS_204.69`, and `OV*.OVL` from its root into a folder.
 2. Run `ps2_analyzer` and `ps2_recomp` on `SLUS_204.69` (output in `recomp/output`).
