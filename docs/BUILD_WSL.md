@@ -136,3 +136,33 @@ deployment remain unverified.
   warning about IPO. IPO was disabled for this build.
 - With the FFmpeg prefix added to the target search roots, MinGW-w64 linked
   `ps2EntryRunner.exe` as a Windows x64 PE executable.
+
+## Incremental developer build
+
+After generation and assembly, run `port/tools/build_runtime_wsl.sh` from the
+workspace root. It checks the PS2Recomp revision, tool executables, retail ELF
+fingerprint, overlay presence, generated header, free space, and FFmpeg
+metadata. The default output is `runs/build-wsl-validation`. Override
+`BUILD_DIR`, `FFMPEG_PREFIX`, `GAMEFILES` or `PS2RECOMP` for other layouts.
+For offline builds set `FETCH_SOURCES` to an existing FetchContent directory
+containing the matching raylib-src, imgui-src and rlimgui-src directories.
+`JOBS` defaults to four and accepts one through sixteen.
+
+The patched MinGW pre-link step modifies input archives, so a second build
+may relink the runner. Unchanged translation units stay cached. The wrapper
+disables PE linker timestamps for repeatable relinks of the same objects.
+
+## Stage a private Windows test build
+
+Staging requires LLVM's `llvm-readobj` (Debian package `llvm`). In the workspace
+run `python3 port/tools/stage_wsl.py runs/build-wsl-validation/ps2xRuntime/ps2EntryRunner.exe`.
+The final line gives the new or verified stage under `runs/`. The script checks
+x64 PE files and named imports against non-system DLL exports. Windows system
+DLLs come from the OS. The stage contains the verified private ELF, executable,
+DLLs, launcher and SHA-256 manifest. Keep it local.
+
+Use `wslpath -w <stage-path>` to get its Windows path. In Windows Command
+Prompt, set `XS_DISC` to the absolute filename of your USA ISO, run
+`pushd "<Windows stage path>"`, then `call "Launch Xenosaga.bat"`. On exit,
+run `popd`. The launcher writes its log and settings in the test directory.
+Windows loader, driver initialization and gameplay need an attended test.

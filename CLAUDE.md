@@ -5,8 +5,6 @@ SLUS-20469). It is built by statically recompiling the original game with
 [PS2Recomp](https://github.com/ran-j/PS2Recomp). The original author has stopped
 working on it; see "Picking this up" in README.md for where it stands.
 
-Read `NOTES.md` for the current investigation before changing anything.
-
 ## Hard rules
 
 - **Never commit or distribute game files or anything derived from them**: the
@@ -41,7 +39,7 @@ as a Windows path); a Redump DVD9 dual-layer dump is what was tested.
    patch's Windows tweaks (objcopy symbol rename for the raylib/user32
    `CloseWindow`/`ShowCursor` clash, pkg-config FFmpeg) target MinGW.
 3. Build the tools (`ps2_analyzer`, `ps2_recomp`), then generate the game code
-   from Beyond's own files (the folder needs `SLUS_204.69` and `OV01/02/10/11/12.OVL`
+   from your own disc (the folder needs `SLUS_204.69` and `OV01/02/10/11/12.OVL`
    from the disc root; the install folder already has `SLUS_204.69`; the OVLs can be
    pulled from the ISO, e.g. with 7-Zip):
    `python port/tools/setup_recomp.py <game files folder> --bin PS2Recomp/<build dir>`
@@ -58,12 +56,12 @@ as a Windows path); a Redump DVD9 dual-layer dump is what was tested.
 
 ### Windows build (works as of 2026-10-31)
 
-MSYS2 is at `C:\msys64` (installed with `winget install MSYS2.MSYS2`). From Git
-Bash, put `/c/msys64/mingw64/bin:/c/msys64/usr/bin` first on `PATH` (Git for
-Windows ships its own `/mingw64`; don't use that one). Folders used:
+Set `MSYS2_ROOT` for a custom install (the launcher defaults to the standard
+MSYS2 location). From Git Bash, put that installation's `mingw64/bin` and
+`usr/bin` first on `PATH`.
 
-- `<root>/gamefiles/` Beyond's `SLUS_204.69`, `OV*.OVL`, `SYSTEM.CNF` (extracted
-  from the ISO with `C:\Program Files\7-Zip\7z.exe e`). Never commit.
+- `<root>/gamefiles/` holds your own extracted `SLUS_204.69`, `OV*.OVL`
+  and `SYSTEM.CNF`. Keep them local.
 - `PS2Recomp/build-tools/` tools only: `-G Ninja -DCMAKE_BUILD_TYPE=Release
   -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF`, then
   `cmake --build build-tools --target ps2_recomp ps2_analyzer`.
@@ -82,8 +80,7 @@ the tools with cwd set to the output folder). The patch's MinGW tweaks
 (objcopy rename, pkg-config FFmpeg) worked unchanged with GCC 16.2.
 
 Recompiler fix in the patch: `VCALLMSR` reads CMSAR0 (`ctx->vu0_cmsar0`), not
-`vi[27]`. Without it no VU0 microprogram started from EE code ever ran (see
-NOTES.md). Changing `ps2xRecomp` means rebuilding the tools and regenerating
+`vi[27]`. Without it no VU0 microprogram started from EE code ever ran. Changing `ps2xRecomp` means rebuilding the tools and regenerating
 the code (`setup_recomp.py` + `assemble.py`) before the runtime build.
 
 `tools/eedis.py <elf> <symbol|0xaddr> [count]` disassembles EE code from the
@@ -121,16 +118,8 @@ line-ending diff) with
   `PS2Recomp-ref/build`) and compares checksums and GIF output. Run it after any
   VU1 change. `runs/prof/prof.sh <capture>` profiles vu1_replay.
 - VU1 native blocks: `python port/tools/vu1gen.py runs/vu1blocks/*.vbl "<install folder>/vu1_blocks.vbl"`
-  regenerates the C++ for every VU1 block logged so far (see NOTES.md); then
+  regenerates the C++ for every VU1 block logged so far. Then
   reconfigure and rebuild. Never commit the logs or the generated file.
-- VU1 native programs (whole calls, 2.1-2.4x faster than blocks):
-  `python port/tools/vu1prog.py runs/*/vu1_capture.bin --min-calls 50`, then
-  rebuild; check with `VU_REPLAY_NATIVE_CMP=1 vu1_replay <capture> 1` and
-  vu1_check.sh. `PS2X_VU1_PROGRAMS=0` disables them. Never commit the output.
-  The generated code keeps VF/ACC in locals, commits MAC/status lazily and
-  skips operand normalisation where the generator proves it a no-op; VU code
-  runs with DAZ (`PS2X_VU1_DAZ=0` to compare). Check every change with
-  `VU_REPLAY_NATIVE_CMP=1` over all captures (0 differing calls) and vu1_check.sh.
 - `XS_PROFILE=start,seconds` (game) writes xs_profile.txt; symbolize with
   `python port/tools/profsym.py <exe> xs_profile.txt [thread]` (MSYS2 nm on PATH).
 - PGO: `bash port/tools/pgo.sh` profiles the hot VU1/VIF1/GS code on the
@@ -140,14 +129,13 @@ line-ending diff) with
   microcode from a capture; `port/tools/gifparse.py gif.bin` summarizes GIF
   packets (tags, AD registers, primitive types, vertex ranges).
 - The current-matrix tracer prints the last VU0 matrix operations whenever
-  `ps2__CurMatrixGet` returns a bad matrix (see NOTES.md).
+  `ps2__CurMatrixGet` returns a bad matrix.
 - **Unattended runs:** `bash port/tools/run_game.sh <name> <seconds> --input
-  port/inputs/newgame-to-tutorial.txt` boots the installed exe with the launcher's
+  "$PRIVATE_ROUTE"` boots the installed exe with the launcher's
   env, replays a pad script and copies log/frame/VRAM dump to `runs/<name>/`.
   `--env PS2X_WINDOW_MONITOR=1` puts the window on the second monitor.
   It needs `XS_GAME_DIR` and `XS_DISC` set, and force-closes any running game.
-  That script reaches the "Virtual Tutorial" 3D scene in about 3 minutes with
-  nobody at the PC. `--record file.txt` writes live controller input as a new
+  `--record file.txt` writes live controller input as a new
   script. Replay/record live in the runtime's `ps2_pad.cpp` (code adapted from the
   console-controller skill; stock key/pad mapping unchanged); scripts are
   `frame buttons [lx ly rx ry]` where frame = port-0 pad reads, and
@@ -156,7 +144,7 @@ line-ending diff) with
   Scripts may hold `@ frame key` sync lines (file loads, movies, memory card
   dir/open): replay waits for or jumps to each, so load times can't shift the
   inputs. Recordings write them; `tools/addsync.py script log -o out` adds them
-  to an older script from the log of a run that went right (see NOTES.md).
+  to an older script from the log of a run that went right.
 - Screen capture of the game window shows black (GL); read `xs_frame.bmp`.
 
 ## Key game facts
