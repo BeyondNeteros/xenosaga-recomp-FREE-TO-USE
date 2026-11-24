@@ -124,7 +124,7 @@ line-ending diff) with
   `python port/tools/profsym.py <exe> xs_profile.txt [thread]` (MSYS2 nm on PATH).
 - PGO: `bash port/tools/pgo.sh` profiles the hot VU1/VIF1/GS code on the
   captures and rebuilds build-runtime with it (~11% faster VU1). Rerun it
-  after VU1/GS changes or regenerating native blocks, then vu1_check.sh.
+  after VU1/GS changes or regenerating native blocks, then run the [strict replay gate](docs/VU1_PERFORMANCE.md).
 - `port/tools/vudis.py capture.bin <record> <start> <end>` disassembles VU1
   microcode from a capture; `port/tools/gifparse.py gif.bin` summarizes GIF
   packets (tags, AD registers, primitive types, vertex ranges).

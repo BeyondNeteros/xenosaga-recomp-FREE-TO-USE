@@ -9,7 +9,8 @@ built by statically recompiling the original game code with [PS2Recomp](https://
 
 The port targets PS2Recomp commit `e563698` plus
 `patches/ps2recomp-runtime.patch`. See [Build with Debian 13 WSL2](docs/BUILD_WSL.md)
-and [developer notes](CLAUDE.md) for setup.
+and [developer notes](CLAUDE.md) for setup. See [VU1 validation](docs/VU1_PERFORMANCE.md)
+for the recorded-route comparison and replay procedure.
 
 ## Status
 

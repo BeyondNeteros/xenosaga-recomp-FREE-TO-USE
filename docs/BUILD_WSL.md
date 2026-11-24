@@ -118,8 +118,8 @@ cmake -S "$PS2RECOMP" -B "$win_build" -G Ninja \
 cmake --build "$win_build" --target ps2EntryRunner --parallel 4
 ```
 
-The Windows target requires AVX2. Windows launch, gameplay, and runtime DLL
-deployment remain unverified.
+The Windows target requires AVX2. See [VU1 validation](VU1_PERFORMANCE.md)
+for the attended baseline evidence and its scope.
 
 ## Validation
 
@@ -165,4 +165,4 @@ Use `wslpath -w <stage-path>` to get its Windows path. In Windows Command
 Prompt, set `XS_DISC` to the absolute filename of your USA ISO, run
 `pushd "<Windows stage path>"`, then `call "Launch Xenosaga.bat"`. On exit,
 run `popd`. The launcher writes its log and settings in the test directory.
-Windows loader, driver initialization and gameplay need an attended test.
+Verify Windows loader and driver initialization and gameplay on the staged build.

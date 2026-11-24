@@ -12,16 +12,16 @@
 #   every runs/*/vu1_capture.bin, copies the .gcda files next to the matching
 #   objects in build-runtime and rebuilds there with PS2X_PGO_USE=ON.
 # Same output either way (check with tools/vu1_check.sh). Rerun after VU1/GS
-# code changes or regenerating the native blocks or programs.
+# code changes or regenerating the native blocks.
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export PATH="/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH"
 RECOMP="$ROOT/PS2Recomp"
 USE="$RECOMP/build-runtime"
 FLAGS="-msse4.2 -mavx2 -Wa,-mbig-obj"
-# Generated native VU1 code (vu1gen.py blocks, vu1prog.py programs) is built
+# Generated native VU1 code (vu1gen.py blocks) is built
 # into both targets; their profiles are shared.
-GENERATED="xenosaga_vu1_blocks xenosaga_vu1_programs"
+GENERATED="xenosaga_vu1_blocks"
 GEN_GCDA="ps2xRuntime/CMakeFiles/%s.dir/src/runner/%s.cpp.gcda"
 
 pgo_objects() # objects of the PGO sources in build-runtime

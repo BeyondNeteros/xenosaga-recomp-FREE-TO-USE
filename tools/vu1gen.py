@@ -156,7 +156,7 @@ def main():
         "",
         "struct Register",
         "{",
-        "    Register() { VU1Interpreter::registerCompiledBlocks(kBlocks, sizeof(kBlocks) / sizeof(kBlocks[0])); }",
+        "    Register() { VU1Interpreter::registerCompatibleBlocks(kBlocks, sizeof(kBlocks) / sizeof(kBlocks[0])); }",
         "} g_register;",
         "}",
         "",
