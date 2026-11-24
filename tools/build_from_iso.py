@@ -219,6 +219,11 @@ class Build:
         return True
 
     def tune(self):
+        if not TUNE_SCRIPT.is_file():
+            step(7, "Automatic tuning skipped: training script unavailable")
+            print("Play the game, then use Optimize in the launcher.", flush=True)
+            return
+
         step(7, "Tuning for speed: the game plays its opening by itself for about 4 minutes "
                 "(you can watch; please don't press anything)")
         if not self.args.iso:
