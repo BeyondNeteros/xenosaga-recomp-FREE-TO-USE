@@ -12,16 +12,23 @@ import hashlib
 import struct
 import sys
 from collections import Counter
+from pathlib import Path
 
 SSZ = 664
 REC = 16 + SSZ + 16384 + 16384
 
 
+def capture_bytes(path):
+    data = Path(path).read_bytes()
+    if len(data) < 16 or struct.unpack_from('<4I', data) != (0x31555658, 1, SSZ, 0):
+        raise ValueError(f'{path}: invalid XVU1 header')
+    if len(data) == 16 or (len(data) - 16) % REC:
+        raise ValueError(f'{path}: empty or partial XVU1 recording')
+    return data
+
+
 def records(path):
-    d = open(path, 'rb').read()
-    magic, _, ssz, _ = struct.unpack_from('<4I', d, 0)
-    if magic != 0x31555658 or ssz != SSZ:
-        return
+    d = capture_bytes(path)
     n = (len(d) - 16) // REC
     for k in range(n):
         o = 16 + k * REC
@@ -30,6 +37,9 @@ def records(path):
         code = d[o + 16 + SSZ:o + 16 + SSZ + 16384]
         data = d[o + 16 + SSZ + 16384:o + REC]
         pc = struct.unpack_from('<I', st, 32 * 16 + 16 * 4 + 16 + 16)[0]
+        entry = pc if kind else start
+        if kind not in (0, 1) or entry >= 0x4000 or entry % 8:
+            raise ValueError(f'{path}: invalid entry at record {k}')
         yield dict(kind=kind, start=start, top=top, itop=itop, state=st, code=code, data=data, pc=pc)
 
 

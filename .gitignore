@@ -25,3 +25,32 @@ work/
 game/
 launcher.ini
 launcher/background.*
+
+# Private inputs, staged Windows builds and generated runner files
+/gamefiles/
+/PS2Recomp/
+/deps/
+*.ISO
+*.IRX
+*.irx
+*.exe
+*.dll
+SYSTEM.CNF
+ps2_recompiled_*.h
+*_0x*.cpp
+__pycache__/
+
+# Local gameplay evidence and build byproducts
+/inputs/
+mc1/
+*.dmp
+*.log
+*.obj
+*.o
+*.a
+*.pdb
+*.gsc
+*.xvu
+route-recorded.txt
+xenosaga_vu1_blocks.cpp
+xenosaga_vu1_programs.cpp
