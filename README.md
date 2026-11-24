@@ -152,6 +152,7 @@ It currently targets PS2Recomp commit `e563698` with the modifications in `patch
 - [Developer Setup](CLAUDE.md)
 - [WSL2 Build Guide](docs/BUILD_WSL.md)
 - [VU1 Performance and Validation](docs/VU1_PERFORMANCE.md)
+- [Changelog](CHANGELOG.md)
 
 ## Contributing
 
