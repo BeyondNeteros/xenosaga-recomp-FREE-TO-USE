@@ -1,8 +1,14 @@
 # Xenosaga Episode I: Recompiled
 
-![Development](https://img.shields.io/badge/development-active-blue)
-![Platform](https://img.shields.io/badge/platform-Windows_x64-blue)
-![License](https://img.shields.io/badge/license-GPLv3-green)
+<p align="center">
+  <img src="docs/images/banner.png" alt="Xenosaga Episode I: Recompiled" width="100%">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/development-active-blue" alt="Active development">
+  <img src="https://img.shields.io/badge/platform-Windows_x64-blue" alt="Windows x64">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-green" alt="GPLv3"></a>
+</p>
 
 An unofficial native PC port of **Xenosaga Episode I: Der Wille zur Macht**, built using [PS2Recomp](https://github.com/ran-j/PS2Recomp).
 
@@ -11,6 +17,21 @@ Originally developed by [BeyondNeteros](https://github.com/BeyondNeteros/xenosag
 The goal is to make Xenosaga Episode I playable on modern PCs with good performance, improved graphics, and support for modern hardware.
 
 > **Work in progress.** The game is playable in tested early-game areas, but a complete playthrough has not yet been validated.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/exploration.png" alt="Exploration" width="400"><br>Exploration</td>
+    <td align="center"><img src="docs/images/combat.png" alt="Combat" width="400"><br>Combat</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/cinematic.png" alt="In-engine cinematic" width="400"><br>In-engine cinematic</td>
+    <td align="center"><img src="docs/images/menu.png" alt="Game interface" width="400"><br>Game interface</td>
+  </tr>
+</table>
+
+*Screenshots from a development build of the native PC port.*
 
 ## Current Status
 
@@ -60,7 +81,9 @@ A CPU renderer is available for systems without compatible graphics hardware.
 
 The launcher generates and compiles the game code locally. Build times depend on your hardware.
 
-The launcher also provides an **Optimize** option that builds native versions of VU1 blocks observed during gameplay.
+Automatic tuning is skipped when no training recording is available. For better performance, play through some gameplay areas and battles, close the game, then select **Optimize** in the launcher. This compiles native VU1 blocks collected locally during play. Repeat as you explore new areas.
+
+If the standard Windows build tools fail to install, see the alternative [WSL2 build guide](docs/BUILD_WSL.md).
 
 Your original disc image is required to play.
 
@@ -143,6 +166,10 @@ Do not upload game files, generated game code, memory dumps, or other proprietar
 - [BeyondNeteros](https://github.com/BeyondNeteros): Original port development
 - [PS2Recomp](https://github.com/ran-j/PS2Recomp): Recompilation framework
 - [FFmpeg](https://ffmpeg.org/): Multimedia decoding
+
+## Image Credits
+
+Gameplay screenshots show Xenosaga Episode I and are included to document the port. The underlying game imagery belongs to its respective rights holders. The custom banner incorporates third-party stock imagery under its applicable licenses. Third-party imagery is not covered by the software GPLv3 license.
 
 ## License
 
